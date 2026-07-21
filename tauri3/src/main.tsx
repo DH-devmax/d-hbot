@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, type ReactNode } from 'react'
+import React, { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -35,6 +35,27 @@ const nav: [PageName, typeof Activity][] = [
 
 function isTauriRuntime() { return typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) }
 
+type WangStartupEvent = { eventId: string; status: string; detail: string; needsConfirmation: boolean }
+type WangStartResult = { detail?: string; maintenanceRequestId?: string | null }
+type MaintenanceResult = { success: boolean; errorCode: string; message: string }
+
+async function finishConfirmedWangRestart(
+  start: () => Promise<WangStartResult>,
+  initial: WangStartResult,
+) {
+  let result = initial
+  const deadline = Date.now() + 30_000
+  while (result.maintenanceRequestId) {
+    if (Date.now() >= deadline) throw new Error('等待旺商聊固定登录分区维护完成超时，请在设置页重新检查')
+    await new Promise(resolve => window.setTimeout(resolve, 500))
+    const maintenance = await invoke<MaintenanceResult | null>('get_wang_maintenance_result', { requestId: result.maintenanceRequestId })
+    if (!maintenance) continue
+    if (!maintenance.success) throw new Error(maintenance.message || maintenance.errorCode)
+    result = await start()
+  }
+  return result
+}
+
 function App() {
   const [page, setPage] = useState<PageName>('总览')
   const [diagnostic, setDiagnostic] = useState<Diagnostic | null>(null)
@@ -51,19 +72,39 @@ function App() {
   const [pageEpoch, setPageEpoch] = useState(0)
   const [closePrompt, setClosePrompt] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
+  const activeAccountRef = useRef('')
+  const refreshSequenceRef = useRef(0)
+  const handledWangStartupRef = useRef(new Set<string>())
+
+  const switchAccount = (nextAccount: string) => {
+    if (activeAccountRef.current === nextAccount) return false
+    activeAccountRef.current = nextAccount
+    setAccountId(nextAccount)
+    setGroups([])
+    setOverviewAudits([])
+    setSummaries([])
+    setSelectedGroup(null)
+    setPageEpoch(value => value + 1)
+    return true
+  }
 
   const loadAccountData = async (nextAccount: string) => {
-    if (!nextAccount) { setOverviewAudits([]); setSummaries([]); return }
+    setOverviewAudits([])
+    setSummaries([])
+    if (!nextAccount) return
     const [auditResult, summaryResult] = await Promise.allSettled([api.listAudit(nextAccount, 20), api.listSummaries(nextAccount, 10)])
+    if (activeAccountRef.current !== nextAccount) return
     if (auditResult.status === 'fulfilled') setOverviewAudits(auditResult.value)
     if (summaryResult.status === 'fulfilled') setSummaries(summaryResult.value)
   }
 
   const refresh = async () => {
+    const refreshSequence = ++refreshSequenceRef.current
     setLoading(true)
     const [diagnosticResult, databaseResult, settingsResult] = await Promise.allSettled([
       invoke<Diagnostic>('diagnose'), invoke<DatabaseStatus>('database_status'), invoke<AiSettings>('get_ai_settings'),
     ])
+    if (refreshSequence !== refreshSequenceRef.current) return
     if (diagnosticResult.status === 'fulfilled') setDiagnostic(diagnosticResult.value)
     else if (!isTauriRuntime()) setDiagnostic({ status: 'unavailable', devtoolsUrl: 'http://127.0.0.1:9222', pageTitle: '', pageUrl: '', nimAccount: '', detail: '浏览器预览模式：请使用桌面程序执行连接检查。' })
     if (databaseResult.status === 'fulfilled') setDatabase(databaseResult.value)
@@ -73,12 +114,10 @@ function App() {
     let nextGroups: Group[] = []
     try { nextGroups = diagnosticResult.status === 'fulfilled' && diagnosticResult.value.status === 'ready' ? await api.listGroups() : await api.listCachedGroups() }
     catch (reason) { if (isTauriRuntime()) setError(readableError(reason)) }
-    setGroups(nextGroups)
+    if (refreshSequence !== refreshSequenceRef.current) return
     const nextAccount = diagnosticResult.status === 'fulfilled' ? diagnosticResult.value.nimAccount || nextGroups[0]?.accountId || '' : nextGroups[0]?.accountId || ''
-    setAccountId(current => {
-      if (current && nextAccount && current !== nextAccount) { setSelectedGroup(null); setPageEpoch(value => value + 1) }
-      return nextAccount
-    })
+    switchAccount(nextAccount)
+    setGroups(nextGroups.filter(group => !nextAccount || group.accountId === nextAccount))
     await loadAccountData(nextAccount)
     setLoading(false)
   }
@@ -89,9 +128,39 @@ function App() {
     const showClosePrompt = () => setClosePrompt(true)
     window.addEventListener('dh-close-requested', showClosePrompt)
     const listeners: Promise<UnlistenFn>[] = []
-    listeners.push(listen<Diagnostic>('connection-status', event => { setDiagnostic(event.payload); if (event.payload.nimAccount) setAccountId(event.payload.nimAccount) }))
+    const handleWangStartup = (payload: WangStartupEvent) => {
+      if (payload.eventId && handledWangStartupRef.current.has(payload.eventId)) return
+      if (payload.eventId) handledWangStartupRef.current.add(payload.eventId)
+      void (async () => {
+        if (payload.detail) setError(payload.detail)
+        if (payload.needsConfirmation && window.confirm('检测到旺商聊已运行，但没有开启 9222 DevTools。需要结束该旺商聊进程并重新启动，是否继续？')) {
+          try {
+            const settings = await invoke<{ path: string }>('get_wang_startup_settings')
+            const start = () => invoke<WangStartResult>('start_wangshangliao', {
+              path: settings.path.trim() || null,
+              devtoolsUrl: 'http://127.0.0.1:9222',
+              confirmRestart: true,
+            })
+            const result = await finishConfirmedWangRestart(start, await start())
+            if (result.detail) setError(result.detail)
+          } catch (reason) {
+            setError(readableError(reason))
+          }
+        }
+        await refresh()
+      })()
+    }
+    listeners.push(listen<Diagnostic>('connection-status', event => {
+      setDiagnostic(event.payload)
+      const nextAccount = event.payload.nimAccount || ''
+      if (nextAccount && switchAccount(nextAccount)) void refresh()
+    }))
     for (const eventName of ['sync-progress', 'message-received', 'task-progress', 'schedule-updated', 'gateway-capabilities']) listeners.push(listen(eventName, () => setPageEpoch(value => value + 1)))
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
+    listeners.push(listen<WangStartupEvent>('wangshangliao-status', event => handleWangStartup(event.payload)))
+    void invoke<WangStartupEvent | null>('take_wang_startup_status').then(payload => {
+      if (payload) handleWangStartup(payload)
+    }).catch(() => undefined)
     listeners.push(listen<{ paused?: boolean } | boolean>('automation-paused', event => setAutomationPaused(typeof event.payload === 'boolean' ? event.payload : Boolean(event.payload.paused))))
     listeners.push(listen('close-requested', () => setClosePrompt(true)))
     return () => {

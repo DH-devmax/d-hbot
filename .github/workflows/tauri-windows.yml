@@ -42,7 +42,6 @@ jobs:
         run: pnpm test:ui
       - run: pnpm test:production
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
-      - run: pnpm tauri:build:production
       - name: Prepare Authenticode certificate
         if: startsWith(github.ref, 'refs/tags/v3.')
         shell: pwsh
@@ -55,7 +54,32 @@ jobs:
           [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:DH_SIGN_PFX_B64))
           "DH_SIGN_PFX=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
           "DH_SIGN_PASSWORD=$env:DH_SIGN_PASSWORD_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build production PE without bundling
+        shell: pwsh
+        run: |
+          pnpm clean:production
+          pnpm exec tauri build --no-bundle --ci -- --no-default-features
+      - name: Sign production PE before NSIS
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'src-tauri\target\release\dh-bot.exe'
+          if (-not (Test-Path $exe)) { throw "缺少主程序：$exe" }
+          if ($env:DH_SIGN_PFX) {
+            $args = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', $env:DH_SIGN_PFX)
+            if ($env:DH_SIGN_PASSWORD) { $args += @('/p', $env:DH_SIGN_PASSWORD) }
+            $args += $exe
+            & signtool @args
+            if ($LASTEXITCODE -ne 0) { throw '主程序 Authenticode 签名失败' }
+            & signtool verify /pa /all $exe
+            if ($LASTEXITCODE -ne 0) { throw '主程序 Authenticode 校验失败' }
+          } elseif ($env:GITHUB_REF -like 'refs/tags/v3.*') {
+            throw '正式标签发布必须配置 Authenticode 证书'
+          }
+      - name: Bundle NSIS with signed production PE
+        shell: pwsh
+        run: pnpm exec tauri bundle --ci --no-sign
       - name: Package and deeply scan production artifacts
+        shell: pwsh
         run: pnpm package:windows:production
       - name: Recheck Windows production artifacts
         run: pnpm verify:windows:production

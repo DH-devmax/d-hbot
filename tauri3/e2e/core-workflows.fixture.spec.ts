@@ -34,6 +34,8 @@ async function installDeveloperFixture(page: Page) {
         case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Fixture', pageUrl: 'http://127.0.0.1:51300', nimAccount: 'ACCOUNT', detail: '开发 Fixture 已就绪' }
         case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 5, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
         case 'get_ai_settings': return { base_url: 'http://127.0.0.1:51300/v1', webhook_url: '', model: 'fixture-model', api_key_configured: true }
+        case 'get_wang_startup_settings': return { path: '', autoStart: true }
+        case 'save_wang_startup_settings': return null
         case 'list_groups': case 'list_cached_groups': return [group]
         case 'list_audit': return audits
         case 'query_audit': return { items: audits, nextCursor: null }
@@ -74,6 +76,7 @@ async function installDeveloperFixture(page: Page) {
         case 'get_runtime_mode': return { mode: 'fixture', dataDir: '%APPDATA%\\DH\\fixture', restartRequired: false }
         case 'test_ai': return { decision: { reply: '你好，我可以回答群规和业务问题。', reason: '开发测试', confidence: 0.95 }, elapsedMs: 12, model: 'fixture-model' }
         case 'get_wang_profile_status': return { state: '开发测试', scriptHash: 'FIXTURE-HASH', backupPath: null, requiresElevation: false, detail: '未读取真实旺商聊目录' }
+        case 'get_gateway_capabilities': return { announcement: 'unsupported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }
         default:
           if (command.startsWith('save_') || command.startsWith('set_') || command.startsWith('delete_')) return null
           throw new Error(`Fixture IPC 未实现: ${command}`)

@@ -21,6 +21,7 @@ mod repository;
 mod runtime;
 mod scheduler;
 mod secrets;
+mod shutdown;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,20 +33,21 @@ use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::Notify;
 
 use build_channel::BuildChannel;
 use database::{Database, DatabaseExecutor, DatabaseStatus};
+use diagnostics::redact;
 use error::{AppError, AppResult};
 use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
-    AuditEvent, CardPlan, CardPreview, CardRenameJob, DailySummary, Group, GroupAiPermissions,
-    GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeChunk as StoredKnowledgeChunk,
-    KnowledgeDocument, Member, MemberRef, MemberRoster, Message, ModerationRule, Page, ScheduleRun,
-    TaskItem,
+    ActionRecord, AuditEvent, CardPlan, CardPreview, CardRenameJob, DailySummary, Group,
+    GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding,
+    KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument, Member, MemberRef, MemberRoster,
+    Message, ModerationRule, Page, ScheduleRun, TaskItem,
 };
 use paths::AppPaths;
 use secrets::SecretStore;
+use shutdown::ShutdownSignal;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,16 +150,34 @@ struct SummarySettings {
     timezone: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WangStartupSettings {
+    path: String,
+    auto_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WangStartupEvent {
+    event_id: String,
+    status: String,
+    detail: String,
+    needs_confirmation: bool,
+}
+
 pub struct AppState {
     pub paths: AppPaths,
     pub database_executor: DatabaseExecutor,
     pub secrets: SecretStore,
     pub gateway: Arc<dyn RuntimeGateway>,
-    pub shutdown: Arc<Notify>,
+    pub shutdown: Arc<ShutdownSignal>,
     pub runtime_tasks: Arc<Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>>,
     pub exit_started: Arc<AtomicBool>,
     pub tray_notice_shown: Arc<AtomicBool>,
     pub close_behavior: Arc<RwLock<String>>,
+    startup_status: Arc<Mutex<Option<WangStartupEvent>>>,
+    wang_start_lock: Arc<tokio::sync::Mutex<()>>,
     pub logger: diagnostics::Logger,
 }
 
@@ -165,10 +185,21 @@ impl AppState {
     fn initialize() -> AppResult<Self> {
         let paths = AppPaths::discover()?;
         let _ = paths.prepare()?;
-        let database = Database::open(&paths)?;
-        let database_executor = DatabaseExecutor::start(database)?;
         diagnostics::install_panic_hook(paths.logs.clone());
-        let logs = paths.logs.clone();
+        let logger = diagnostics::Logger::new(paths.logs.clone());
+        let database = Database::open(&paths).map_err(|error| {
+            let wrapped = AppError::new(
+                error.code,
+                format!(
+                    "{}\n数据文件：{}\n原文件保持不变，请从迁移快照恢复或将日志交给维护人员。",
+                    error.message,
+                    paths.database.display()
+                ),
+            );
+            logger.write("ERROR", &wrapped.message);
+            wrapped
+        })?;
+        let database_executor = DatabaseExecutor::start(database)?;
         // The endpoint is a build-time/runtime-mode decision.  In particular,
         // the public binary never trusts stale database settings or caller URLs.
         let devtools_url = paths.default_devtools_url().to_string();
@@ -179,12 +210,14 @@ impl AppState {
             paths,
             database_executor,
             gateway,
-            shutdown: Arc::new(Notify::new()),
+            shutdown: Arc::new(ShutdownSignal::default()),
             runtime_tasks: Arc::new(Mutex::new(Vec::new())),
             exit_started: Arc::new(AtomicBool::new(false)),
             tray_notice_shown: Arc::new(AtomicBool::new(false)),
             close_behavior: Arc::new(RwLock::new("ask".into())),
-            logger: diagnostics::Logger::new(logs),
+            startup_status: Arc::new(Mutex::new(None)),
+            wang_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            logger,
         })
     }
 }
@@ -209,6 +242,10 @@ fn cache_close_behavior(state: &AppState, value: &str) {
     if let Ok(mut current) = state.close_behavior.write() {
         *current = normalize_close_behavior(Some(value)).to_string();
     }
+}
+
+fn wang_auto_start_enabled(value: Option<&str>) -> bool {
+    value != Some("false")
 }
 
 #[tauri::command]
@@ -246,7 +283,7 @@ fn set_runtime_mode(state: State<'_, AppState>, mode: String) -> AppResult<serde
 
 #[cfg(feature = "fixture")]
 #[tauri::command]
-fn start_fixture_host(app: tauri::AppHandle) -> AppResult<String> {
+fn start_fixture_host(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<String> {
     let executable = std::env::current_exe()
         .map_err(|error| AppError::new("fixture_start", error.to_string()))?;
     let directory = executable.parent().unwrap_or(std::path::Path::new("."));
@@ -291,6 +328,9 @@ fn start_fixture_host(app: tauri::AppHandle) -> AppResult<String> {
     command.spawn().map_err(|error| {
         AppError::new("fixture_start", format!("启动 DH-Fixture 失败：{error}"))
     })?;
+    let (version, script_hash) = contracts::fixture_calibration_identity();
+    let capabilities = state.gateway.calibrate_capabilities(&version, &script_hash);
+    let _ = app.emit("gateway-capabilities", capabilities);
     Ok(fixture.display().to_string())
 }
 
@@ -687,11 +727,20 @@ async fn save_ai_settings(
 #[tauri::command]
 async fn send_text(state: State<'_, AppState>, group_id: i64, text: String) -> AppResult<String> {
     require_manager(&state, group_id).await?;
-    state
-        .gateway
-        .send_text(group_id, &text)
-        .await
-        .map(|receipt| receipt.message_id)
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state.gateway.send_text(group_id, &text).await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        0,
+        "send_text",
+        0,
+        "人工发送群消息",
+        result,
+    )
+    .await
+    .map(|receipt| receipt.message_id)
 }
 
 #[tauri::command]
@@ -706,9 +755,22 @@ async fn send_text_batch(
     for group_id in &group_ids {
         require_manager(&state, *group_id).await?;
     }
+    let account_id = state.gateway.session_identity().await?.1;
     let mut results = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
-        match state.gateway.send_text(group_id, text.trim()).await {
+        let result = state.gateway.send_text(group_id, text.trim()).await;
+        match archive_manual_gateway_result(
+            &state,
+            &account_id,
+            group_id,
+            0,
+            "send_text",
+            0,
+            "人工批量发送群消息",
+            result,
+        )
+        .await
+        {
             Ok(receipt) => results.push(BatchSendResult {
                 group_id,
                 success: true,
@@ -1415,19 +1477,81 @@ async fn locate_wangshangliao() -> AppResult<Vec<platform::InstallCandidate>> {
 }
 
 #[tauri::command]
+async fn get_wang_startup_settings(state: State<'_, AppState>) -> AppResult<WangStartupSettings> {
+    let path = state
+        .database_executor
+        .get_setting("wangshangliao.path".into())
+        .await?
+        .unwrap_or_default();
+    let auto_start = wang_auto_start_enabled(
+        state
+            .database_executor
+            .get_setting("wangshangliao.auto_start".into())
+            .await?
+            .as_deref(),
+    );
+    Ok(WangStartupSettings { path, auto_start })
+}
+
+#[tauri::command]
+async fn save_wang_startup_settings(
+    state: State<'_, AppState>,
+    settings: WangStartupSettings,
+) -> AppResult<()> {
+    state
+        .database_executor
+        .set_setting(
+            "wangshangliao.path".into(),
+            settings.path.trim().to_string(),
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            "wangshangliao.auto_start".into(),
+            settings.auto_start.to_string(),
+            false,
+        )
+        .await
+}
+
+#[tauri::command]
+fn take_wang_startup_status(state: State<'_, AppState>) -> AppResult<Option<WangStartupEvent>> {
+    state
+        .startup_status
+        .lock()
+        .map(|mut value| value.take())
+        .map_err(|_| AppError::new("wangshangliao_status", "旺商聊启动状态锁已损坏"))
+}
+
+#[tauri::command]
 async fn start_wangshangliao(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: Option<String>,
     devtools_url: Option<String>,
     confirm_restart: bool,
 ) -> AppResult<platform::WangStartResult> {
     let _ = devtools_url;
-    platform::start(
+    let _start_guard = state.wang_start_lock.lock().await;
+    let result = platform::start(
         path,
         state.paths.default_devtools_url().to_string(),
         confirm_restart,
     )
-    .await
+    .await?;
+    if let Some(process) = &result.process {
+        let script_hash = platform::profile_status(Some(process.image_path.clone()))
+            .await
+            .map(|status| status.script_hash)
+            .unwrap_or_default();
+        let capabilities = state
+            .gateway
+            .calibrate_capabilities(&process.file_version, &script_hash);
+        let _ = app.emit("gateway-capabilities", capabilities);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1440,6 +1564,18 @@ async fn inspect_wangshangliao(
 }
 
 #[tauri::command]
+fn get_gateway_capabilities(state: State<'_, AppState>) -> gateway::GatewayCapabilities {
+    state.gateway.capabilities()
+}
+
+#[tauri::command]
+fn get_wang_maintenance_result(
+    request_id: String,
+) -> AppResult<Option<platform::WangMaintenanceResult>> {
+    platform::maintenance_result(&request_id)
+}
+
+#[tauri::command]
 async fn get_wang_profile_status(
     path: Option<String>,
 ) -> AppResult<platform::WangMaintenanceStatus> {
@@ -1448,16 +1584,26 @@ async fn get_wang_profile_status(
 
 #[tauri::command]
 async fn apply_wang_profile_patch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
     path: Option<String>,
 ) -> AppResult<platform::WangMaintenanceStatus> {
-    platform::apply_profile_patch(path).await
+    let status = platform::apply_profile_patch(path).await?;
+    let capabilities = state.gateway.calibrate_capabilities("", "");
+    let _ = app.emit("gateway-capabilities", capabilities);
+    Ok(status)
 }
 
 #[tauri::command]
 async fn restore_wang_profile_patch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
     path: Option<String>,
 ) -> AppResult<platform::WangMaintenanceStatus> {
-    platform::restore_profile_patch(path).await
+    let status = platform::restore_profile_patch(path).await?;
+    let capabilities = state.gateway.calibrate_capabilities("", "");
+    let _ = app.emit("gateway-capabilities", capabilities);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1468,11 +1614,23 @@ async fn recall_message(
     message_id: String,
 ) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state
         .gateway
         .recall(group_id, sender_user_id, &message_id)
-        .await
-        .map(|_| ())
+        .await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        sender_user_id,
+        "recall",
+        0,
+        "人工撤回消息",
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -1483,17 +1641,42 @@ async fn mute_member(
     duration_seconds: i64,
 ) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state
         .gateway
         .mute(group_id, user_id, duration_seconds)
-        .await
-        .map(|_| ())
+        .await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        user_id,
+        "mute",
+        duration_seconds,
+        "人工禁言成员",
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
 async fn unmute_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state.gateway.unmute(group_id, user_id).await.map(|_| ())
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state.gateway.unmute(group_id, user_id).await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        user_id,
+        "unmute",
+        0,
+        "人工解禁成员",
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -1504,31 +1687,63 @@ async fn rename_member(
     nickname: String,
 ) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state
-        .gateway
-        .rename(group_id, &member, &nickname)
-        .await
-        .map(|_| ())
+    let account_id = state.gateway.session_identity().await?.1;
+    let user_id = member.user_id.unwrap_or_default();
+    let result = state.gateway.rename(group_id, &member, &nickname).await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        user_id,
+        "rename",
+        0,
+        "人工修改群名片",
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
 async fn remove_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state
-        .gateway
-        .remove_member(group_id, user_id)
-        .await
-        .map(|_| ())
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state.gateway.remove_member(group_id, user_id).await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        user_id,
+        "remove",
+        0,
+        "人工移出成员",
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
 async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state
-        .gateway
-        .set_group_mute(group_id, muted)
-        .await
-        .map(|_| ())
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state.gateway.set_group_mute(group_id, muted).await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        0,
+        "group_mute",
+        0,
+        if muted {
+            "人工关群"
+        } else {
+            "人工开群"
+        },
+        result,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -1576,29 +1791,21 @@ async fn execute_member_batch(
     let account_id = state.gateway.session_identity().await?.1;
     let mut results = Vec::with_capacity(input.members.len());
     for member in input.members {
+        let user_id = member.user_id.unwrap_or_default();
+        let nim_id = member.nim_id.clone();
         let result = match action.as_str() {
             "mute" => {
                 state
                     .gateway
                     .mute(
                         input.group_id,
-                        member.user_id.unwrap_or_default(),
+                        user_id,
                         input.duration_seconds.unwrap_or(600),
                     )
                     .await
             }
-            "unmute" => {
-                state
-                    .gateway
-                    .unmute(input.group_id, member.user_id.unwrap_or_default())
-                    .await
-            }
-            "remove" => {
-                state
-                    .gateway
-                    .remove_member(input.group_id, member.user_id.unwrap_or_default())
-                    .await
-            }
+            "unmute" => state.gateway.unmute(input.group_id, user_id).await,
+            "remove" => state.gateway.remove_member(input.group_id, user_id).await,
             "rename" => {
                 state
                     .gateway
@@ -1611,21 +1818,30 @@ async fn execute_member_batch(
             }
             "blacklist" => state
                 .database_executor
-                .set_member_blacklisted(
-                    account_id.clone(),
-                    input.group_id,
-                    member.user_id.unwrap_or_default(),
-                    true,
-                )
+                .set_member_blacklisted(account_id.clone(), input.group_id, user_id, true)
                 .await
                 .map(|_| GatewayReceipt::succeeded("database.member.blacklist")),
             _ => unreachable!(),
         };
+        let archived = archive_manual_gateway_result(
+            &state,
+            &account_id,
+            input.group_id,
+            user_id,
+            &action,
+            input.duration_seconds.unwrap_or(0),
+            "人工批量成员操作",
+            result,
+        )
+        .await;
         results.push(MemberBatchResult {
             user_id: member.user_id,
-            nim_id: member.nim_id,
-            success: result.is_ok(),
-            error: result.err().map(|error| error.message).unwrap_or_default(),
+            nim_id,
+            success: archived.is_ok(),
+            error: archived
+                .err()
+                .map(|error| error.message)
+                .unwrap_or_default(),
         });
     }
     Ok(results)
@@ -1699,6 +1915,115 @@ async fn retry_card_rename_jobs(
         .database_executor
         .retry_failed_card_jobs(account_id, group_id)
         .await
+}
+
+fn redact_archived_receipt(mut receipt: GatewayReceipt) -> GatewayReceipt {
+    receipt.route = redact(&receipt.route);
+    receipt.status = redact(&receipt.status);
+    receipt.business_message = redact(&receipt.business_message);
+    receipt.request_id = redact(&receipt.request_id);
+    receipt.message_id = redact(&receipt.message_id);
+    receipt.session = redact(&receipt.session);
+    receipt
+}
+
+fn manual_event_name(kind: &str) -> &'static str {
+    match kind {
+        "send_text" => "人工发送群消息",
+        "recall" => "人工撤回消息",
+        "mute" => "人工禁言成员",
+        "unmute" => "人工解禁成员",
+        "rename" => "人工修改群名片",
+        "remove" => "人工移出成员",
+        "blacklist" => "人工加入黑名单",
+        "group_mute" => "人工设置全群发言",
+        _ => "人工群管操作",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn archive_manual_gateway_result(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    group_id: i64,
+    user_id: i64,
+    kind: &str,
+    duration_seconds: i64,
+    reason: &str,
+    result: AppResult<GatewayReceipt>,
+) -> AppResult<GatewayReceipt> {
+    let (success, unknown, error_text, receipt) = match &result {
+        Ok(receipt) => (true, false, String::new(), receipt.clone()),
+        Err(error) => {
+            let unknown = error.delivery_outcome_unknown();
+            let mut receipt = GatewayReceipt::failed(kind, error);
+            if unknown {
+                receipt.status = "unknown".into();
+            }
+            (false, unknown, error.message.clone(), receipt)
+        }
+    };
+    let error_text = redact(&error_text);
+    let receipt = redact_archived_receipt(receipt);
+    let receipt_json = serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".into());
+    let action_result = state
+        .database_executor
+        .record_action(ActionRecord {
+            id: 0,
+            account_id: account_id.into(),
+            group_id,
+            user_id,
+            message_id: None,
+            rule_id: None,
+            kind: kind.into(),
+            mode: "manual".into(),
+            duration_seconds,
+            reason: reason.into(),
+            success,
+            error: error_text.clone(),
+            receipt_json: receipt_json.clone(),
+            dedupe_key: format!("manual:{}", uuid::Uuid::new_v4()),
+            created_at: Utc::now(),
+        })
+        .await;
+    let audit_result = state
+        .database_executor
+        .record_audit(AuditEvent {
+            id: 0,
+            account_id: account_id.into(),
+            group_id,
+            user_id,
+            actor: "当前管理员".into(),
+            event: manual_event_name(kind).into(),
+            level: if success {
+                "info"
+            } else if unknown {
+                "warning"
+            } else {
+                "error"
+            }
+            .into(),
+            details: serde_json::json!({
+                "status": if success { "succeeded" } else if unknown { "unknown" } else { "failed" },
+                "error": error_text,
+                "receipt": receipt,
+            })
+            .to_string(),
+            created_at: Utc::now(),
+        })
+        .await;
+    if let Err(error) = action_result.and(audit_result.map(|_| 0)) {
+        state
+            .logger
+            .write("ERROR", &format!("人工群管操作归档失败：{}", error.message));
+        if result.is_ok() {
+            return Err(AppError::new(
+                "manual_action_archive",
+                "操作已发送，但本地归档失败，请查看调试日志",
+            ));
+        }
+    }
+    result
 }
 
 async fn require_manager(state: &State<'_, AppState>, group_id: i64) -> AppResult<()> {
@@ -1785,8 +2110,13 @@ macro_rules! dh_handlers {
             test_ai,
             test_prediction,
             locate_wangshangliao,
+            get_wang_startup_settings,
+            save_wang_startup_settings,
+            take_wang_startup_status,
             start_wangshangliao,
             inspect_wangshangliao,
+            get_gateway_capabilities,
+            get_wang_maintenance_result,
             get_wang_profile_status,
             apply_wang_profile_patch,
             restore_wang_profile_patch,
@@ -1856,35 +2186,175 @@ fn request_graceful_exit(app: tauri::AppHandle) {
     if state.exit_started.swap(true, Ordering::AcqRel) {
         return;
     }
-    state.shutdown.notify_waiters();
+    state.shutdown.cancel();
     let database = state.database_executor.clone();
     let tasks = state.runtime_tasks.clone();
     tauri::async_runtime::spawn(async move {
-        let handles = tasks
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let worker_deadline = deadline - Duration::from_secs(1);
+        let mut handles = tasks
             .lock()
             .map(|mut handles| std::mem::take(&mut *handles))
             .unwrap_or_default();
-        let worker_wait = async move {
-            for handle in handles {
+        let worker_wait = async {
+            for handle in &mut handles {
                 let _ = handle.await;
             }
         };
-        let timed_out = tokio::time::timeout(Duration::from_secs(4), worker_wait)
+        let timed_out = tokio::time::timeout_at(worker_deadline, worker_wait)
             .await
             .is_err();
         if timed_out {
-            let _ = database
-                .mark_processing_effects_unknown("DH BOT 退出等待超时，远端执行结果未确认".into())
-                .await;
+            for handle in &handles {
+                handle.abort();
+            }
+            let unknown_deadline = deadline
+                .checked_sub(Duration::from_millis(500))
+                .unwrap_or(deadline);
+            let _ = tokio::time::timeout_at(
+                unknown_deadline,
+                database.mark_processing_effects_unknown(
+                    "DH BOT 退出等待超时，远端执行结果未确认".into(),
+                ),
+            )
+            .await;
         }
-        let _ = tokio::time::timeout(Duration::from_secs(1), database.shutdown()).await;
+        let _ = tokio::time::timeout_at(deadline, database.shutdown()).await;
         app.exit(0);
     });
+}
+
+async fn capability_calibration_loop(
+    app: tauri::AppHandle,
+    gateway: Arc<dyn RuntimeGateway>,
+    database: DatabaseExecutor,
+    shutdown: Arc<ShutdownSignal>,
+) {
+    let mut calibrated_identity: Option<(String, String)> = None;
+    loop {
+        let configured_path = database
+            .get_setting("wangshangliao.path".into())
+            .await
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        let identity = match platform::running_process_identity_for(configured_path).await {
+            Ok(Some(process)) => {
+                let script_hash = platform::profile_status(Some(process.image_path))
+                    .await
+                    .map(|status| status.script_hash)
+                    .unwrap_or_default();
+                Some((process.file_version, script_hash))
+            }
+            _ => None,
+        };
+        if identity != calibrated_identity {
+            let capabilities = match &identity {
+                Some((version, script_hash)) => {
+                    gateway.calibrate_capabilities(version, script_hash)
+                }
+                None => gateway.calibrate_capabilities("", ""),
+            };
+            let _ = app.emit("gateway-capabilities", capabilities);
+            calibrated_identity = identity;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn auto_start_wangshangliao(
+    app: tauri::AppHandle,
+    database: DatabaseExecutor,
+    shutdown: Arc<ShutdownSignal>,
+    startup_status: Arc<Mutex<Option<WangStartupEvent>>>,
+    start_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    let enabled = wang_auto_start_enabled(
+        database
+            .get_setting("wangshangliao.auto_start".into())
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    if !enabled || shutdown.is_cancelled() {
+        return;
+    }
+    let _start_guard = start_lock.lock().await;
+    let path = database
+        .get_setting("wangshangliao.path".into())
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let mut start_result =
+        platform::start(path.clone(), "http://127.0.0.1:9222".into(), false).await;
+    if let Ok(result) = &start_result {
+        if let Some(request_id) = &result.maintenance_request_id {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match platform::maintenance_result(request_id) {
+                    Ok(Some(result)) if result.success => {
+                        start_result =
+                            platform::start(path.clone(), "http://127.0.0.1:9222".into(), false)
+                                .await;
+                        break;
+                    }
+                    Ok(Some(result)) => {
+                        start_result = Err(AppError::new(result.error_code, result.message));
+                        break;
+                    }
+                    Err(error) => {
+                        start_result = Err(error);
+                        break;
+                    }
+                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                            _ = shutdown.cancelled() => return,
+                        }
+                    }
+                    Ok(None) => {
+                        start_result = Err(AppError::new(
+                            "maintenance_timeout",
+                            "等待旺商聊固定登录分区维护完成超时，请在设置页重新检查",
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let payload = match start_result {
+        Ok(result) => WangStartupEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            status: result.status,
+            detail: result.detail,
+            needs_confirmation: result.needs_confirmation,
+        },
+        Err(error) => WangStartupEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            status: error.code,
+            detail: error.message,
+            needs_confirmation: false,
+        },
+    };
+    if let Ok(mut pending) = startup_status.lock() {
+        *pending = Some(payload.clone());
+    }
+    let _ = app.emit("wangshangliao-status", payload);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if platform::run_maintenance_if_requested() {
+        return;
+    }
+    if !platform::ensure_webview2_runtime() {
         return;
     }
     // Register single-instance arbitration before opening SQLite, logs or any
@@ -1902,7 +2372,7 @@ pub fn run() {
     ]);
     #[cfg(not(feature = "fixture"))]
     let builder = builder.invoke_handler(dh_handlers![]);
-    builder
+    if let Err(error) = builder
         .on_tray_icon_event(|app, event| {
             let restore = matches!(
                 event,
@@ -1999,11 +2469,27 @@ pub fn run() {
                 app.state::<AppState>().shutdown.clone(),
                 app.state::<AppState>().logger.clone(),
             ));
+            if app.state::<AppState>().paths.runtime_mode() == "real" {
+                runtime_tasks.push(tauri::async_runtime::spawn(capability_calibration_loop(
+                    app.handle().clone(),
+                    app.state::<AppState>().gateway.clone(),
+                    app.state::<AppState>().database_executor.clone(),
+                    app.state::<AppState>().shutdown.clone(),
+                )));
+                #[cfg(windows)]
+                runtime_tasks.push(tauri::async_runtime::spawn(auto_start_wangshangliao(
+                    app.handle().clone(),
+                    app.state::<AppState>().database_executor.clone(),
+                    app.state::<AppState>().shutdown.clone(),
+                    app.state::<AppState>().startup_status.clone(),
+                    app.state::<AppState>().wang_start_lock.clone(),
+                )));
+            }
             if let Ok(mut tasks) = app.state::<AppState>().runtime_tasks.lock() {
                 *tasks = runtime_tasks;
             }
             tauri::async_runtime::spawn(async move {
-                shutdown.notified().await;
+                shutdown.cancelled().await;
                 if let Some(window) = app_handle.get_webview_window("main") {
                     let _ = window.close();
                 }
@@ -2044,12 +2530,18 @@ pub fn run() {
             _ => {}
         })
         .run(tauri::generate_context!())
-        .expect("DH BOT 3.0 failed to start");
+    {
+        platform::show_startup_error(&format!("DH BOT 启动失败：{error}"));
+    }
 }
 
 #[cfg(test)]
 mod close_behavior_tests {
-    use super::normalize_close_behavior;
+    use super::{
+        manual_event_name, normalize_close_behavior, redact_archived_receipt,
+        wang_auto_start_enabled,
+    };
+    use crate::gateway::GatewayReceipt;
 
     #[test]
     fn accepts_only_persisted_close_choices() {
@@ -2058,5 +2550,37 @@ mod close_behavior_tests {
         assert_eq!(normalize_close_behavior(Some("ask")), "ask");
         assert_eq!(normalize_close_behavior(Some("fixture")), "ask");
         assert_eq!(normalize_close_behavior(None), "ask");
+    }
+
+    #[test]
+    fn wangshangliao_auto_start_defaults_on_and_honors_explicit_off() {
+        assert!(wang_auto_start_enabled(None));
+        assert!(wang_auto_start_enabled(Some("true")));
+        assert!(!wang_auto_start_enabled(Some("false")));
+    }
+
+    #[test]
+    fn manual_action_archive_uses_chinese_events_and_redacted_receipts() {
+        assert_eq!(manual_event_name("recall"), "人工撤回消息");
+        let secret = ["sk", "-", "abcdefghijklmnopqrstuvwxyz"].concat();
+        let receipt = redact_archived_receipt(GatewayReceipt {
+            route: format!("/send?token={secret}"),
+            status: "succeeded".into(),
+            transport_code: Some(200),
+            transport_errno: Some(0),
+            business_code: Some(200),
+            business_errno: Some(0),
+            business_message: format!("Authorization: Bearer {secret}"),
+            request_id: secret.clone(),
+            message_id: "MESSAGE".into(),
+            session: secret.clone(),
+            acknowledged_through: 0,
+            acknowledged: 0,
+            remaining: 0,
+            dropped: 0,
+        });
+        let archived = serde_json::to_string(&receipt).unwrap();
+        assert!(!archived.contains(&secret));
+        assert!(archived.contains("***"));
     }
 }

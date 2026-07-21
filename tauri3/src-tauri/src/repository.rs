@@ -546,6 +546,17 @@ impl Database {
         .map_err(|error| AppError::new("task_reminder_finish", error.to_string()))
     }
 
+    pub fn mark_task_reminder_unknown(&self, task_id: i64, error: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE tasks SET reminder_state='unknown',reminder_claimed_at=NULL,reminder_next_attempt_at=NULL,reminder_last_error=?,updated_at=? WHERE id=? AND reminder_state='processing'",
+                params![error, Utc::now().to_rfc3339(), task_id],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("task_reminder_unknown", error.to_string()))
+    }
+
     pub fn delete_task(&self, account_id: &str, task_id: i64) -> AppResult<()> {
         self.with_connection(|connection| {
             connection.execute(
@@ -745,6 +756,17 @@ impl Database {
         })
         .map(|_| ())
         .map_err(|error| AppError::new("schedule_run", error.to_string()))
+    }
+
+    pub fn mark_schedule_run_unknown(&self, run_key: &str, error: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE schedule_runs SET success=0,error=?,attempts=MAX(attempts,5),next_retry_at=NULL WHERE run_key=?",
+                params![error, run_key],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("schedule_run_unknown", error.to_string()))
     }
 
     pub fn record_action(&self, action: &ActionRecord) -> AppResult<i64> {

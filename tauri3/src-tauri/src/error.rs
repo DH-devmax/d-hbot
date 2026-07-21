@@ -95,6 +95,21 @@ impl AppError {
         self.gateway = Some(Box::new(metadata));
         self
     }
+
+    pub fn delivery_outcome_unknown(&self) -> bool {
+        if let Some(gateway) = self.gateway.as_deref() {
+            return matches!(
+                gateway.kind,
+                GatewayErrorKind::Transport | GatewayErrorKind::Decode | GatewayErrorKind::Unknown
+            ) || matches!(
+                gateway.layer,
+                GatewayErrorLayer::Transport
+                    | GatewayErrorLayer::Response
+                    | GatewayErrorLayer::Delivery
+            );
+        }
+        self.retryable
+    }
 }
 
 impl std::fmt::Display for AppError {
@@ -134,3 +149,27 @@ impl From<InternalError> for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_delivery_errors_are_not_automatic_retry_candidates() {
+        let transport = AppError::new("gateway_transport", "timeout").with_gateway(
+            GatewayErrorMetadata::new("/send", GatewayErrorLayer::Transport)
+                .with_kind(GatewayErrorKind::Transport),
+        );
+        let delivery = AppError::new("send_receipt_missing", "missing id").with_gateway(
+            GatewayErrorMetadata::new("nim.send", GatewayErrorLayer::Delivery)
+                .with_kind(GatewayErrorKind::Business),
+        );
+        let permission = AppError::new("permission", "denied").with_gateway(
+            GatewayErrorMetadata::new("/mute", GatewayErrorLayer::Business)
+                .with_kind(GatewayErrorKind::Permission),
+        );
+        assert!(transport.delivery_outcome_unknown());
+        assert!(delivery.delivery_outcome_unknown());
+        assert!(!permission.delivery_outcome_unknown());
+    }
+}

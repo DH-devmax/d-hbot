@@ -10,6 +10,7 @@ tauri3/test-results/
 tauri3/playwright-report/
 tauri3/src-tauri/gen/
 tauri3/src-tauri/resources/tools/
+tauri3/contracts/raw/
 output/playwright/
 .playwright-cli/
 *.db

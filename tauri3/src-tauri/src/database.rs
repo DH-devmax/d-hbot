@@ -529,9 +529,17 @@ impl DatabaseExecutor {
             .map_err(|_| AppError::new("database_executor_shutdown", "SQLite 线程锁已损坏"))?
             .take();
         if let Some(worker) = worker {
-            worker.join().map_err(|_| {
-                AppError::new("database_executor_shutdown", "SQLite 执行线程异常退出")
-            })?;
+            tokio::task::spawn_blocking(move || worker.join())
+                .await
+                .map_err(|error| {
+                    AppError::new(
+                        "database_executor_shutdown",
+                        format!("SQLite 执行线程等待失败：{error}"),
+                    )
+                })?
+                .map_err(|_| {
+                    AppError::new("database_executor_shutdown", "SQLite 执行线程异常退出")
+                })?;
         }
         Ok(())
     }
@@ -577,6 +585,27 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn processed_gateway_event_ids(
+        &self,
+        account_id: String,
+        event_ids: Vec<String>,
+    ) -> AppResult<Vec<String>> {
+        self.execute(move |database| database.processed_gateway_event_ids(&account_id, &event_ids))
+            .await
+    }
+
+    pub async fn commit_gateway_ack(
+        &self,
+        account_id: String,
+        event_ids: Vec<String>,
+        message_ids: Vec<i64>,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.commit_gateway_ack(&account_id, &event_ids, &message_ids)
+        })
+        .await
+    }
+
     pub async fn enqueue_effect(&self, request: EffectOutboxRequest) -> AppResult<EnqueuedEffect> {
         self.execute(move |database| database.enqueue_effect(&request))
             .await
@@ -600,6 +629,18 @@ impl DatabaseExecutor {
     ) -> AppResult<()> {
         self.execute(move |database| {
             database.finish_effect_outbox(id, success, &error, &receipt_json)
+        })
+        .await
+    }
+
+    pub async fn finish_effect_outbox_unknown(
+        &self,
+        id: i64,
+        error: String,
+        receipt_json: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.finish_effect_outbox_unknown(id, &error, &receipt_json)
         })
         .await
     }
@@ -891,6 +932,11 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn mark_task_reminder_unknown(&self, task_id: i64, error: String) -> AppResult<()> {
+        self.execute(move |database| database.mark_task_reminder_unknown(task_id, &error))
+            .await
+    }
+
     pub async fn save_daily_summary(&self, summary: DailySummary) -> AppResult<i64> {
         self.execute(move |database| database.save_daily_summary(&summary))
             .await
@@ -978,6 +1024,11 @@ impl DatabaseExecutor {
         self.execute(move |database| database.finish_schedule_run(&run_key, success, &error))
             .await
     }
+
+    pub async fn mark_schedule_run_unknown(&self, run_key: String, error: String) -> AppResult<()> {
+        self.execute(move |database| database.mark_schedule_run_unknown(&run_key, &error))
+            .await
+    }
 }
 
 fn snapshot_before_migration(
@@ -1034,6 +1085,30 @@ fn add_column_if_missing(
         ))?;
     }
     Ok(())
+}
+
+fn quick_check_rows(connection: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = connection.prepare("PRAGMA quick_check")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn quick_check_connection(connection: &Connection) -> AppResult<()> {
+    let rows = quick_check_rows(connection).map_err(|error| {
+        AppError::new(
+            "database_corrupt",
+            format!("SQLite 完整性检查失败：{error}"),
+        )
+    })?;
+    if rows.len() == 1 && rows[0] == "ok" {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "database_corrupt",
+        format!("SQLite 完整性检查失败：{}", rows.join("；")),
+    ))
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
@@ -1155,6 +1230,9 @@ impl Database {
         let mut connection = Connection::open(&paths.database).map_err(|error| {
             AppError::new("database_open", format!("打开 3.0 数据库失败：{error}"))
         })?;
+        if database_existed {
+            quick_check_connection(&connection)?;
+        }
         let old_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| AppError::new("database_version", error.to_string()))?;
@@ -1224,18 +1302,22 @@ impl Database {
     }
 
     pub fn quick_check(&self) -> AppResult<()> {
-        let result: String = self
-            .with_connection(|connection| {
-                connection.query_row("PRAGMA quick_check", [], |row| row.get(0))
-            })
-            .map_err(InternalError::from)?;
-        if result != "ok" {
-            return Err(AppError::new(
+        let rows = self
+            .with_connection(|connection| quick_check_rows(connection))
+            .map_err(|error| {
+                AppError::new(
+                    "database_corrupt",
+                    format!("SQLite 完整性检查失败：{error}"),
+                )
+            })?;
+        if rows.len() == 1 && rows[0] == "ok" {
+            Ok(())
+        } else {
+            Err(AppError::new(
                 "database_corrupt",
-                format!("SQLite 完整性检查失败：{result}"),
-            ));
+                format!("SQLite 完整性检查失败：{}", rows.join("；")),
+            ))
         }
-        Ok(())
     }
 
     pub fn status(&self) -> AppResult<DatabaseStatus> {
@@ -1630,7 +1712,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let ids = {
                 let mut statement = transaction.prepare(
-                    "SELECT id FROM gateway_inbox WHERE (?1 IS NULL OR account_id=?1) AND state IN ('pending','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?2) ORDER BY received_at,id LIMIT ?3",
+                    "SELECT current.id FROM gateway_inbox AS current WHERE (?1 IS NULL OR current.account_id=?1) AND current.state IN ('pending','retry') AND (current.next_attempt_at IS NULL OR current.next_attempt_at<=?2) AND NOT EXISTS (SELECT 1 FROM gateway_inbox AS prior WHERE prior.account_id=current.account_id AND prior.bridge_session=current.bridge_session AND prior.bridge_sequence>0 AND prior.bridge_sequence<current.bridge_sequence AND prior.state<>'processed') ORDER BY current.received_at,current.id LIMIT ?3",
                 )?;
                 let result = statement
                     .query_map(
@@ -1709,6 +1791,57 @@ impl Database {
             Ok(changed)
         })
         .map_err(|error| AppError::new("gateway_inbox_mark_processed", error.to_string()))
+    }
+
+    pub fn processed_gateway_event_ids(
+        &self,
+        account_id: &str,
+        event_ids: &[String],
+    ) -> AppResult<Vec<String>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT state FROM gateway_inbox WHERE account_id=? AND event_id=?")?;
+            let mut processed = Vec::new();
+            for event_id in event_ids {
+                let state = statement
+                    .query_row(params![account_id, event_id], |row| row.get::<_, String>(0))
+                    .optional()?;
+                if state.as_deref() == Some("processed") {
+                    processed.push(event_id.clone());
+                }
+            }
+            Ok(processed)
+        })
+        .map_err(|error| AppError::new("gateway_inbox_state", error.to_string()))
+    }
+
+    pub fn commit_gateway_ack(
+        &self,
+        account_id: &str,
+        event_ids: &[String],
+        message_ids: &[i64],
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            for message_id in message_ids {
+                transaction.execute(
+                    "UPDATE messages SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE id=? AND account_id=?",
+                    params![now, message_id, account_id],
+                )?;
+            }
+            for event_id in event_ids {
+                transaction.execute(
+                    "UPDATE gateway_inbox SET state='processed',processed_at=COALESCE(processed_at,?),claimed_at=NULL,next_attempt_at=NULL,last_error='' WHERE account_id=? AND event_id=?",
+                    params![now, account_id, event_id],
+                )?;
+            }
+            transaction.commit()
+        })
+        .map_err(|error| AppError::new("gateway_ack_commit", error.to_string()))
     }
 
     pub fn enqueue_effect(&self, request: &EffectOutboxRequest) -> AppResult<EnqueuedEffect> {
@@ -1816,6 +1949,22 @@ impl Database {
         .map_err(|error| AppError::new("effect_outbox_finish", error.to_string()))
     }
 
+    pub fn finish_effect_outbox_unknown(
+        &self,
+        id: i64,
+        error: &str,
+        receipt_json: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE effect_outbox SET state='unknown',claimed_at=NULL,next_attempt_at=NULL,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
+                params![error, receipt_json, id],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("effect_outbox_unknown", error.to_string()))
+    }
+
     pub fn mark_processing_effects_unknown(&self, reason: &str) -> AppResult<usize> {
         let receipt = serde_json::json!({
             "status": "unknown",
@@ -1913,7 +2062,7 @@ impl Database {
 
     pub fn list_pending_messages(&self, account_id: &str, limit: usize) -> AppResult<Vec<Message>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=? AND processed_at IS NULL AND processing_state IN ('pending','queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY sequence,id LIMIT ?")?;
+            let mut statement = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=? AND acknowledged_at IS NOT NULL AND processed_at IS NULL AND processing_state IN ('pending','queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY sequence,id LIMIT ?")?;
             let rows = statement.query_map(params![account_id, Utc::now().to_rfc3339(), limit.clamp(1, 1000) as i64], message_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("messages_pending", error.to_string()))
@@ -2316,10 +2465,7 @@ mod tests {
             Ok(_) => panic!("损坏数据库不应被当作新库覆盖"),
             Err(error) => error,
         };
-        assert!(matches!(
-            error.code.as_str(),
-            "database_version" | "database_schema" | "database_corrupt"
-        ));
+        assert_eq!(error.code, "database_corrupt");
         assert_eq!(std::fs::read(&paths.database).unwrap(), original);
     }
 
@@ -2521,6 +2667,12 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(
+            database
+                .processed_gateway_event_ids("a", &["event-1".into(), "event-2".into()])
+                .unwrap(),
+            vec!["event-2".to_string()]
+        );
         let claimed = database.claim_gateway_inbox(Some("a"), 10).unwrap();
         assert_eq!(claimed.len(), 1);
         assert!(database
@@ -2587,6 +2739,144 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(database.enqueue_effect(&effect).unwrap().state, "succeeded");
+    }
+
+    #[test]
+    fn gateway_inbox_retry_never_skips_an_unconfirmed_lower_sequence() {
+        let database = populated_database();
+        let now = Utc::now();
+        let events = [1_i64, 2_i64]
+            .into_iter()
+            .map(|sequence| GatewayInboxEvent {
+                account_id: "a".into(),
+                bridge_session: "ordered-session".into(),
+                bridge_sequence: sequence,
+                event_id: format!("ordered-{sequence}"),
+                event_type: "message".into(),
+                payload_json: format!("{{\"sequence\":{sequence}}}"),
+                received_at: now,
+            })
+            .collect::<Vec<_>>();
+        database.ingest_gateway_inbox_batch(&events).unwrap();
+        let first = database.claim_gateway_inbox(Some("a"), 10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].bridge_sequence, 1);
+        database
+            .finish_gateway_inbox(first[0].id, false, "ACK 失败")
+            .unwrap();
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE gateway_inbox SET state='failed',next_attempt_at=NULL WHERE id=?",
+                    params![first[0].id],
+                )
+            })
+            .unwrap();
+        assert!(database
+            .claim_gateway_inbox(Some("a"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn gateway_ack_commit_is_atomic_and_retryable_after_local_failure() {
+        let database = populated_database();
+        let now = Utc::now();
+        database
+            .ingest_gateway_inbox_batch(&[GatewayInboxEvent {
+                account_id: "a".into(),
+                bridge_session: "session-ack".into(),
+                bridge_sequence: 7,
+                event_id: "event-ack".into(),
+                event_type: "message".into(),
+                payload_json: "{\"idServer\":\"message-ack\"}".into(),
+                received_at: now,
+            }])
+            .unwrap();
+        let persisted = database
+            .insert_message(&Message {
+                id: 0,
+                account_id: "a".into(),
+                group_id: 1,
+                server_message_id: "message-ack".into(),
+                sequence: 7,
+                user_id: 2,
+                sender_name: "M".into(),
+                kind: "text".into(),
+                text: "hello".into(),
+                sent_at: now,
+                received_at: now,
+                processed_at: None,
+                acknowledged_at: None,
+                processing_state: "pending".into(),
+                attempts: 0,
+                next_attempt_at: None,
+                last_error: String::new(),
+                mentions_json: "[]".into(),
+                source_kind: Some("nim".into()),
+                flow: Some("inbound".into()),
+            })
+            .unwrap();
+
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_gateway_ack
+                     BEFORE UPDATE OF state ON gateway_inbox
+                     WHEN NEW.event_id='event-ack'
+                     BEGIN SELECT RAISE(ABORT, 'injected local commit failure'); END;",
+                )
+            })
+            .unwrap();
+        let error = database
+            .commit_gateway_ack("a", &["event-ack".into()], &[persisted.id])
+            .unwrap_err();
+        assert_eq!(error.code, "gateway_ack_commit");
+        let (acknowledged_at, inbox_state): (Option<String>, String) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT acknowledged_at FROM messages WHERE id=?",
+                        params![persisted.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state FROM gateway_inbox WHERE account_id='a' AND event_id='event-ack'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert!(acknowledged_at.is_none());
+        assert_eq!(inbox_state, "pending");
+
+        database
+            .with_connection(|connection| connection.execute_batch("DROP TRIGGER fail_gateway_ack"))
+            .unwrap();
+        database
+            .commit_gateway_ack("a", &["event-ack".into()], &[persisted.id])
+            .unwrap();
+        database
+            .commit_gateway_ack("a", &["event-ack".into()], &[persisted.id])
+            .unwrap();
+        let (acknowledged, processed): (i64, i64) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT acknowledged_at IS NOT NULL FROM messages WHERE id=?",
+                        params![persisted.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT state='processed' FROM gateway_inbox WHERE account_id='a' AND event_id='event-ack'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((acknowledged, processed), (1, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2799,6 +3089,54 @@ mod tests {
         executor.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn ambiguous_effect_receipt_is_terminal_until_manual_retry() {
+        let executor = DatabaseExecutor::start(populated_database()).unwrap();
+        executor
+            .enqueue_effect(EffectOutboxRequest {
+                account_id: "a".into(),
+                group_id: 1,
+                effect_type: "send_text".into(),
+                payload_json: "{\"text\":\"hello\"}".into(),
+                dedupe_key: "ambiguous-effect".into(),
+            })
+            .await
+            .unwrap();
+        let claimed = executor
+            .claim_effect_outbox(Some("a".into()), 1)
+            .await
+            .unwrap();
+        executor
+            .finish_effect_outbox_unknown(
+                claimed[0].id,
+                "远端结果未确认".into(),
+                "{\"status\":\"unknown\"}".into(),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .claim_effect_outbox(Some("a".into()), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let state = executor
+            .execute(|database| {
+                database
+                    .with_connection(|connection| {
+                        connection.query_row(
+                            "SELECT state FROM effect_outbox WHERE dedupe_key='ambiguous-effect'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                    })
+                    .map_err(|error| AppError::new("test_query", error.to_string()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "unknown");
+        executor.shutdown().await.unwrap();
+    }
+
     #[test]
     fn real_member_identity_merges_provisional_state_transactionally() {
         let database = populated_database();
@@ -2917,6 +3255,7 @@ mod tests {
             flow: None,
         };
         let persisted = database.insert_message(&message).unwrap();
+        assert!(database.list_pending_messages("a", 10).unwrap().is_empty());
         database.mark_message_acknowledged(persisted.id).unwrap();
         assert!(database.claim_message(persisted.id).unwrap());
         assert!(!database.claim_message(persisted.id).unwrap());

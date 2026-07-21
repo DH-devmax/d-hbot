@@ -1,21 +1,20 @@
 use std::sync::Arc;
 
+use crate::diagnostics::Logger;
+use crate::error::AppError;
+use crate::gateway::RuntimeGateway;
+use crate::models::MemberRef;
+use crate::shutdown::ShutdownSignal;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Notify;
-
-use crate::diagnostics::Logger;
-use crate::error::AppError;
-use crate::gateway::RuntimeGateway;
-use crate::models::MemberRef;
 
 pub fn spawn(
     gateway: Arc<dyn RuntimeGateway>,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<ShutdownSignal>,
     logger: Logger,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
@@ -34,21 +33,21 @@ pub fn spawn(
         let listener = loop {
             let bind = tokio::net::TcpListener::bind("127.0.0.1:51235");
             match tokio::select! {
-                _ = shutdown.notified() => return,
+                _ = shutdown.cancelled() => return,
                 result = bind => result,
             } {
                 Ok(listener) => break listener,
                 Err(error) => {
                     logger.write("WARN", &format!("本地诊断桥监听失败，5 秒后重试：{error}"));
                     tokio::select! {
-                        _ = shutdown.notified() => return,
+                        _ = shutdown.cancelled() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                     }
                 }
             }
         };
         if let Err(error) = axum::serve(listener, router)
-            .with_graceful_shutdown(async move { shutdown.notified().await })
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
             .await
         {
             logger.write("ERROR", &format!("本地诊断桥退出：{error}"));

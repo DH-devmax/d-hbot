@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Check, ChevronLeft, ChevronRight, Filter, RefreshCw, Search, Send, Undo2 } from 'lucide-react'
 import { api, readableError } from '../api/client'
 import { EmptyState, PageFeedback, SectionHeading } from '../components/PageState'
-import type { Group, Message } from '../types'
+import type { Group, LoadState, Message } from '../types'
 
 const kindLabels: Record<string, string> = { text: '文本', image: '图片', card: '名片', other: '其他' }
 const stateLabels: Record<string, string> = { processed: '已处理', pending: '待处理', processing: '处理中', failed: '失败' }
@@ -13,7 +13,7 @@ export default function MessagesPage({ groups, accountId, onError }: { groups: G
   const [kind, setKind] = useState('all')
   const [processingState, setProcessingState] = useState('all')
   const [messages, setMessages] = useState<Message[]>([])
-  const [state, setState] = useState<'idle' | 'loading' | 'empty' | 'ready' | 'error'>('idle')
+  const [state, setState] = useState<LoadState>('idle')
   const [error, setError] = useState('')
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
@@ -26,7 +26,7 @@ export default function MessagesPage({ groups, accountId, onError }: { groups: G
     try {
       const result = await api.queryMessages(accountId, { groupIds: selectedGroups, keyword, kind, processingState }, undefined, 500)
       setMessages(result.items); setPage(0); setState(result.items.length ? 'ready' : 'empty')
-    } catch (reason) { setError(readableError(reason)); setState('error') }
+    } catch (reason) { setError(readableError(reason)); setState(messages.length ? 'offlineCached' : 'error') }
   }
   useEffect(() => { void reload() }, [accountId])
   const visible = useMemo(() => messages.slice(page * pageSize, (page + 1) * pageSize), [messages, page])

@@ -33,6 +33,10 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if ($Channel -eq 'production') {
   & node (Join-Path $Root 'scripts\verify-build-boundary.mjs')
   if ($LASTEXITCODE -ne 0) { throw '生产构建边界校验失败' }
+  if ($RequireSignature) {
+    & signtool verify /pa /all (Join-Path $Target 'dh-bot.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'NSIS 打包前主程序未通过 Authenticode 校验' }
+  }
   Copy-Item (Join-Path $Target 'dh-bot.exe') (Join-Path $Dist 'DH-BOT.exe')
   $Installer = Get-ChildItem (Join-Path $Target 'bundle\nsis') -Filter '*.exe' | Select-Object -First 1
   if (-not $Installer) { throw '没有找到 Tauri NSIS 安装器' }
@@ -42,7 +46,7 @@ if ($Channel -eq 'production') {
   Copy-Item (Join-Path $ProjectRoot 'docs\DH-Manual-ZH.pdf') (Join-Path $Dist 'DH-Manual-ZH.pdf')
   Copy-Item (Join-Path $ProjectRoot 'package\ZCG-Compatible-Rules.json') (Join-Path $Dist 'ZCG-Compatible-Rules.json')
   Get-ChildItem $Dist -Filter '*.exe' | ForEach-Object { Sign-Artifact $_.FullName }
-  & (Join-Path $Root 'scripts\verify-windows-production.ps1') -ArtifactDirectory $Dist
+  & (Join-Path $Root 'scripts\verify-windows-production.ps1') -ArtifactDirectory $Dist -RequireSignature:$RequireSignature
   if ($LASTEXITCODE -ne 0) { throw 'Windows 生产产物深度扫描失败' }
   $Zip = Join-Path $Root "dist\DH-BOT-$Version-windows-x64-portable.zip"
   Remove-Item $Zip -Force -ErrorAction SilentlyContinue

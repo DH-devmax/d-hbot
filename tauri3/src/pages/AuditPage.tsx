@@ -2,14 +2,14 @@ import { useEffect, useMemo, useState } from 'react'
 import { Download, Filter, RefreshCw, Search, X } from 'lucide-react'
 import { api, readableError } from '../api/client'
 import { PageFeedback, SectionHeading } from '../components/PageState'
-import type { Audit, Group } from '../types'
+import type { Audit, Group, LoadState } from '../types'
 
 const eventLabels: Record<string, string> = { message_received: '收到消息', rule_matched: '规则命中', action_executed: '执行群管动作', ai_reply: 'AI 回复', member_joined: '成员入群', member_left: '成员离群', member_updated: '成员资料变更', card_renamed: '群名片修改', schedule_open: '定时开群', schedule_close: '定时关群', daily_summary: '生成每日摘要' }
 const levelLabels: Record<string, string> = { info: '信息', warning: '警告', error: '错误', success: '成功' }
 
 export default function AuditPage({ accountId, groups, onError }: { accountId: string; groups: Group[]; onError: (value: string) => void }) {
-  const [audits, setAudits] = useState<Audit[]>([]); const [state, setState] = useState<'idle'|'loading'|'empty'|'ready'|'error'>('idle'); const [keyword, setKeyword] = useState(''); const [groupId, setGroupId] = useState(0); const [level, setLevel] = useState('all'); const [date, setDate] = useState(''); const [detail, setDetail] = useState<Audit | null>(null)
-  const reload = async () => { if (!accountId) { setState('empty'); return }; setState('loading'); try { const result = await api.queryAudit(accountId, { groupId: groupId || undefined, level, from: date ? `${date}T00:00:00Z` : undefined, to: date ? `${date}T23:59:59Z` : undefined }); setAudits(result.items); setState(result.items.length ? 'ready' : 'empty') } catch (reason) { onError(readableError(reason)); setState('error') } }
+  const [audits, setAudits] = useState<Audit[]>([]); const [state, setState] = useState<LoadState>('idle'); const [keyword, setKeyword] = useState(''); const [groupId, setGroupId] = useState(0); const [level, setLevel] = useState('all'); const [date, setDate] = useState(''); const [detail, setDetail] = useState<Audit | null>(null)
+  const reload = async () => { if (!accountId) { setAudits([]); setState('empty'); return }; setState('loading'); try { const result = await api.queryAudit(accountId, { groupId: groupId || undefined, level, from: date ? `${date}T00:00:00Z` : undefined, to: date ? `${date}T23:59:59Z` : undefined }); setAudits(result.items); setState(result.items.length ? 'ready' : 'empty') } catch (reason) { onError(readableError(reason)); setState(audits.length ? 'offlineCached' : 'error') } }
   useEffect(() => { void reload() }, [accountId])
   const filtered = useMemo(() => { const term = keyword.trim().toLocaleLowerCase(); return audits.filter(item => (!groupId || item.groupId === groupId) && (level === 'all' || item.level === level) && (!date || item.createdAt.slice(0, 10) === date) && (!term || `${item.event} ${item.details} ${item.actor} ${item.userId}`.toLocaleLowerCase().includes(term))) }, [audits, keyword, groupId, level, date])
   const exportData = async (format: 'json'|'csv') => { try { const content = await api.exportAudit(accountId, format); const blob = new Blob([content || (format === 'json' ? JSON.stringify(filtered, null, 2) : toCsv(filtered))], { type: format === 'json' ? 'application/json;charset=utf-8' : 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `dh-audit.${format}`; link.click(); URL.revokeObjectURL(url) } catch (reason) { onError(readableError(reason)) } }

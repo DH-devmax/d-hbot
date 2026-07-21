@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Download, Pencil, Plus, RefreshCw, Save, ShieldCheck, Trash2, Upload } from 'lucide-react'
 import { api, readableError } from '../api/client'
 import { EmptyState, PageFeedback, SectionHeading } from '../components/PageState'
-import type { Group, Rule } from '../types'
+import type { Group, LoadState, Rule } from '../types'
 
 const actionLabels: Record<string, string> = { recall: '撤回', mute: '禁言', remove: '移出', blacklist: '拉黑', notify: '提示' }
 const matcherLabels: Record<string, string> = { contains: '包含关键词', exact: '精确匹配', prefix: '前缀匹配', regex: '正则表达式', semantic: 'AI 语义' }
@@ -10,8 +10,8 @@ const matcherLabels: Record<string, string> = { contains: '包含关键词', exa
 function blankRule(accountId: string): Rule { return { id: 0, accountId, groupId: 0, name: '新规则', matcher: 'contains', pattern: '', threshold: 0, count: 0, windowSeconds: 0, cooldownSeconds: 0, priority: 100, mode: 'observe', enabled: false, semanticThreshold: 0.8, exemptRoles: ['owner', 'admin'], exemptUserIds: [], actions: [{ kind: 'recall', durationSeconds: 0, message: '' }] } }
 
 export default function RulesPage({ accountId, groups, onError }: { accountId: string; groups: Group[]; onError: (value: string) => void }) {
-  const [rules, setRules] = useState<Rule[]>([]); const [selected, setSelected] = useState<number | null>(null); const [state, setState] = useState<'idle'|'loading'|'empty'|'ready'|'error'>('idle'); const [error, setError] = useState(''); const [saving, setSaving] = useState(false)
-  const reload = async () => { if (!accountId) { setState('empty'); return }; setState('loading'); try { const result = await api.listRules(accountId); setRules(result); setSelected(current => current && result.some(rule => rule.id === current) ? current : result[0]?.id ?? null); setState(result.length ? 'ready' : 'empty') } catch (reason) { setError(readableError(reason)); setState('error') } }
+  const [rules, setRules] = useState<Rule[]>([]); const [selected, setSelected] = useState<number | null>(null); const [state, setState] = useState<LoadState>('idle'); const [error, setError] = useState(''); const [saving, setSaving] = useState(false)
+  const reload = async () => { if (!accountId) { setRules([]); setState('empty'); return }; setState('loading'); setError(''); try { const result = await api.listRules(accountId); setRules(result); setSelected(current => current && result.some(rule => rule.id === current) ? current : result[0]?.id ?? null); setState(result.length ? 'ready' : 'empty') } catch (reason) { setError(readableError(reason)); setState(rules.length ? 'offlineCached' : 'error') } }
   useEffect(() => { void reload() }, [accountId])
   const current = rules.find(rule => rule.id === selected) || null
   const update = (patch: Partial<Rule>) => { if (!current) return; setRules(values => values.map(rule => rule.id === current.id ? { ...rule, ...patch } : rule)) }

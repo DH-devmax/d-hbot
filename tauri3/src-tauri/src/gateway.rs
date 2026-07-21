@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+use crate::contracts::{runtime_capabilities, unverified_production_capabilities};
 use crate::error::{
     AppError, AppResult, GatewayErrorKind, GatewayErrorLayer, GatewayErrorMetadata,
 };
@@ -174,6 +175,11 @@ struct DevToolsPage {
     web_socket_debugger_url: Option<String>,
 }
 
+fn is_wangshangliao_page(page: &DevToolsPage) -> bool {
+    let identity = format!("{} {}", page.title, page.url).to_lowercase();
+    identity.contains("旺商聊") || identity.contains("wangshangliao")
+}
+
 #[derive(Clone)]
 pub struct CdpClient {
     base_url: String,
@@ -233,23 +239,30 @@ impl CdpClient {
 
     async fn page(&self) -> AppResult<DevToolsPage> {
         let pages = self.pages().await?;
-        pages
+        let candidates = pages
             .into_iter()
             .filter(|page| page.page_type == "page")
             .filter(|page| page.web_socket_debugger_url.is_some())
+            .collect::<Vec<_>>();
+        if let Some(page) = candidates
+            .iter()
+            .filter(|page| is_wangshangliao_page(page))
             .max_by_key(|page| {
-                let value = format!("{} {}", page.title, page.url).to_lowercase();
-                if value.contains("旺商聊") || value.contains("wangshangliao") {
-                    3
-                } else if value.contains("rsbuild") {
-                    2
-                } else {
-                    1
-                }
+                let identity = format!("{} {}", page.title, page.url).to_lowercase();
+                usize::from(identity.contains("旺商聊")) * 2
+                    + usize::from(identity.contains("wangshangliao"))
             })
-            .ok_or_else(|| {
-                AppError::new("devtools_page", "DevTools 中没有可用的旺商聊页面").retryable()
-            })
+        {
+            return Ok(page.clone());
+        }
+        if candidates.is_empty() {
+            Err(AppError::new("devtools_page", "DevTools 中没有可用的页面").retryable())
+        } else {
+            Err(AppError::new(
+                "devtools_other_service",
+                "9222 端口已被其他程序的 DevTools 占用",
+            ))
+        }
     }
 
     pub async fn evaluate(&self, expression: &str) -> AppResult<Value> {
@@ -326,6 +339,15 @@ impl CdpClient {
         let page = match self.page().await {
             Ok(page) => page,
             Err(error) => {
+                if matches!(
+                    error.code.as_str(),
+                    "devtools_other_service"
+                        | "devtools_http"
+                        | "devtools_response"
+                        | "devtools_page"
+                ) {
+                    snapshot.status = ConnectionStatus::OtherService;
+                }
                 snapshot.detail = error.message;
                 return snapshot;
             }
@@ -406,6 +428,7 @@ impl CapabilityStatus {
 #[serde(rename_all = "camelCase")]
 pub struct GatewayCapabilities {
     pub announcement: CapabilityStatus,
+    pub send_text: CapabilityStatus,
     pub mute: CapabilityStatus,
     pub recall: CapabilityStatus,
     pub rename: CapabilityStatus,
@@ -434,6 +457,13 @@ pub trait RuntimeGateway: GroupGateway {
     async fn poll_events(&self) -> AppResult<Vec<GatewayEvent>> {
         Ok(Vec::new())
     }
+    fn calibrate_capabilities(
+        &self,
+        _app_file_version: &str,
+        _main_script_sha256: &str,
+    ) -> GatewayCapabilities {
+        self.capabilities()
+    }
     fn capabilities(&self) -> GatewayCapabilities;
 }
 
@@ -444,6 +474,7 @@ pub struct CdpGateway {
     sender_id: Arc<RwLock<i64>>,
     listener_session: Arc<RwLock<String>>,
     delivered_event_sequences: Arc<RwLock<BTreeMap<String, u64>>>,
+    capabilities: Arc<SyncRwLock<GatewayCapabilities>>,
 }
 
 impl CdpGateway {
@@ -454,11 +485,26 @@ impl CdpGateway {
             sender_id: Arc::new(RwLock::new(0)),
             listener_session: Arc::new(RwLock::new(String::new())),
             delivered_event_sequences: Arc::new(RwLock::new(BTreeMap::new())),
+            capabilities: Arc::new(SyncRwLock::new(unverified_production_capabilities())),
         }
     }
 
     pub fn cdp(&self) -> &CdpClient {
         &self.cdp
+    }
+
+    fn require_capability(&self, status: CapabilityStatus, capability: &str) -> AppResult<()> {
+        match status {
+            CapabilityStatus::Supported => Ok(()),
+            CapabilityStatus::Unverified => Err(AppError::new(
+                "capability_unverified",
+                format!("当前旺商聊版本尚未完成{capability}能力校准"),
+            )),
+            CapabilityStatus::Unsupported => Err(AppError::new(
+                "capability_unsupported",
+                format!("当前旺商聊版本不支持{capability}"),
+            )),
+        }
     }
 
     async fn xclient(&self, route: &str, payload: Value) -> AppResult<Value> {
@@ -816,15 +862,22 @@ impl RuntimeGateway for CdpGateway {
     }
 
     fn capabilities(&self) -> GatewayCapabilities {
-        GatewayCapabilities {
-            announcement: CapabilityStatus::Unsupported,
-            mute: CapabilityStatus::Supported,
-            recall: CapabilityStatus::Supported,
-            rename: CapabilityStatus::Supported,
-            remove_member: CapabilityStatus::Supported,
-            group_mute: CapabilityStatus::Supported,
-            member_events: CapabilityStatus::Unverified,
+        self.capabilities
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| unverified_production_capabilities())
+    }
+
+    fn calibrate_capabilities(
+        &self,
+        app_file_version: &str,
+        main_script_sha256: &str,
+    ) -> GatewayCapabilities {
+        let calibrated = runtime_capabilities(app_file_version, main_script_sha256);
+        if let Ok(mut capabilities) = self.capabilities.write() {
+            *capabilities = calibrated.clone();
         }
+        calibrated
     }
 }
 
@@ -957,6 +1010,7 @@ impl GroupGateway for CdpGateway {
     }
 
     async fn send_text(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().send_text, "发送消息")?;
         require_positive("groupId", group_id)?;
         if text.trim().is_empty() {
             return Err(AppError::new("invalid_argument", "发送内容为空"));
@@ -1024,6 +1078,7 @@ impl GroupGateway for CdpGateway {
         sender_user_id: i64,
         message_id: &str,
     ) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().recall, "撤回消息")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", sender_user_id)?;
         require_non_empty("messageId", message_id)?;
@@ -1040,6 +1095,7 @@ impl GroupGateway for CdpGateway {
         user_id: i64,
         duration_seconds: i64,
     ) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().mute, "成员禁言")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
         require_positive("durationSeconds", duration_seconds)?;
@@ -1050,6 +1106,7 @@ impl GroupGateway for CdpGateway {
         .await
     }
     async fn unmute(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().mute, "成员解禁")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
         self.action(
@@ -1064,6 +1121,7 @@ impl GroupGateway for CdpGateway {
         member: &MemberRef,
         nickname: &str,
     ) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().rename, "修改群名片")?;
         require_positive("groupId", group_id)?;
         require_non_empty("nickname", nickname)?;
         let mut http_error = None;
@@ -1144,6 +1202,7 @@ impl GroupGateway for CdpGateway {
         }
     }
     async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().remove_member, "移出成员")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
         self.action(
@@ -1153,6 +1212,7 @@ impl GroupGateway for CdpGateway {
         .await
     }
     async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().group_mute, "全群发言控制")?;
         require_positive("groupId", group_id)?;
         self.action(
             GROUP_MUTE_ROUTE,
@@ -1194,7 +1254,7 @@ struct GroupInfo {
 fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
     let input = json!({"type":kind,"route":route,"payload":payload});
     format!(
-        r#"(async()=>{{const input={input};const ipc=require("electron").ipcRenderer;return new Promise(resolve=>{{const channel="dh-rust-"+Date.now()+"-"+Math.random();const timer=setTimeout(()=>resolve({{transportCode:504,errno:1,error:"IPC timeout",requestId:channel}}),15000);ipc.once(channel,(event,value)=>{{clearTimeout(timer);resolve({{transportCode:value&&value.code,errno:value&&value.errno,response:value&&value.response,error:value&&value.message,requestId:channel}});}});if(input.type==="request")ipc.send("xclient",{{type:"request",requestId:channel,url:input.route,excuteType:0,params:JSON.stringify(input.payload),key:channel}});else ipc.send("xclient",{{type:"encode",params:JSON.stringify(input.payload),key:channel}});}});}})()"#
+        r#"(async()=>{{const input={input};const ipc=globalThis.__dhFixtureIpc||(typeof require==="function"?require("electron").ipcRenderer:null);if(!ipc)return{{transportCode:503,errno:1,error:"Electron IPC 未就绪",requestId:""}};return new Promise(resolve=>{{const channel="dh-rust-"+Date.now()+"-"+Math.random();const timer=setTimeout(()=>resolve({{transportCode:504,errno:1,error:"IPC timeout",requestId:channel}}),15000);ipc.once(channel,(event,value)=>{{clearTimeout(timer);resolve({{transportCode:value&&value.code,errno:value&&value.errno,response:value&&value.response,error:value&&value.message,requestId:value&&value.requestId||channel}});}});if(input.type==="request")ipc.send("xclient",{{type:"request",requestId:channel,url:input.route,excuteType:0,params:JSON.stringify(input.payload),key:channel}});else ipc.send("xclient",{{type:"encode",params:JSON.stringify(input.payload),key:channel}});}});}})()"#
     )
 }
 
@@ -1768,6 +1828,46 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(page.page_type, "page");
+        assert!(is_wangshangliao_page(&page));
+        let unrelated: DevToolsPage = serde_json::from_value(json!({
+            "title": "Chrome DevTools",
+            "url": "https://example.test/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/2"
+        }))
+        .unwrap();
+        assert!(!is_wangshangliao_page(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn unrelated_devtools_is_reported_as_other_service() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = serde_json::json!([{
+                "title": "Chrome DevTools",
+                "url": "https://example.test/",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/chrome"
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = CdpClient::new(format!("http://{address}")).unwrap();
+        let diagnostic = client.diagnose().await;
+        server.await.unwrap();
+        assert_eq!(diagnostic.status, ConnectionStatus::OtherService);
+        assert!(diagnostic.detail.contains("9222"));
     }
 
     #[test]

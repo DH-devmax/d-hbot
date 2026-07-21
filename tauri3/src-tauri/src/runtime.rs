@@ -6,12 +6,13 @@ use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::ai::{self, AiConfig, AiContextMessage, AiProvider, AiRequest, ConfiguredProvider};
 use crate::database::DatabaseExecutor;
-use crate::diagnostics::Logger;
+use crate::diagnostics::{redact, Logger};
 use crate::error::{AppError, AppResult};
 use crate::gateway::{
     ConnectionStatus, GatewayEvent, GatewayReceipt, GatewayRecord, GatewayRecordKind,
@@ -22,6 +23,7 @@ use crate::models::{
     GatewayInboxEvent, Group, Member, MemberRef, Message, RuleAction, TaskItem,
 };
 use crate::secrets::SecretStore;
+use crate::shutdown::ShutdownSignal;
 use crate::{knowledge, moderation, prediction, scheduler};
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,12 +40,25 @@ struct IncomingJob {
     message: Message,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectDispatchStatus {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+impl EffectDispatchStatus {
+    fn succeeded(self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendRuntime {
     database: DatabaseExecutor,
     gateway: Arc<dyn RuntimeGateway>,
     secrets: SecretStore,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<ShutdownSignal>,
     logger: Logger,
 }
 
@@ -52,7 +67,7 @@ impl BackendRuntime {
         database: DatabaseExecutor,
         gateway: Arc<dyn RuntimeGateway>,
         secrets: SecretStore,
-        shutdown: Arc<Notify>,
+        shutdown: Arc<ShutdownSignal>,
         logger: Logger,
     ) -> Self {
         Self {
@@ -146,7 +161,7 @@ impl BackendRuntime {
             }
             tokio::select! {
                 _ = sleep(Duration::from_millis(500)) => {},
-                _ = self.shutdown.notified() => break,
+                _ = self.shutdown.cancelled() => break,
             }
         }
     }
@@ -160,9 +175,11 @@ impl BackendRuntime {
             .unwrap_or(0);
         let capabilities = self.gateway.capabilities();
         let capability = match item.effect_type.as_str() {
+            "send_text" => Some(&capabilities.send_text),
             "recall" => Some(&capabilities.recall),
             "mute" | "unmute" => Some(&capabilities.mute),
             "remove" => Some(&capabilities.remove_member),
+            "rename" => Some(&capabilities.rename),
             "group_mute" => Some(&capabilities.group_mute),
             _ => None,
         };
@@ -199,6 +216,25 @@ impl BackendRuntime {
                 "mute" => self.gateway.mute(item.group_id, user_id, duration).await,
                 "unmute" => self.gateway.unmute(item.group_id, user_id).await,
                 "remove" => self.gateway.remove_member(item.group_id, user_id).await,
+                "rename" => {
+                    self.gateway
+                        .rename(
+                            item.group_id,
+                            &MemberRef {
+                                user_id: (user_id > 0).then_some(user_id),
+                                nim_id: payload
+                                    .get("nimId")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .filter(|value| !value.trim().is_empty()),
+                            },
+                            payload
+                                .get("nickname")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                        .await
+                }
                 "blacklist" => self
                     .database
                     .set_member_blacklisted(item.account_id.clone(), item.group_id, user_id, true)
@@ -218,22 +254,42 @@ impl BackendRuntime {
                 _ => Err(AppError::new("effect_unsupported", "当前副作用类型未开放")),
             }
         };
-        let (success, error_text, receipt) = match result {
-            Ok(receipt) => (true, String::new(), receipt),
-            Err(error) => (
-                false,
-                error.message.clone(),
-                GatewayReceipt::failed(&item.effect_type, &error),
-            ),
+        let (status, error_text, receipt) = match result {
+            Ok(receipt) => (EffectDispatchStatus::Succeeded, String::new(), receipt),
+            Err(error) => {
+                let status = if error.delivery_outcome_unknown() {
+                    EffectDispatchStatus::Unknown
+                } else {
+                    EffectDispatchStatus::Failed
+                };
+                let mut receipt = GatewayReceipt::failed(&item.effect_type, &error);
+                if status == EffectDispatchStatus::Unknown {
+                    receipt.status = "unknown".into();
+                }
+                (status, error.message.clone(), receipt)
+            }
         };
+        let success = status.succeeded();
+        let error_text = redact(&error_text);
+        let receipt = redact_gateway_receipt(receipt);
         let receipt_json = serde_json::to_string(&receipt).unwrap_or_default();
-        let _ = self
-            .database
-            .finish_effect_outbox(item.id, success, error_text.clone(), receipt_json.clone())
-            .await;
+        let _ = if status == EffectDispatchStatus::Unknown {
+            self.database
+                .finish_effect_outbox_unknown(item.id, error_text.clone(), receipt_json.clone())
+                .await
+        } else {
+            self.database
+                .finish_effect_outbox(item.id, success, error_text.clone(), receipt_json.clone())
+                .await
+        };
 
         if let Some(task_id) = payload.get("taskId").and_then(Value::as_i64) {
-            if success {
+            if status == EffectDispatchStatus::Unknown {
+                let _ = self
+                    .database
+                    .mark_task_reminder_unknown(task_id, error_text.clone())
+                    .await;
+            } else if success {
                 let _ = self
                     .database
                     .finish_task_reminder(task_id, true, String::new())
@@ -252,7 +308,12 @@ impl BackendRuntime {
             }
         }
         if let Some(run_key) = payload.get("scheduleRunKey").and_then(Value::as_str) {
-            if success || item.attempts >= 5 {
+            if status == EffectDispatchStatus::Unknown {
+                let _ = self
+                    .database
+                    .mark_schedule_run_unknown(run_key.to_string(), error_text.clone())
+                    .await;
+            } else if success || item.attempts >= 5 {
                 let _ = self
                     .database
                     .finish_schedule_run(run_key.to_string(), success, error_text.clone())
@@ -335,10 +396,20 @@ impl BackendRuntime {
                 user_id,
                 actor: "DH BOT".into(),
                 event: "effect_dispatched".into(),
-                level: if success { "info" } else { "error" }.into(),
+                level: match status {
+                    EffectDispatchStatus::Succeeded => "info",
+                    EffectDispatchStatus::Failed => "error",
+                    EffectDispatchStatus::Unknown => "warning",
+                }
+                .into(),
                 details: serde_json::json!({
                     "effect": item.effect_type,
                     "success": success,
+                    "status": match status {
+                        EffectDispatchStatus::Succeeded => "succeeded",
+                        EffectDispatchStatus::Failed => "failed",
+                        EffectDispatchStatus::Unknown => "unknown",
+                    },
                     "error": error_text,
                     "receipt": receipt,
                 })
@@ -351,6 +422,7 @@ impl BackendRuntime {
     fn worker_for(
         &self,
         workers: &mut HashMap<i64, mpsc::Sender<IncomingJob>>,
+        worker_tasks: &mut JoinSet<()>,
         group_id: i64,
         app: &AppHandle,
         account_id: &str,
@@ -363,7 +435,7 @@ impl BackendRuntime {
                 let runtime = self.clone();
                 let app_handle = app.clone();
                 let account = account_id.to_string();
-                tokio::spawn(async move {
+                worker_tasks.spawn(async move {
                     while let Some(job) = receiver.recv().await {
                         if runtime
                             .database
@@ -490,7 +562,7 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.notified() => break }
+            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
@@ -640,7 +712,7 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.notified() => break }
+            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
@@ -777,7 +849,7 @@ impl BackendRuntime {
                         );
                         tokio::select! {
                             _ = sleep(Duration::from_millis(500)) => {},
-                            _ = self.shutdown.notified() => break,
+                            _ = self.shutdown.cancelled() => break,
                         }
                         continue;
                     }
@@ -785,7 +857,7 @@ impl BackendRuntime {
             }
             tokio::select! {
                 _ = sleep(Duration::from_secs(1)) => {},
-                _ = self.shutdown.notified() => break,
+                _ = self.shutdown.cancelled() => break,
             }
         }
     }
@@ -1058,20 +1130,22 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.notified() => break }
+            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
     async fn connection_loop(&self, app: AppHandle) {
         let mut workers: HashMap<i64, mpsc::Sender<IncomingJob>> = HashMap::new();
+        let mut worker_tasks = JoinSet::new();
+        let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
         let mut last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
-        loop {
+        'connection: loop {
             let diagnostic = self.gateway.diagnose().await;
             let _ = app.emit("connection-status", &diagnostic);
             let _ = app.emit("gateway-capabilities", self.gateway.capabilities());
             if diagnostic.status != ConnectionStatus::Ready {
-                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.notified() => break }
+                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
                 continue;
             }
             let (sender_id, account_id) = match self.gateway.session_identity().await {
@@ -1079,7 +1153,7 @@ impl BackendRuntime {
                 Err(error) => {
                     self.logger.write("WARN", &error.message);
                     let _ = app.emit("connection-error", &error);
-                    tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.notified() => break };
+                    tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break };
                     continue;
                 }
             };
@@ -1100,7 +1174,7 @@ impl BackendRuntime {
                 }
             }
             if self.gateway.install_message_listener().await.is_err() {
-                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.notified() => break }
+                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
                 continue;
             }
             let _ = app.emit(
@@ -1122,6 +1196,7 @@ impl BackendRuntime {
                 for message in pending {
                     let sender = self.worker_for(
                         &mut workers,
+                        &mut worker_tasks,
                         message.group_id,
                         &app,
                         &account_id,
@@ -1157,6 +1232,7 @@ impl BackendRuntime {
                         for message in pending {
                             let sender = self.worker_for(
                                 &mut workers,
+                                &mut worker_tasks,
                                 message.group_id,
                                 &app,
                                 &account_id,
@@ -1170,19 +1246,60 @@ impl BackendRuntime {
                     }
                     if let Ok(inbox) = self
                         .database
-                        .claim_gateway_inbox(Some(account_id.clone()), 100)
+                        .claim_gateway_inbox(Some(account_id.clone()), 1)
                         .await
                     {
                         for item in inbox {
                             if item.event_type != "message" {
-                                let _ = self
-                                    .database
-                                    .finish_gateway_inbox(
-                                        item.id,
-                                        false,
-                                        "成员事件等待名单同步确认".into(),
-                                    )
-                                    .await;
+                                if item.event_type == "connection-changed" {
+                                    match self
+                                        .gateway
+                                        .ack(
+                                            &item.bridge_session,
+                                            item.bridge_sequence.max(0) as u64,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            if let Err(error) = self
+                                                .database
+                                                .commit_gateway_ack(
+                                                    account_id.clone(),
+                                                    vec![item.event_id.clone()],
+                                                    Vec::new(),
+                                                )
+                                                .await
+                                            {
+                                                let _ = self
+                                                    .database
+                                                    .finish_gateway_inbox(
+                                                        item.id,
+                                                        false,
+                                                        format!(
+                                                            "源队列 ACK 已成功，本地提交失败：{}",
+                                                            error.message
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = self
+                                                .database
+                                                .finish_gateway_inbox(item.id, false, error.message)
+                                                .await;
+                                        }
+                                    }
+                                } else {
+                                    let _ = self
+                                        .database
+                                        .finish_gateway_inbox(
+                                            item.id,
+                                            false,
+                                            "成员事件等待源队列重放和名单同步确认".into(),
+                                        )
+                                        .await;
+                                }
                                 continue;
                             }
                             let mut raw: Value = match serde_json::from_str(&item.payload_json) {
@@ -1211,23 +1328,60 @@ impl BackendRuntime {
                                     match self.database.insert_message(job.message.clone()).await {
                                         Ok(persisted) => {
                                             job.message.id = persisted.id;
-                                            let _ = self
-                                                .database
-                                                .mark_message_acknowledged(persisted.id)
-                                                .await;
-                                            let _ = self
-                                                .database
-                                                .finish_gateway_inbox(item.id, true, String::new())
-                                                .await;
-                                            if !persisted.processed {
-                                                let sender = self.worker_for(
-                                                    &mut workers,
-                                                    job.message.group_id,
-                                                    &app,
-                                                    &account_id,
-                                                    sender_id,
-                                                );
-                                                let _ = sender.try_send(job);
+                                            match self
+                                                .gateway
+                                                .ack(
+                                                    &item.bridge_session,
+                                                    item.bridge_sequence.max(0) as u64,
+                                                )
+                                                .await
+                                            {
+                                                Ok(_) => match self
+                                                    .database
+                                                    .commit_gateway_ack(
+                                                        account_id.clone(),
+                                                        vec![item.event_id.clone()],
+                                                        vec![persisted.id],
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(()) => {
+                                                        if !persisted.processed {
+                                                            let sender = self.worker_for(
+                                                                &mut workers,
+                                                                &mut worker_tasks,
+                                                                job.message.group_id,
+                                                                &app,
+                                                                &account_id,
+                                                                sender_id,
+                                                            );
+                                                            let _ = sender.try_send(job);
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        let _ = self
+                                                            .database
+                                                            .finish_gateway_inbox(
+                                                                item.id,
+                                                                false,
+                                                                format!(
+                                                                    "源队列 ACK 已成功，本地提交失败：{}",
+                                                                    error.message
+                                                                ),
+                                                            )
+                                                            .await;
+                                                    }
+                                                },
+                                                Err(error) => {
+                                                    let _ = self
+                                                        .database
+                                                        .finish_gateway_inbox(
+                                                            item.id,
+                                                            false,
+                                                            error.message,
+                                                        )
+                                                        .await;
+                                                }
                                             }
                                         }
                                         Err(error) => {
@@ -1244,11 +1398,49 @@ impl BackendRuntime {
                                         .finish_gateway_inbox(item.id, false, reason)
                                         .await;
                                 }
-                                Err(_) => {
-                                    let _ = self
-                                        .database
-                                        .finish_gateway_inbox(item.id, true, String::new())
-                                        .await;
+                                Err(reason) => {
+                                    match self
+                                        .gateway
+                                        .ack(
+                                            &item.bridge_session,
+                                            item.bridge_sequence.max(0) as u64,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            if let Err(error) = self
+                                                .database
+                                                .commit_gateway_ack(
+                                                    account_id.clone(),
+                                                    vec![item.event_id.clone()],
+                                                    Vec::new(),
+                                                )
+                                                .await
+                                            {
+                                                let _ = self
+                                                    .database
+                                                    .finish_gateway_inbox(
+                                                        item.id,
+                                                        false,
+                                                        format!(
+                                                            "源队列 ACK 已成功，本地提交失败：{}",
+                                                            error.message
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = self
+                                                .database
+                                                .finish_gateway_inbox(
+                                                    item.id,
+                                                    false,
+                                                    format!("{reason}；{}", error.message),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1301,12 +1493,29 @@ impl BackendRuntime {
                     .collect::<Vec<_>>();
                 let mut normalized = Vec::new();
                 let mut ignored = Vec::new();
-                let mut completed_inbox_ids = Vec::new();
+                let mut ackable_event_ids = HashSet::new();
+                let mut member_event_ids = Vec::new();
+                let mut expected_member_events = 0usize;
                 for record in &batch.records {
                     let inbox_event_id = gateway_record_id(record);
-                    if record.kind != GatewayRecordKind::Message {
-                        completed_inbox_ids.push(inbox_event_id);
-                        continue;
+                    match record.kind {
+                        GatewayRecordKind::ConnectionChanged => {
+                            ackable_event_ids.insert(inbox_event_id);
+                            continue;
+                        }
+                        GatewayRecordKind::TeamMemberJoined
+                        | GatewayRecordKind::TeamMemberLeft
+                        | GatewayRecordKind::TeamMemberUpdated => {
+                            expected_member_events += record
+                                .payload
+                                .get("members")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0);
+                            member_event_ids.push(inbox_event_id);
+                            continue;
+                        }
+                        GatewayRecordKind::Message => {}
                     }
                     let mut raw = record.payload.clone();
                     if let Some(object) = raw.as_object_mut() {
@@ -1315,12 +1524,12 @@ impl BackendRuntime {
                     }
                     match self.normalize_message(&account_id, sender_id, &raw).await {
                         Ok(job) => {
-                            completed_inbox_ids.push(inbox_event_id);
+                            ackable_event_ids.insert(inbox_event_id);
                             normalized.push((job, raw));
                         }
                         Err(reason) => {
                             if reason != "解码失败且群身份未映射" {
-                                completed_inbox_ids.push(inbox_event_id);
+                                ackable_event_ids.insert(inbox_event_id);
                             }
                             ignored.push((record.sequence, reason));
                         }
@@ -1339,15 +1548,112 @@ impl BackendRuntime {
                     Err(error) => {
                         self.logger.write("WARN", &error.message);
                         let _ = app.emit("connection-error", &error);
-                        tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.notified() => return }
+                        tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
                         continue;
                     }
                 };
-                // Events are only applied after the raw ordered batch is durable.
-                // CdpGateway reads the same unacknowledged batch when normalizing
-                // member callbacks, so this does not advance the source queue.
-                for event in self.gateway.poll_events().await.unwrap_or_default() {
-                    self.handle_gateway_event(&app, &account_id, event).await;
+                // Member records join the ACK prefix only after every normalized
+                // event has been durably applied. Transient database failures are
+                // retried in-place so a gateway cursor cannot outrun persistence.
+                let member_cache_key = (!member_event_ids.is_empty())
+                    .then(|| format!("{}:{}", batch.session, member_event_ids.join("|")));
+                if !member_event_ids.is_empty() {
+                    let already_processed = self
+                        .database
+                        .processed_gateway_event_ids(account_id.clone(), member_event_ids.clone())
+                        .await
+                        .unwrap_or_default();
+                    if already_processed.len() == member_event_ids.len() {
+                        ackable_event_ids.extend(already_processed);
+                    } else {
+                        let events = if let Some(cached) = member_cache_key
+                            .as_ref()
+                            .and_then(|key| member_event_cache.get(key))
+                        {
+                            Ok(cached.clone())
+                        } else {
+                            self.gateway.poll_events().await
+                        };
+                        match events {
+                            Ok(events) if events.len() == expected_member_events => {
+                                if let Some(key) = &member_cache_key {
+                                    member_event_cache.insert(key.clone(), events.clone());
+                                }
+                                for (event_index, event) in events.into_iter().enumerate() {
+                                    let durable_event_id = format!(
+                                        "{}:{event_index}",
+                                        member_cache_key.as_deref().unwrap_or(&batch.session)
+                                    );
+                                    loop {
+                                        match self
+                                            .handle_gateway_event(
+                                                &app,
+                                                &account_id,
+                                                &durable_event_id,
+                                                event.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => break,
+                                            Err(error) => {
+                                                self.logger.write(
+                                                    "WARN",
+                                                    &format!(
+                                                        "成员事件持久化失败，稍后重试：{}",
+                                                        error.message
+                                                    ),
+                                                );
+                                                let _ = app.emit("connection-error", &error);
+                                                tokio::select! {
+                                                    _ = sleep(Duration::from_millis(500)) => {},
+                                                    _ = self.shutdown.cancelled() => break 'connection,
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                loop {
+                                    match self
+                                        .database
+                                        .mark_gateway_inbox_processed(
+                                            account_id.clone(),
+                                            member_event_ids.clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => break,
+                                        Err(error) => {
+                                            self.logger.write(
+                                                "WARN",
+                                                &format!(
+                                                    "成员事件状态写入失败，稍后重试：{}",
+                                                    error.message
+                                                ),
+                                            );
+                                            tokio::select! {
+                                                _ = sleep(Duration::from_millis(500)) => {},
+                                                _ = self.shutdown.cancelled() => break 'connection,
+                                            }
+                                        }
+                                    }
+                                }
+                                ackable_event_ids.extend(member_event_ids.iter().cloned());
+                            }
+                            Ok(events) => {
+                                self.logger.write(
+                                "WARN",
+                                &format!(
+                                    "成员事件归一化数量不一致：期望 {expected_member_events}，实际 {}",
+                                    events.len()
+                                ),
+                            );
+                            }
+                            Err(error) => {
+                                self.logger.write("WARN", &error.message);
+                                let _ = app.emit("connection-error", &error);
+                            }
+                        }
+                    }
                 }
                 for (sequence, reason) in ignored {
                     let _ = self
@@ -1370,48 +1676,91 @@ impl BackendRuntime {
                         })
                         .await;
                 }
-                let ack_sequence = batch
-                    .records
-                    .last()
-                    .map(|record| record.sequence)
-                    .unwrap_or(0);
+                let ack_sequence = contiguous_ack_sequence(&batch.records, &ackable_event_ids);
                 if ack_sequence > 0 {
                     if let Err(error) = self.gateway.ack(&batch.session, ack_sequence).await {
                         self.logger.write("WARN", &error.message);
                     } else {
-                        for persisted in &persisted_messages {
-                            let _ = self.database.mark_message_acknowledged(persisted.id).await;
-                        }
-                        let _ = self
+                        let completed_inbox_ids = batch
+                            .records
+                            .iter()
+                            .take_while(|record| record.sequence <= ack_sequence)
+                            .map(gateway_record_id)
+                            .collect::<Vec<_>>();
+                        let acknowledged_message_ids = normalized
+                            .iter()
+                            .zip(&persisted_messages)
+                            .filter(|((job, _), _)| job.sequence <= ack_sequence)
+                            .map(|(_, persisted)| persisted.id)
+                            .collect::<Vec<_>>();
+                        let local_commit = self
                             .database
-                            .mark_gateway_inbox_processed(account_id.clone(), completed_inbox_ids)
+                            .commit_gateway_ack(
+                                account_id.clone(),
+                                completed_inbox_ids,
+                                acknowledged_message_ids,
+                            )
                             .await;
-                        for ((mut job, raw), persisted) in
-                            normalized.into_iter().zip(persisted_messages)
-                        {
-                            if persisted.processed {
-                                continue;
-                            }
-                            job.message.id = persisted.id;
-                            let sender = self.worker_for(
-                                &mut workers,
-                                job.message.group_id,
-                                &app,
-                                &account_id,
-                                sender_id,
+                        if let Err(error) = local_commit {
+                            self.logger.write(
+                                "WARN",
+                                &format!(
+                                    "源队列 ACK 已成功，本地状态提交失败，将重试：{}",
+                                    error.message
+                                ),
                             );
-                            let _ = sender.send(job).await;
-                            let _ = app.emit("message-received", &raw);
+                        } else {
+                            if member_event_ids
+                                .iter()
+                                .all(|event_id| ackable_event_ids.contains(event_id))
+                                && batch
+                                    .records
+                                    .iter()
+                                    .filter(|record| {
+                                        member_event_ids.contains(&gateway_record_id(record))
+                                    })
+                                    .all(|record| record.sequence <= ack_sequence)
+                            {
+                                if let Some(key) = &member_cache_key {
+                                    member_event_cache.remove(key);
+                                }
+                            }
+                            for ((mut job, raw), persisted) in
+                                normalized.into_iter().zip(persisted_messages)
+                            {
+                                if persisted.processed || job.sequence > ack_sequence {
+                                    continue;
+                                }
+                                job.message.id = persisted.id;
+                                let sender = self.worker_for(
+                                    &mut workers,
+                                    &mut worker_tasks,
+                                    job.message.group_id,
+                                    &app,
+                                    &account_id,
+                                    sender_id,
+                                );
+                                let _ = sender.send(job).await;
+                                let _ = app.emit("message-received", &raw);
+                            }
                         }
                     }
                 }
-                tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.notified() => return }
+                tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.notified() => break }
+            tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
         }
+        drop(workers);
+        while worker_tasks.join_next().await.is_some() {}
     }
 
-    async fn handle_gateway_event(&self, app: &AppHandle, account_id: &str, event: GatewayEvent) {
+    async fn handle_gateway_event(
+        &self,
+        app: &AppHandle,
+        account_id: &str,
+        durable_event_id: &str,
+        event: GatewayEvent,
+    ) -> AppResult<()> {
         match event {
             GatewayEvent::MemberJoined {
                 group_id,
@@ -1421,8 +1770,7 @@ impl BackendRuntime {
                 if let Some(saved) = self
                     .database
                     .list_members(account_id.to_string(), group_id)
-                    .await
-                    .unwrap_or_default()
+                    .await?
                     .into_iter()
                     .find(|saved| {
                         saved.user_id == member.user_id
@@ -1437,12 +1785,24 @@ impl BackendRuntime {
                 member.joined_at = Some(Utc::now());
                 member.discovered_at = Utc::now();
                 member.last_seen_at = Utc::now();
-                let _ = self.database.upsert_member(member.clone()).await;
+                self.database.upsert_member(member.clone()).await?;
                 let _ = app.emit("sync-progress", serde_json::json!({"phase":"member-joined","groupId":group_id,"userId":member.user_id,"source":"online-joined"}));
                 if member.blacklisted {
-                    let result = self.gateway.remove_member(group_id, member.user_id).await;
-                    let _ = self
-                        .database
+                    self.enqueue_effect(
+                        account_id,
+                        group_id,
+                        "remove",
+                        serde_json::json!({
+                            "userId": member.user_id,
+                            "recordAction": true,
+                            "actionKind": "remove",
+                            "reason": "黑名单成员重新入群",
+                            "mode": "automatic",
+                        }),
+                        format!("member-rejoin-remove:{account_id}:{durable_event_id}"),
+                    )
+                    .await?;
+                    self.database
                         .record_audit(AuditEvent {
                             id: 0,
                             account_id: account_id.into(),
@@ -1450,26 +1810,21 @@ impl BackendRuntime {
                             user_id: member.user_id,
                             actor: "DH BOT".into(),
                             event: "blacklisted_member_rejoined".into(),
-                            level: if result.is_ok() { "warning" } else { "error" }.into(),
-                            details: result
-                                .err()
-                                .map(|error| error.message)
-                                .unwrap_or_else(|| "黑名单成员重新入群，已移出".into()),
+                            level: "warning".into(),
+                            details: "黑名单成员重新入群，已进入移出队列".into(),
                             created_at: Utc::now(),
                         })
-                        .await;
-                    return;
+                        .await?;
+                    return Ok(());
                 }
                 self.enqueue_member_card_job(account_id, group_id, &member)
-                    .await;
+                    .await?;
             }
             GatewayEvent::MemberLeft { group_id, member } => {
-                let _ = self
-                    .database
+                self.database
                     .mark_member_not_present(account_id.to_string(), group_id, member.user_id)
-                    .await;
-                let _ = self
-                    .database
+                    .await?;
+                self.database
                     .record_audit(AuditEvent {
                         id: 0,
                         account_id: account_id.into(),
@@ -1481,7 +1836,7 @@ impl BackendRuntime {
                         details: "收到 NIM 离群事件".into(),
                         created_at: Utc::now(),
                     })
-                    .await;
+                    .await?;
             }
             GatewayEvent::MemberUpdated {
                 group_id,
@@ -1491,8 +1846,7 @@ impl BackendRuntime {
                 let saved = self
                     .database
                     .list_members(account_id.to_string(), group_id)
-                    .await
-                    .unwrap_or_default()
+                    .await?
                     .into_iter()
                     .find(|saved| {
                         saved.user_id == member.user_id
@@ -1508,40 +1862,44 @@ impl BackendRuntime {
                     .map(|saved| saved.locked_card_name.trim())
                     .filter(|locked| !locked.is_empty() && *locked != member.card_name.trim())
                     .map(str::to_string);
-                if restore_name.is_some() {
+                let new_violation = restore_name.is_some()
+                    && saved
+                        .as_ref()
+                        .is_none_or(|saved| saved.card_name != member.card_name);
+                if new_violation {
                     member.violation_count += 1;
                 }
-                let _ = self.database.upsert_member(member.clone()).await;
+                self.database.upsert_member(member.clone()).await?;
                 if let Some(locked) = restore_name {
-                    let result = self
-                        .gateway
-                        .rename(
-                            group_id,
-                            &MemberRef {
-                                user_id: (member.user_id > 0).then_some(member.user_id),
-                                nim_id: (!member.nim_id.is_empty())
-                                    .then_some(member.nim_id.clone()),
-                            },
-                            &locked,
-                        )
-                        .await;
-                    let _ = self
-                        .database
+                    self.enqueue_effect(
+                        account_id,
+                        group_id,
+                        "rename",
+                        serde_json::json!({
+                            "userId": member.user_id,
+                            "nimId": member.nim_id,
+                            "nickname": locked,
+                            "recordAction": true,
+                            "actionKind": "rename",
+                            "reason": "锁定群名片恢复",
+                            "mode": "automatic",
+                        }),
+                        format!("locked-card:{account_id}:{durable_event_id}"),
+                    )
+                    .await?;
+                    self.database
                         .record_audit(AuditEvent {
                             id: 0,
                             account_id: account_id.into(),
                             group_id,
                             user_id: member.user_id,
                             actor: "DH BOT".into(),
-                            event: "locked_card_restored".into(),
-                            level: if result.is_ok() { "warning" } else { "error" }.into(),
-                            details: result
-                                .err()
-                                .map(|error| error.message)
-                                .unwrap_or_else(|| format!("群名片已恢复为「{locked}」")),
+                            event: "locked_card_restore_queued".into(),
+                            level: "warning".into(),
+                            details: format!("群名片已进入恢复队列：「{locked}」"),
                             created_at: Utc::now(),
                         })
-                        .await;
+                        .await?;
                 }
                 let _ = app.emit("sync-progress", serde_json::json!({"phase":"member-updated","groupId":group_id,"userId":member.user_id}));
             }
@@ -1552,50 +1910,45 @@ impl BackendRuntime {
                 let _ = app.emit("connection-status", diagnostic);
             }
         }
+        Ok(())
     }
 
-    async fn enqueue_member_card_job(&self, account_id: &str, group_id: i64, member: &Member) {
+    async fn enqueue_member_card_job(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        member: &Member,
+    ) -> AppResult<()> {
         if self
             .database
             .get_setting(format!("card.auto.{account_id}.{group_id}"))
-            .await
-            .ok()
-            .flatten()
+            .await?
             .as_deref()
             != Some("true")
         {
-            return;
+            return Ok(());
         }
         let prefix = self
             .database
             .get_setting(format!("card.prefix.{account_id}.{group_id}"))
-            .await
-            .ok()
-            .flatten()
+            .await?
             .unwrap_or_else(|| "DH".into());
         let members = self
             .database
             .list_members(account_id.to_string(), group_id)
-            .await
-            .unwrap_or_default();
-        let sender_id = self
-            .gateway
-            .session_identity()
-            .await
-            .map(|value| value.0)
-            .unwrap_or_default();
-        if let Ok(preview) = crate::cardnames::preview(group_id, &prefix, members, sender_id) {
-            if let Some(plan) = preview
-                .items
-                .into_iter()
-                .find(|plan| plan.member.user_id == member.user_id && plan.status == "planned")
-            {
-                let _ = self
-                    .database
-                    .enqueue_card_job(account_id.to_string(), group_id, plan, true)
-                    .await;
-            }
+            .await?;
+        let sender_id = self.gateway.session_identity().await?.0;
+        let preview = crate::cardnames::preview(group_id, &prefix, members, sender_id)?;
+        if let Some(plan) = preview
+            .items
+            .into_iter()
+            .find(|plan| plan.member.user_id == member.user_id && plan.status == "planned")
+        {
+            self.database
+                .enqueue_card_job(account_id.to_string(), group_id, plan, true)
+                .await?;
         }
+        Ok(())
     }
 
     async fn normalize_message(
@@ -2389,6 +2742,16 @@ impl BackendRuntime {
     }
 }
 
+fn redact_gateway_receipt(mut receipt: GatewayReceipt) -> GatewayReceipt {
+    receipt.route = redact(&receipt.route);
+    receipt.status = redact(&receipt.status);
+    receipt.business_message = redact(&receipt.business_message);
+    receipt.request_id = redact(&receipt.request_id);
+    receipt.message_id = redact(&receipt.message_id);
+    receipt.session = redact(&receipt.session);
+    receipt
+}
+
 fn merge_managed_member_state(incoming: &mut Member, saved: &Member) {
     incoming.original_card_name = saved.original_card_name.clone();
     incoming.managed_card_name = saved.managed_card_name.clone();
@@ -2422,6 +2785,15 @@ fn gateway_record_id(record: &GatewayRecord) -> String {
         }
     }
     format!("{}:{}", record.session, record.sequence)
+}
+
+fn contiguous_ack_sequence(records: &[GatewayRecord], ackable_event_ids: &HashSet<String>) -> u64 {
+    records
+        .iter()
+        .take_while(|record| ackable_event_ids.contains(&gateway_record_id(record)))
+        .map(|record| record.sequence)
+        .last()
+        .unwrap_or(0)
 }
 
 fn message_explicitly_mentions(message: &Message, account_id: &str) -> bool {
@@ -2570,6 +2942,60 @@ mod tests {
         assert_eq!(error.code, "semantic_response");
     }
 
+    #[test]
+    fn gateway_ack_stops_before_unpersisted_member_event() {
+        let records = (1..=3)
+            .map(|sequence| GatewayRecord {
+                session: "session".into(),
+                sequence,
+                kind: if sequence == 2 {
+                    GatewayRecordKind::TeamMemberJoined
+                } else {
+                    GatewayRecordKind::Message
+                },
+                source: "fixture".into(),
+                payload: serde_json::json!({"idServer":format!("m-{sequence}")}),
+            })
+            .collect::<Vec<_>>();
+        let ackable = [
+            gateway_record_id(&records[0]),
+            gateway_record_id(&records[2]),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        assert_eq!(contiguous_ack_sequence(&records, &ackable), 1);
+        let ackable = records
+            .iter()
+            .map(gateway_record_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(contiguous_ack_sequence(&records, &ackable), 3);
+    }
+
+    #[test]
+    fn gateway_receipts_are_redacted_before_archiving() {
+        let secret = ["sk", "-", "abcdefghijklmnopqrstuvwxyz"].concat();
+        let receipt = redact_gateway_receipt(GatewayReceipt {
+            route: format!("/route?token={secret}"),
+            status: "failed".into(),
+            transport_code: Some(500),
+            transport_errno: Some(1),
+            business_code: Some(500),
+            business_errno: Some(2),
+            business_message: format!("Authorization: Bearer TOKEN apiKey={secret}"),
+            request_id: format!("request-{secret}"),
+            message_id: format!("message-{secret}"),
+            session: format!("session-{secret}"),
+            acknowledged_through: 0,
+            acknowledged: 0,
+            remaining: 0,
+            dropped: 0,
+        });
+        let archived = serde_json::to_string(&receipt).unwrap();
+        assert!(!archived.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!archived.contains("Bearer TOKEN"));
+        assert!(archived.contains("***"));
+    }
+
     #[tokio::test]
     async fn durable_effect_outbox_executes_once_against_fixture_gateway() {
         let (_directory, paths) = test_paths();
@@ -2580,7 +3006,7 @@ mod tests {
             database.clone(),
             fixture.clone(),
             SecretStore::new(&paths.secrets),
-            Arc::new(Notify::new()),
+            Arc::new(ShutdownSignal::default()),
             Logger::new(&paths.logs),
         );
         let payload = serde_json::json!({

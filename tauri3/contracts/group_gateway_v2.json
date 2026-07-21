@@ -15,6 +15,7 @@
       "verified": true,
       "capabilities": {
         "announcement": "unsupported",
+        "sendText": "supported",
         "mute": "supported",
         "recall": "supported",
         "rename": "supported",
@@ -49,7 +50,7 @@
       "request": {"kind":"nim","params":{"target":"GROUP_001","content":"PAYLOAD_001"}},
       "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_003"},
       "business": {"code":0,"errno":0,"msg":"ok","data":{"idServer":"MESSAGE_001"}},
-      "normalizedReceipt": {"route":"nim.sendCustomMsg","status":"succeeded","businessCode":0,"businessErrno":0,"businessMessage":"OK","requestId":"REQUEST_003","messageId":"MESSAGE_001"},
+      "normalizedReceipt": {"route":"nim.sendCustomMsg","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK","requestId":"REQUEST_003","messageId":"MESSAGE_001"},
       "expectedNormalizedState": {"action":"send_text","messageId":"MESSAGE_001"}
     },
     {
