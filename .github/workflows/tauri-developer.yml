@@ -1,0 +1,34 @@
+name: DH BOT Developer Fixture
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tauri3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: tauri3/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:fixture
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+      - run: pnpm tauri:build:developer
+      - run: pnpm package:windows:developer
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 7
+          name: DH-BOT-3.0.0-dev-windows-x64-internal
+          path: |
+            tauri3/dist/DH-BOT-3.0.0-beta.1-dev-windows-x64.zip
+            tauri3/src-tauri/target/release/bundle/nsis/*.exe

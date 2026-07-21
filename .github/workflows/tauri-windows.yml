@@ -1,0 +1,46 @@
+name: DH BOT Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v3.*"
+    paths:
+      - "tauri3/**"
+      - ".github/workflows/tauri-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tauri3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: tauri3/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:production
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+      - run: pnpm tauri:build:production
+      - run: pnpm package:windows:production
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DH-BOT-3.0.0-beta.1-windows-production
+          path: |
+            tauri3/dist/production/*
+            tauri3/dist/DH-BOT-3.0.0-beta.1-windows-x64-portable.zip
+      - name: Publish production release
+        if: startsWith(github.ref, 'refs/tags/v3.')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tauri3/dist/production/*
+            tauri3/dist/DH-BOT-3.0.0-beta.1-windows-x64-portable.zip

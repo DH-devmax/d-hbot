@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "snapshot": {
+    "game": "PC28",
+    "period": "20260720001",
+    "result": [1, 2, 3],
+    "updatedAt": "2026-07-20T04:00:00Z",
+    "history": [[1,2,3],[1,4,5],[2,6,7]],
+    "freshness": "fresh"
+  }
+}

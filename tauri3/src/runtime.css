@@ -1,0 +1,49 @@
+.developer-badge {
+  display: inline-flex;
+  margin-bottom: 12px;
+  padding: 5px 8px;
+  border: 1px solid #111;
+  border-radius: 4px;
+  background: #111;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.runtime-mode-control {
+  display: grid;
+  gap: 6px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #eee;
+}
+
+.runtime-mode-control > span,
+.runtime-mode-control > small {
+  overflow: hidden;
+  color: #888;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-mode-control > div {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.runtime-mode-control button {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  color: #555;
+}
+
+.runtime-mode-control button.active {
+  border-color: #111;
+  background: #111;
+  color: #fff;
+}

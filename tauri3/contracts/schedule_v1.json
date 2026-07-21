@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "schedule": {
+    "id": 1,
+    "accountId": "ACCOUNT_FIXTURE",
+    "name": "每日开关群",
+    "enabled": true,
+    "openTime": "08:00",
+    "closeTime": "22:00",
+    "timezone": "local",
+    "groupIds": [10001]
+  }
+}

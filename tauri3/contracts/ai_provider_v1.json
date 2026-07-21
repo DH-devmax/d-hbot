@@ -1,0 +1,17 @@
+{
+  "version": "1",
+  "request": {
+    "eventId": "EVENT_FIXTURE",
+    "groupId": 10001,
+    "memberId": 20001,
+    "message": "@DH 群规是什么",
+    "knowledge": []
+  },
+  "response": {
+    "reply": "请遵守当前群已配置的群规。",
+    "actions": [],
+    "tasks": [],
+    "confidence": 0.9,
+    "reason": "知识库命中"
+  }
+}

@@ -1,0 +1,130 @@
+[
+  {
+    "groupId": 0,
+    "name": "加权字符超过100",
+    "matcher": "length",
+    "threshold": 100,
+    "cooldown": 60000000000,
+    "priority": 100,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "加权字符超过200",
+    "matcher": "length",
+    "threshold": 200,
+    "cooldown": 60000000000,
+    "priority": 200,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "超过4行",
+    "matcher": "lines",
+    "threshold": 4,
+    "cooldown": 60000000000,
+    "priority": 100,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "图片消息",
+    "matcher": "image_count",
+    "count": 1,
+    "cooldown": 60000000000,
+    "priority": 100,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "图片10分钟3次",
+    "matcher": "image_count",
+    "window": 600000000000,
+    "count": 3,
+    "priority": 200,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "恢复群名片",
+    "matcher": "rename_count",
+    "count": 1,
+    "priority": 100,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "改名累计5次",
+    "matcher": "rename_count",
+    "count": 5,
+    "priority": 200,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "黑名单成员",
+    "matcher": "blacklist",
+    "priority": 300,
+    "mode": "auto",
+    "enabled": true,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "AI广告识别",
+    "matcher": "semantic",
+    "pattern": "advertisement",
+    "priority": 50,
+    "mode": "observe",
+    "enabled": true,
+    "semanticThreshold": 0.85,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "AI辱骂识别",
+    "matcher": "semantic",
+    "pattern": "abuse",
+    "priority": 50,
+    "mode": "observe",
+    "enabled": true,
+    "semanticThreshold": 0.85,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  },
+  {
+    "groupId": 0,
+    "name": "AI诈骗识别",
+    "matcher": "semantic",
+    "pattern": "scam",
+    "priority": 60,
+    "mode": "observe",
+    "enabled": true,
+    "semanticThreshold": 0.9,
+    "exemptRoles": ["owner", "admin"],
+    "actions": [{"type": "recall"}]
+  }
+]

@@ -1,0 +1,39 @@
+{
+  "name": "dh-bot-3",
+  "version": "3.0.0-beta.1",
+  "private": true,
+  "scripts": {
+    "build": "pnpm build:production",
+    "build:production": "vite build --mode production",
+    "build:developer": "vite build --mode developer",
+    "test": "vitest run --passWithNoTests",
+    "test:fixture": "cargo test --manifest-path src-tauri/Cargo.toml --features fixture",
+    "test:production": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
+    "dev": "vite --mode production --host 127.0.0.1",
+    "dev:developer": "vite --mode developer --host 127.0.0.1",
+    "dev:fixture": "node scripts/dev-fixture.mjs",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "pnpm tauri:build:production",
+    "build:fixture-resource": "cargo build --manifest-path src-tauri/Cargo.toml --release --features fixture --bin dh-fixture && node scripts/stage-fixture.mjs",
+    "clean:bundle": "node scripts/clean-bundle.mjs",
+    "tauri:build:production": "pnpm clean:bundle && tauri build",
+    "tauri:build:developer": "pnpm build:fixture-resource && pnpm clean:bundle && tauri build --features fixture --config src-tauri/tauri.fixture.conf.json",
+    "package:windows:production": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel production",
+    "package:windows:developer": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel developer",
+    "verify:production": "node scripts/verify-production.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.8"
+  },
+  "packageManager": "pnpm@11.15.1+sha512.81350b07e53c9538a02f1f2303b4290fa2d7be04e56e2a970c4cc4b417dc761de196edabd49d55c7dc9580db81007c44143e4e3d7e462b3000d23c255122d065"
+}

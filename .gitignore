@@ -1,0 +1,16 @@
+/build/
+/dist/
+/output/
+*.log
+tauri3/node_modules/
+tauri3/src-tauri/target/
+tauri3/dist/
+tauri3/src-tauri/gen/
+tauri3/src-tauri/resources/tools/
+output/playwright/
+.playwright-cli/
+*.db
+*.db-shm
+*.db-wal
+*.dat
+.DS_Store
