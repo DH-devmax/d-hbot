@@ -229,6 +229,15 @@ mod tests {
         assert_eq!(metadata["mainScriptSha256"].as_str().unwrap().len(), 64);
         assert!(value["callbacks"].as_array().unwrap().len() >= 4);
         assert!(value["expectedNormalizedState"].is_object());
+        assert_eq!(
+            value["businessFailures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|failure| failure["name"] == "nimNotReady")
+                .unwrap()["transportCode"],
+            503
+        );
         assert!(value["operations"]
             .as_array()
             .unwrap()

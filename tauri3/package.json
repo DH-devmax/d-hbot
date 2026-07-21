@@ -9,7 +9,7 @@
     "test": "vitest run --config vitest.config.ts --passWithNoTests",
     "test:ui": "pnpm test",
     "test:e2e:fixture": "playwright test --config playwright.fixture.config.ts",
-    "test:contract-sanitizer": "node scripts/sanitize-contract-capture.mjs --self-test",
+    "test:contract-sanitizer": "node --test scripts/sanitize-contract-capture.test.mjs && node scripts/sanitize-contract-capture.mjs --self-test",
     "test:fixture": "cargo test --manifest-path src-tauri/Cargo.toml --features fixture",
     "test:production": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
     "dev": "vite --mode production --host 127.0.0.1",

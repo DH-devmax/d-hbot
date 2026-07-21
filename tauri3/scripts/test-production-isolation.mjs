@@ -11,10 +11,20 @@ function verify(directory) {
   return spawnSync(process.execPath, [verifier, directory], { encoding: 'utf8' })
 }
 
+function fakePe(subsystem) {
+  const buffer = Buffer.alloc(0x200)
+  buffer.write('MZ', 0, 'ascii')
+  buffer.writeUInt32LE(0x80, 0x3c)
+  buffer.write('PE\0\0', 0x80, 'ascii')
+  buffer.writeUInt16LE(0x20b, 0x98)
+  buffer.writeUInt16LE(subsystem, 0x98 + 68)
+  return buffer
+}
+
 try {
   const clean = path.join(temporary, 'clean')
   await mkdir(clean)
-  await writeFile(path.join(clean, 'DH-BOT.exe'), 'production binary placeholder')
+  await writeFile(path.join(clean, 'DH-BOT.exe'), fakePe(2))
   const cleanResult = verify(clean)
   if (cleanResult.status !== 0) throw new Error(cleanResult.stderr || cleanResult.stdout)
 
@@ -35,7 +45,17 @@ try {
     if (result.status === 0) throw new Error(`扫描器未拦截：${name}`)
   }
 
-  console.log(`生产隔离扫描自测通过：${cases.length + 1} 个场景`)
+  const consoleBuild = path.join(temporary, 'console-build')
+  await mkdir(consoleBuild)
+  await writeFile(path.join(consoleBuild, 'DH-BOT.exe'), fakePe(3))
+  if (verify(consoleBuild).status === 0) throw new Error('扫描器未拦截 CUI 子系统')
+
+  const invalidBuild = path.join(temporary, 'invalid-build')
+  await mkdir(invalidBuild)
+  await writeFile(path.join(invalidBuild, 'DH-BOT.exe'), 'not a PE executable')
+  if (verify(invalidBuild).status === 0) throw new Error('扫描器未拦截无效 PE')
+
+  console.log(`生产隔离扫描自测通过：${cases.length + 3} 个场景`)
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }

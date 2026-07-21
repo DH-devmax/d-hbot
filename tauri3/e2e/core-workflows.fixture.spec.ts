@@ -13,6 +13,7 @@ const fixtureState: FixtureState = { rules: [], tasks: [], schedules: [] }
 async function installDeveloperFixture(page: Page) {
   await page.addInitScript(({ initialState }) => {
     const state = structuredClone(initialState)
+    const actionLog: Array<{ command: string; args: Record<string, unknown> }> = []
     let callbackId = 1
     const callbacks = new Map<number, (payload: unknown) => void>()
     const group = { accountId: 'ACCOUNT', groupId: 101, name: '16 人开发测试群', ownerUserId: 1, enabled: true, aiEnabled: true, moderationEnabled: true, manualTakeover: false, welcomeMessage: '欢迎 @「[成员]」' }
@@ -24,6 +25,9 @@ async function installDeveloperFixture(page: Page) {
     const summaries = [{ id: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-21', content: '群内交流正常。', source: 'fixture', createdAt: '2026-07-21T12:00:00Z' }]
 
     const invoke = async (command: string, args: Record<string, any> = {}) => {
+      if (!/^(plugin:event\||diagnose$|database_status$|get_|list_|query_|export_)/.test(command)) {
+        actionLog.push({ command, args })
+      }
       switch (command) {
         case 'plugin:event|listen': return callbackId++
         case 'plugin:event|unlisten': return null
@@ -78,6 +82,7 @@ async function installDeveloperFixture(page: Page) {
 
     Object.assign(window, {
       __DH_E2E_FIXTURE__: true,
+      __DH_E2E_ACTIONS__: actionLog,
       __TAURI_INTERNALS__: {
         invoke,
         transformCallback(callback: (payload: unknown) => void, once = false) {
@@ -106,12 +111,16 @@ test('developer fixture covers navigation, data and management workflows', async
   await page.getByRole('button', { name: /16 人开发测试群/ }).click()
   await expect(page.getByText('广校')).toBeVisible()
   await expect(page.getByText('群人数').locator('..')).toContainText('16')
+  await page.getByPlaceholder('搜索名称、旺商号').fill('广校')
+  await expect(page.getByRole('row').filter({ hasText: '广校' })).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: 'DH群员0001' })).toHaveCount(0)
 
   await page.getByRole('button', { name: '消息台' }).click()
   await expect(page.getByText('@DH 请查看群规')).toBeVisible()
   await page.locator('label.check-chip').filter({ hasText: '16 人开发测试群' }).click()
   await page.getByPlaceholder('发送内容只会发到当前勾选的群。').fill('开发测试消息')
   await page.getByRole('button', { name: '发送文本' }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__DH_E2E_ACTIONS__.filter((item: any) => item.command === 'send_text_batch').length)).toBe(1)
 
   await page.getByRole('button', { name: '规则' }).click()
   await page.getByRole('button', { name: '新建规则' }).click()
@@ -122,6 +131,10 @@ test('developer fixture covers navigation, data and management workflows', async
   await page.getByRole('button', { name: '知识与 AI' }).click()
   await expect(page.getByRole('heading', { name: 'DH 群规' })).toBeVisible()
   await expect(page.getByLabel('标题')).toHaveValue('文明交流')
+  await page.getByLabel('内容').fill('文明交流，不发布恶意链接。')
+  await page.getByRole('button', { name: '保存文档' }).click()
+  await page.getByRole('button', { name: '保存绑定' }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__DH_E2E_ACTIONS__.map((item: any) => item.command))).toEqual(expect.arrayContaining(['save_knowledge_document', 'bind_knowledge_base']))
 
   await page.getByRole('button', { name: '任务与计划' }).click()
   await page.getByLabel('任务标题').fill('跟进群内问题')
@@ -133,7 +146,8 @@ test('developer fixture covers navigation, data and management workflows', async
   await expect(page.getByText('每日群发言').first()).toBeVisible()
 
   await page.getByRole('button', { name: '审计' }).click()
-  await expect(page.getByText('测试环境收到消息')).toBeVisible()
+  await page.getByText('测试环境收到消息').click()
+  await expect(page.getByRole('heading', { name: '收到消息' })).toBeVisible()
 
   await page.getByRole('button', { name: '设置' }).click()
   await expect(page.getByText('DH Fixture · 9233')).toBeVisible()
@@ -144,6 +158,10 @@ test('developer fixture covers navigation, data and management workflows', async
   await page.getByRole('button', { name: '调试' }).click()
   await expect(page.getByText('http://127.0.0.1:9233')).toBeVisible()
   await expect(page.getByText('FIXTURE-HASH')).toBeVisible()
+
+  const commands = await page.evaluate(() => (window as any).__DH_E2E_ACTIONS__.map((item: any) => item.command))
+  expect(commands).toEqual(expect.arrayContaining(['send_text_batch', 'save_rule', 'save_knowledge_document', 'bind_knowledge_base', 'save_task', 'save_schedule']))
+  expect(await page.locator('body').innerText()).not.toContain('127.0.0.1:9222')
 })
 
 test('captures current Tauri pages for the manual', async ({ page }) => {

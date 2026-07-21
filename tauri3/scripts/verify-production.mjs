@@ -43,11 +43,33 @@ async function files(directory) {
   return result
 }
 
+function peSubsystem(buffer) {
+  if (buffer.length < 0x40 || buffer.toString('ascii', 0, 2) !== 'MZ') return null
+  const peOffset = buffer.readUInt32LE(0x3c)
+  if (peOffset + 24 > buffer.length || buffer.toString('ascii', peOffset, peOffset + 4) !== 'PE\0\0') return null
+  const optionalOffset = peOffset + 24
+  const magic = buffer.readUInt16LE(optionalOffset)
+  if (magic !== 0x10b && magic !== 0x20b) return null
+  const subsystemOffset = optionalOffset + 68
+  return subsystemOffset + 2 <= buffer.length ? buffer.readUInt16LE(subsystemOffset) : null
+}
+
 const rootStat = await stat(root).catch(() => null)
 if (!rootStat?.isDirectory()) throw new Error(`生产产物目录不存在：${root}`)
 
 const productionFiles = await files(root)
 if (!productionFiles.length) throw new Error('生产产物目录为空')
+
+const mainExecutable = productionFiles.find(file => /^DH-BOT\.exe$/i.test(path.basename(file)))
+if (mainExecutable) {
+  const subsystem = peSubsystem(await readFile(mainExecutable))
+  if (subsystem === null) {
+    throw new Error('DH-BOT.exe 不是有效的 Windows PE 可执行文件')
+  }
+  if (subsystem !== 2) {
+    throw new Error(`DH-BOT.exe 不是 Windows GUI 子系统（Subsystem=${subsystem}），将显示 CMD 窗口`)
+  }
+}
 
 for (const file of productionFiles) {
   const relative = path.relative(root, file)

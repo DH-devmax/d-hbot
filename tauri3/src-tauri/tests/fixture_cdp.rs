@@ -115,6 +115,9 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         gateway.diagnose().await.status,
         ConnectionStatus::NimNotReady
     );
+    let nim_error = gateway.session_identity().await.unwrap_err();
+    assert_eq!(nim_error.code, "nim_not_ready");
+    assert!(nim_error.retryable);
 
     client
         .post(format!("{http_base}/fixture/faults"))
@@ -126,6 +129,17 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert!(!partial.complete);
     assert_eq!(partial.resolved_count, 8);
     assert_eq!(partial.reported_count, 17);
+
+    let unmute = gateway.unmute(FIXTURE_GROUP, 10006).await.unwrap();
+    assert_eq!(unmute.route, "/v1/group/member-mute-cancel");
+    let recall = gateway
+        .recall(FIXTURE_GROUP, 10006, "fixture-contract-recall")
+        .await
+        .unwrap();
+    assert_eq!(recall.message_id, "fixture-contract-recall");
+    gateway.set_group_mute(FIXTURE_GROUP, true).await.unwrap();
+    gateway.set_group_mute(FIXTURE_GROUP, false).await.unwrap();
+    gateway.remove_member(FIXTURE_GROUP, 10017).await.unwrap();
 
     client
         .post(format!("{http_base}/fixture/reset"))

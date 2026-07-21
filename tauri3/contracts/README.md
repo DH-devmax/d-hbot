@@ -26,9 +26,10 @@ adding or updating a frozen trace, run:
 ```text
 node scripts/sanitize-contract-capture.mjs contracts/raw/TRACE.json contracts/TRACE.sanitized.json
 node scripts/sanitize-contract-capture.mjs --self-test
+node --test scripts/sanitize-contract-capture.test.mjs
 ```
 
 The sanitizer sorts object keys, assigns stable `ACCOUNT/GROUP/USER/NIM/MESSAGE`
-placeholders, and stops when it finds API keys, authorization values, cookies,
+and display-name placeholders, and stops when it finds API keys, authorization values, cookies,
 passwords, tokens or private keys. Review the sanitized file before replacing a
 frozen contract; raw traces must remain local.

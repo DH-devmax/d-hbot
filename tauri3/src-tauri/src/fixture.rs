@@ -620,24 +620,22 @@ impl FixtureGateway {
                             .unwrap_or(FIXTURE_GROUP),
                     )
                     .await),
-                "/v1/group/set-member-mute" => {
+                "/v1/group/set-member-mute" => Self::receipt_value(
                     self.mute(
                         payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
                         payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
                         payload.get("min").and_then(Value::as_i64).unwrap_or(0) * 60,
                     )
-                    .await?;
-                    Ok(json!({}))
-                }
-                "/v1/group/member-mute-cancel" => {
+                    .await?,
+                ),
+                "/v1/group/member-mute-cancel" => Self::receipt_value(
                     self.unmute(
                         payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
                         payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
                     )
-                    .await?;
-                    Ok(json!({}))
-                }
-                "/v1/group/set-member-nickname" => {
+                    .await?,
+                ),
+                "/v1/group/set-member-nickname" => Self::receipt_value(
                     self.rename(
                         payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
                         &MemberRef {
@@ -649,10 +647,9 @@ impl FixtureGateway {
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
                     )
-                    .await?;
-                    Ok(json!({}))
-                }
-                "/v1/group/message-rollback" => {
+                    .await?,
+                ),
+                "/v1/group/message-rollback" => Self::receipt_value(
                     self.recall(
                         payload
                             .get("groupId")
@@ -664,10 +661,10 @@ impl FixtureGateway {
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
                     )
-                    .await?;
-                    Ok(json!({}))
-                }
+                    .await?,
+                ),
                 "/v1/group/remove-group-member" => {
+                    let mut receipt = None;
                     for user_id in payload
                         .get("groupMemberIds")
                         .and_then(Value::as_array)
@@ -675,15 +672,19 @@ impl FixtureGateway {
                         .flatten()
                         .filter_map(Value::as_i64)
                     {
-                        self.remove_member(
-                            payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                            user_id,
-                        )
-                        .await?;
+                        receipt = Some(
+                            self.remove_member(
+                                payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                                user_id,
+                            )
+                            .await?,
+                        );
                     }
-                    Ok(json!({}))
+                    Self::receipt_value(receipt.ok_or_else(|| {
+                        AppError::new("invalid_argument", "Fixture 移出成员列表为空")
+                    })?)
                 }
-                "/v1/group/set-group-mute" => {
+                "/v1/group/set-group-mute" => Self::receipt_value(
                     self.set_group_mute(
                         payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
                         payload
@@ -692,9 +693,8 @@ impl FixtureGateway {
                             .unwrap_or("")
                             == "MUTE_MEMBER",
                     )
-                    .await?;
-                    Ok(json!({}))
-                }
+                    .await?,
+                ),
                 _ => Err(AppError::new(
                     "fixture_route",
                     format!("Fixture 未实现路由：{route}"),
@@ -714,6 +714,11 @@ impl FixtureGateway {
 
     fn business_ok(data: Value) -> Value {
         json!({"code":0,"errno":0,"msg":"ok","data":data})
+    }
+
+    fn receipt_value(receipt: GatewayReceipt) -> AppResult<Value> {
+        serde_json::to_value(receipt)
+            .map_err(|error| AppError::new("fixture_receipt", error.to_string()))
     }
 
     fn business_error(code: i64, errno: i64, message: &str) -> Value {
@@ -1424,9 +1429,18 @@ mod tests {
         assert_eq!(fixture.snapshot().await.actions.len(), 1);
     }
 
-    #[test]
-    fn unknown_wangshangliao_build_keeps_write_capabilities_unverified() {
+    #[tokio::test]
+    async fn unknown_wangshangliao_build_keeps_reads_and_marks_writes_unverified() {
         let fixture = FixtureGateway::new_with_calibration("unknown", &"f".repeat(64));
+        assert_eq!(fixture.list_groups().await.unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .list_members(FIXTURE_GROUP)
+                .await
+                .unwrap()
+                .reported_count,
+            16
+        );
         let capabilities = fixture.capabilities();
         assert_eq!(capabilities.mute, CapabilityStatus::Unverified);
         assert_eq!(capabilities.recall, CapabilityStatus::Unverified);

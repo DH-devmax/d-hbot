@@ -17,10 +17,12 @@ function kindForKey(key) {
   if (normalized.includes('requestid') || normalized === 'traceid') return 'REQUEST'
   if (normalized.includes('listenersession') || normalized === 'sessionid') return 'SESSION'
   if (normalized.includes('messageid') || normalized.includes('msgid') || normalized === 'idserver' || normalized === 'idclient') return 'MESSAGE'
-  if (normalized.includes('group') || normalized.includes('teamid') || normalized === 'to') return 'GROUP'
+  if (normalized === 'groupmemberids' || normalized === 'memberids') return 'USER'
   if (normalized.includes('nimid') || normalized === 'accid') return 'NIM'
   if (normalized === 'account' || normalized.includes('accountid') || normalized.includes('nimaccount')) return 'ACCOUNT'
-  if (normalized.includes('userid') || normalized.includes('senderid') || normalized === 'from') return 'USER'
+  if (normalized.endsWith('userid') || normalized === 'senderid' || normalized === 'from') return 'USER'
+  if (normalized === 'groupid' || normalized === 'groupcloudid' || normalized === 'teamid' || normalized === 'to') return 'GROUP'
+  if (normalized === 'groupname' || normalized === 'nickname' || normalized === 'cardname' || normalized === 'usernick' || normalized === 'groupmembernick') return 'NAME'
   return null
 }
 
@@ -36,8 +38,18 @@ function assertNoSecrets(value, location = '$') {
     }
     return
   }
-  if (typeof value === 'string' && sensitiveValues.some(pattern => pattern.test(value))) {
-    throw new Error(`捕获包含敏感值：${location}`)
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        assertNoSecrets(JSON.parse(trimmed), `${location}<json>`)
+      } catch (error) {
+        if (String(error.message).includes('捕获包含敏感')) throw error
+      }
+    }
+    if (sensitiveValues.some(pattern => pattern.test(value))) {
+      throw new Error(`捕获包含敏感值：${location}`)
+    }
   }
 }
 
