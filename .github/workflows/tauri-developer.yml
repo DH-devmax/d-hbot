@@ -1,4 +1,5 @@
 name: DH BOT Developer Fixture
+run-name: DH BOT internal developer build - ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
