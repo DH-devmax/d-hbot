@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Audit, DailySummary, Group, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
+import type { Audit, AuditFilters, DailySummary, Group, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {
   if (typeof reason === 'string') return reason
@@ -30,10 +30,7 @@ export const api = {
   recentMessages: (accountId: string, groupId?: number, limit = 500) => invoke<Message[]>('recent_messages', { accountId, groupId: groupId ?? null, limit }),
   async queryMessages(accountId: string, filters: MessageFilters, cursor?: string, limit = 100): Promise<PageResult<Message>> {
     try {
-      const result = await invoke<PageResult<Message>>('query_messages', { query: { accountId, groupIds: filters.groupIds || [], keyword: filters.keyword || null, kind: filters.kind === 'all' ? null : filters.kind || null, cursor: cursor ?? null, limit } })
-      if (!filters.processingState || filters.processingState === 'all') return result
-      const items = result.items.filter(message => matchesMessageFilters(message, filters))
-      return { items, nextCursor: result.nextCursor }
+      return await invoke<PageResult<Message>>('query_messages', { query: { accountId, groupIds: filters.groupIds || [], keyword: filters.keyword || null, kind: filters.kind === 'all' ? null : filters.kind || null, processingState: filters.processingState === 'all' ? null : filters.processingState || null, cursor: cursor ?? null, limit } })
     } catch (reason) {
       if (!missingCommand(reason)) throw reason
       const messages = await api.recentMessages(accountId, undefined, Math.max(limit, 500))
@@ -96,12 +93,13 @@ export const api = {
   saveSummarySettings: (settings: SummarySettings) => invoke<void>('save_summary_settings', { settings }),
   generateSummary: (accountId: string, groupId: number) => invoke<DailySummary>('generate_daily_summary', { accountId, groupId }),
   listAudit: (accountId: string, limit = 1000) => invoke<Audit[]>('list_audit', { accountId, limit }),
-  async queryAudit(accountId: string, filters: { groupId?: number; level?: string; from?: string; to?: string; cursor?: string }, limit = 500): Promise<PageResult<Audit>> {
-    try { return await invoke<PageResult<Audit>>('query_audit', { query: { accountId, groupId: filters.groupId || null, userId: null, event: null, level: filters.level && filters.level !== 'all' ? filters.level : null, from: filters.from || null, to: filters.to || null, cursor: filters.cursor || null, limit } }) }
+  async queryAudit(accountId: string, filters: AuditFilters, limit = 500): Promise<PageResult<Audit>> {
+    const query = { accountId, groupId: filters.groupId || null, userId: filters.userId || null, event: filters.event && filters.event !== 'all' ? filters.event : null, level: filters.level && filters.level !== 'all' ? filters.level : null, from: filters.from || null, to: filters.to || null, cursor: filters.cursor || null, limit }
+    try { return await invoke<PageResult<Audit>>('query_audit', { query }) }
     catch (reason) { if (!missingCommand(reason)) throw reason; return { items: await api.listAudit(accountId, limit), nextCursor: null } }
   },
-  async exportAudit(accountId: string, format: 'json' | 'csv') {
-    try { return await invoke<string>('export_audit', { query: { accountId, groupId: null, userId: null, event: null, level: null, from: null, to: null, cursor: null, limit: 1000 }, format }) }
+  async exportAudit(accountId: string, filters: AuditFilters, format: 'json' | 'csv') {
+    try { return await invoke<string>('export_audit', { query: { accountId, groupId: filters.groupId || null, userId: filters.userId || null, event: filters.event && filters.event !== 'all' ? filters.event : null, level: filters.level && filters.level !== 'all' ? filters.level : null, from: filters.from || null, to: filters.to || null, cursor: null, limit: 1000 }, format }) }
     catch (reason) { if (!missingCommand(reason)) throw reason; return '' }
   },
 }

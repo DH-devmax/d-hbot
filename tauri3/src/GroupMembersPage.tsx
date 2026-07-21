@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, Hand, Pencil, RefreshCw, Search, Shield, Sparkles, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
+import { Ban, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, Hand, Pencil, RefreshCw, Search, Shield, Sparkles, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
 import './members.css'
 
 type GroupSummary = {
@@ -22,6 +22,7 @@ type Member = {
   cardName: string
   role: string
   accountState: string
+  blacklisted: boolean
   present: boolean
   originalCardName: string
   managedCardName: string
@@ -55,6 +56,13 @@ type AiAutomationSettings = {
   mute: boolean
   remove: boolean
   manualTakeover: boolean
+}
+
+type MemberBatchResult = {
+  userId?: number
+  nimId?: string
+  success: boolean
+  error: string
 }
 
 type Props = {
@@ -331,7 +339,7 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
 
   const cleanupInactive = async () => {
     if (!activeGroup || !roster) return
-    const candidates = roster.members.filter(member => member.role === 'member' && (member.accountState.includes('BAN') || ['已封禁用户', '该用户已注销'].includes(displayName(member))))
+    const candidates = roster.members.filter(member => member.role === 'member' && (member.accountState.includes('BAN') || member.accountState.includes('CANCEL') || ['已封禁用户', '该用户已注销'].includes(displayName(member))))
     if (!candidates.length) {
       onError('当前群没有需要清理的注销或封禁普通成员')
       return
@@ -340,7 +348,8 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
     setActiveAction('cleanup')
     onError('')
     try {
-      for (const member of candidates) await invoke('remove_member', { groupId: activeGroup.groupId, userId: member.userId })
+      const results = await invoke<MemberBatchResult[]>('execute_member_batch', { input: { groupId: activeGroup.groupId, action: 'remove', members: candidates.map(member => ({ userId: member.userId > 0 ? member.userId : null, nimId: member.nimId || null })) } })
+      reportBatchResults(results, '清理')
       await loadMembers(selectedGroup)
     } catch (reason) {
       onError(actionError(reason))
@@ -402,21 +411,22 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
     }
   }
 
-  const runBulk = async (kind: 'mute' | 'unmute' | 'remove') => {
+  const reportBatchResults = (results: MemberBatchResult[], label: string) => {
+    const failed = results.filter(result => !result.success)
+    if (failed.length) onError(`${label}完成：成功 ${results.length - failed.length} 人，失败 ${failed.length} 人。${failed.slice(0, 3).map(result => result.error).filter(Boolean).join('；')}`)
+    else onError(`${label}完成：成功 ${results.length} 人`)
+  }
+
+  const runBulk = async (kind: 'mute' | 'unmute' | 'remove' | 'blacklist' | 'unblacklist') => {
     const members = (roster?.members ?? []).filter(member => selected.has(member.userId))
     if (!selectedGroup || !members.length) return
-    const label = kind === 'mute' ? `禁言 ${Math.round(muteSeconds / 60)} 分钟` : kind === 'unmute' ? '解除禁言' : '移出群聊'
+    const label = kind === 'mute' ? `禁言 ${Math.round(muteSeconds / 60)} 分钟` : kind === 'unmute' ? '解除禁言' : kind === 'remove' ? '移出群聊' : kind === 'blacklist' ? '加入黑名单' : '移出黑名单'
     if (!window.confirm(`确认对已选择的 ${members.length} 位群员执行“${label}”？`)) return
     setActiveAction(`bulk:${kind}`)
     onError('')
     try {
-      for (const member of members) {
-        if (member.userId <= 0 || (kind === 'remove' && member.role === 'owner')) continue
-        const command = kind === 'mute' ? 'mute_member' : kind === 'unmute' ? 'unmute_member' : 'remove_member'
-        const payload: Record<string, unknown> = { groupId: selectedGroup, userId: member.userId }
-        if (kind === 'mute') payload.durationSeconds = muteSeconds
-        await invoke(command, payload)
-      }
+      const results = await invoke<MemberBatchResult[]>('execute_member_batch', { input: { groupId: selectedGroup, action: kind, durationSeconds: kind === 'mute' ? muteSeconds : null, members: members.map(member => ({ userId: member.userId > 0 ? member.userId : null, nimId: member.nimId || null })) } })
+      reportBatchResults(results, label)
       await loadMembers(selectedGroup)
     } catch (reason) {
       onError(actionError(reason))
@@ -460,9 +470,9 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
           <select value={muteSeconds} onChange={event => setMuteSeconds(Number(event.target.value))} aria-label="禁言时长"><option value={600}>禁言 10 分钟</option><option value={3600}>禁言 1 小时</option><option value={86400}>禁言 24 小时</option><option value={604800}>禁言 7 天</option></select>
           <button className="icon-command" title="重新同步成员" onClick={() => void loadMembers()} disabled={memberLoading}><RefreshCw size={16} className={memberLoading ? 'spin' : ''} /></button>
         </div>
-        {selected.size > 0 && <div className="bulk-bar"><strong>已选择 {selected.size} 人</strong><button onClick={() => void runBulk('mute')} disabled={Boolean(activeAction)}><VolumeX size={14} />禁言</button><button onClick={() => void runBulk('unmute')} disabled={Boolean(activeAction)}><Volume2 size={14} />解禁</button><button className="danger-text" onClick={() => void runBulk('remove')} disabled={Boolean(activeAction)}><UserMinus size={14} />移出</button><button onClick={() => setSelected(new Set())}>取消选择</button></div>}
+        {selected.size > 0 && <div className="bulk-bar"><strong>已选择 {selected.size} 人</strong><button onClick={() => void runBulk('mute')} disabled={Boolean(activeAction)}><VolumeX size={14} />禁言</button><button onClick={() => void runBulk('unmute')} disabled={Boolean(activeAction)}><Volume2 size={14} />解禁</button><button onClick={() => void runBulk('blacklist')} disabled={Boolean(activeAction)}><Ban size={14} />加入黑名单</button><button onClick={() => void runBulk('unblacklist')} disabled={Boolean(activeAction)}><Shield size={14} />移出黑名单</button><button className="danger-text" onClick={() => void runBulk('remove')} disabled={Boolean(activeAction)}><UserMinus size={14} />移出</button><button onClick={() => setSelected(new Set())}>取消选择</button></div>}
         <div className="member-table-wrap">
-          <table className="member-table"><thead><tr><th><input type="checkbox" checked={allVisibleSelected} onChange={toggleAll} aria-label="选择当前列表" /></th><th>序号</th><th>群员</th><th>角色</th><th>账号状态</th><th>操作</th></tr></thead><tbody>{pagedMembers.map((member, index) => <tr key={`${member.userId}:${member.nimId}`}><td><input type="checkbox" checked={selected.has(member.userId)} onChange={() => setSelected(previous => { const next = new Set(previous); if (next.has(member.userId)) next.delete(member.userId); else next.add(member.userId); return next })} aria-label={`选择${displayName(member)}`} /></td><td>{memberPage * memberPageSize + index + 1}</td><td><strong>{displayName(member)}</strong><small>{member.nickname && member.nickname !== member.cardName ? `原名称：${member.nickname}` : `旺商号：${member.nimId || '未识别'}`}</small></td><td><span className={`role role-${member.role}`}>{roleLabels[member.role] || '群员'}</span></td><td><span className={member.accountState.includes('BAN') ? 'state-bad' : ''}>{stateLabels[member.accountState] || '未知'}</span></td><td><div className="row-actions"><button title="修改群名片" onClick={() => void invokeMemberAction(member, 'rename')} disabled={Boolean(activeAction)}><Pencil size={15} /></button><button title={`禁言 ${Math.round(muteSeconds / 60)} 分钟`} onClick={() => void invokeMemberAction(member, 'mute')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><VolumeX size={15} /></button><button title="解除禁言" onClick={() => void invokeMemberAction(member, 'unmute')} disabled={Boolean(activeAction) || member.userId <= 0}><Volume2 size={15} /></button><button className="danger-text" title="移出群聊" onClick={() => void invokeMemberAction(member, 'remove')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><UserMinus size={15} /></button></div></td></tr>)}</tbody></table>
+          <table className="member-table"><thead><tr><th><input type="checkbox" checked={allVisibleSelected} onChange={toggleAll} aria-label="选择当前列表" /></th><th>序号</th><th>群员</th><th>角色</th><th>账号状态</th><th>操作</th></tr></thead><tbody>{pagedMembers.map((member, index) => <tr key={`${member.userId}:${member.nimId}`}><td><input type="checkbox" checked={selected.has(member.userId)} onChange={() => setSelected(previous => { const next = new Set(previous); if (next.has(member.userId)) next.delete(member.userId); else next.add(member.userId); return next })} aria-label={`选择${displayName(member)}`} /></td><td>{memberPage * memberPageSize + index + 1}</td><td><strong>{displayName(member)}</strong><small>{member.nickname && member.nickname !== member.cardName ? `原名称：${member.nickname}` : `旺商号：${member.nimId || '未识别'}`}</small></td><td><span className={`role role-${member.role}`}>{roleLabels[member.role] || '群员'}</span></td><td><span className={member.accountState.includes('BAN') || member.accountState.includes('CANCEL') ? 'state-bad' : ''}>{member.blacklisted ? '黑名单 · ' : ''}{stateLabels[member.accountState] || '未知'}</span></td><td><div className="row-actions"><button title="修改群名片" onClick={() => void invokeMemberAction(member, 'rename')} disabled={Boolean(activeAction)}><Pencil size={15} /></button><button title={`禁言 ${Math.round(muteSeconds / 60)} 分钟`} onClick={() => void invokeMemberAction(member, 'mute')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><VolumeX size={15} /></button><button title="解除禁言" onClick={() => void invokeMemberAction(member, 'unmute')} disabled={Boolean(activeAction) || member.userId <= 0}><Volume2 size={15} /></button><button className="danger-text" title="移出群聊" onClick={() => void invokeMemberAction(member, 'remove')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><UserMinus size={15} /></button></div></td></tr>)}</tbody></table>
           {memberLoading && <div className="member-loading"><RefreshCw size={18} className="spin" />正在同步成员</div>}
           {!memberLoading && roster && !visibleMembers.length && <div className="compact-empty">没有匹配的群员</div>}
         </div>

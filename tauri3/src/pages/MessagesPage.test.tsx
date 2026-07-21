@@ -63,4 +63,19 @@ describe('MessagesPage', () => {
     resolveNext({ items: [message('ACCOUNT-B', 'ACCOUNT-B 消息', 2)], nextCursor: null })
     await screen.findByText('ACCOUNT-B 消息')
   })
+
+  it('uses backend cursors for the next and previous page', async () => {
+    mocks.queryMessages
+      .mockResolvedValueOnce({ items: [message('ACCOUNT-A', '第一页', 30)], nextCursor: '30' })
+      .mockResolvedValueOnce({ items: [message('ACCOUNT-A', '第二页', 29)], nextCursor: null })
+      .mockResolvedValueOnce({ items: [message('ACCOUNT-A', '第一页', 30)], nextCursor: '30' })
+    render(<MessagesPage groups={groups} accountId="ACCOUNT-A" onError={vi.fn()} />)
+    await screen.findByText('第一页')
+    await userEvent.click(screen.getByTitle('下一页'))
+    await screen.findByText('第二页')
+    expect(mocks.queryMessages).toHaveBeenLastCalledWith('ACCOUNT-A', expect.any(Object), '30', 30)
+    await userEvent.click(screen.getByTitle('上一页'))
+    await screen.findByText('第一页')
+    expect(mocks.queryMessages).toHaveBeenLastCalledWith('ACCOUNT-A', expect.any(Object), undefined, 30)
+  })
 })

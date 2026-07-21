@@ -102,9 +102,45 @@ impl Database {
     ) -> AppResult<Vec<Message>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=? AND (?2 IS NULL OR group_id=?2) ORDER BY received_at DESC,id DESC LIMIT ?3")?;
-            let rows = statement.query_map(params![account_id, group_id, limit.clamp(1, 1000) as i64], |row| Ok(Message { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, server_message_id: row.get(3)?, sequence: row.get(4)?, user_id: row.get(5)?, sender_name: row.get(6)?, kind: row.get(7)?, text: row.get(8)?, sent_at: parse_time(row.get::<_, String>(9)?), received_at: parse_time(row.get::<_, String>(10)?), processed_at: optional_time(row.get(11)?), acknowledged_at: optional_time(row.get(12)?), processing_state: row.get(13)?, attempts: row.get(14)?, next_attempt_at: optional_time(row.get(15)?), last_error: row.get(16)?, mentions_json: row.get(17)?, source_kind: row.get(18)?, flow: row.get(19)? }))?;
+            let rows = statement.query_map(params![account_id, group_id, limit.clamp(1, 1000) as i64], message_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("messages_read", error.to_string()))
+    }
+
+    pub(crate) fn query_messages(&self, query: &crate::MessageQuery) -> AppResult<Vec<Message>> {
+        self.with_connection(|connection| {
+            let mut sql = String::from("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=?");
+            let mut values = vec![rusqlite::types::Value::from(query.account_id.clone())];
+            if !query.group_ids.is_empty() {
+                sql.push_str(" AND group_id IN (");
+                sql.push_str(&vec!["?"; query.group_ids.len()].join(","));
+                sql.push(')');
+                values.extend(query.group_ids.iter().copied().map(rusqlite::types::Value::from));
+            }
+            if let Some(keyword) = query.keyword.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                sql.push_str(" AND (LOWER(text) LIKE ? OR LOWER(sender_name) LIKE ? OR LOWER(server_message_id) LIKE ?)");
+                let pattern = format!("%{}%", keyword.to_lowercase());
+                values.extend([pattern.clone().into(), pattern.clone().into(), pattern.into()]);
+            }
+            if let Some(kind) = query.kind.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                sql.push_str(" AND kind=?");
+                values.push(kind.to_string().into());
+            }
+            if let Some(state) = query.processing_state.as_deref().map(str::trim).filter(|value| !value.is_empty() && *value != "all") {
+                sql.push_str(" AND processing_state=?");
+                values.push(state.to_string().into());
+            }
+            if let Some(cursor) = query.cursor.as_deref().and_then(|value| value.parse::<i64>().ok()) {
+                sql.push_str(" AND id<?");
+                values.push(cursor.into());
+            }
+            sql.push_str(" ORDER BY id DESC LIMIT ?");
+            values.push((query.limit.unwrap_or(50).clamp(1, 201) as i64).into());
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(values), message_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| AppError::new("messages_query", error.to_string()))
     }
 
     pub fn mark_message_processed(&self, id: i64, acknowledged: bool) -> AppResult<()> {
@@ -798,6 +834,77 @@ impl Database {
         self.with_connection(|connection| { connection.execute("INSERT INTO audit_events(account_id,group_id,user_id,actor,event,level,details,created_at) VALUES(?,?,?,?,?,?,?,?)", params![event.account_id,event.group_id,event.user_id,event.actor,event.event,event.level,event.details,event.created_at.to_rfc3339()])?; Ok(connection.last_insert_rowid()) }).map_err(|error| AppError::new("audit_write", error.to_string()))
     }
 
+    /// Commits the externally observed effect result and its operator-visible
+    /// records as one unit. A crash can therefore leave the claimed effect in
+    /// `processing` (recovered as `unknown` on restart), but can never expose a
+    /// terminal outbox row without its matching action/audit records.
+    pub fn archive_effect_dispatch(
+        &self,
+        outbox_id: i64,
+        status: &str,
+        error: &str,
+        receipt_json: &str,
+        action: Option<&ActionRecord>,
+        audit: &AuditEvent,
+    ) -> AppResult<bool> {
+        let now = Utc::now();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = match status {
+                "succeeded" => transaction.execute(
+                    "UPDATE effect_outbox SET state='succeeded',completed_at=?,claimed_at=NULL,next_attempt_at=NULL,last_error='',receipt_json=? WHERE id=? AND state='processing'",
+                    params![now.to_rfc3339(), receipt_json, outbox_id],
+                )?,
+                "unknown" => transaction.execute(
+                    "UPDATE effect_outbox SET state='unknown',claimed_at=NULL,next_attempt_at=NULL,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
+                    params![error, receipt_json, outbox_id],
+                )?,
+                _ => {
+                    let attempts: i64 = transaction
+                        .query_row(
+                            "SELECT attempts FROM effect_outbox WHERE id=?",
+                            params![outbox_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .unwrap_or(1);
+                    let state = if attempts >= 5 { "failed" } else { "retry" };
+                    let next_attempt_at = (attempts < 5).then(|| {
+                        (now + chrono::Duration::seconds(match attempts {
+                            0 | 1 => 5,
+                            2 => 30,
+                            3 => 120,
+                            4 => 600,
+                            _ => 1_800,
+                        }))
+                        .to_rfc3339()
+                    });
+                    transaction.execute(
+                        "UPDATE effect_outbox SET state=?,claimed_at=NULL,next_attempt_at=?,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
+                        params![state, next_attempt_at, error, receipt_json, outbox_id],
+                    )?
+                }
+            };
+            if changed == 0 {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            if let Some(action) = action {
+                transaction.execute(
+                    "INSERT INTO actions(account_id,group_id,user_id,message_id,rule_id,kind,mode,duration_seconds,reason,success,error,receipt_json,dedupe_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,dedupe_key) WHERE dedupe_key<>'' DO UPDATE SET success=excluded.success,error=excluded.error,receipt_json=excluded.receipt_json,reason=excluded.reason,created_at=excluded.created_at",
+                    params![action.account_id,action.group_id,action.user_id,action.message_id,action.rule_id,action.kind,action.mode,action.duration_seconds,action.reason,bool_i(action.success),action.error,action.receipt_json,action.dedupe_key,action.created_at.to_rfc3339()],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO audit_events(account_id,group_id,user_id,actor,event,level,details,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                params![audit.account_id,audit.group_id,audit.user_id,audit.actor,audit.event,audit.level,audit.details,audit.created_at.to_rfc3339()],
+            )?;
+            transaction.commit()?;
+            Ok(true)
+        })
+        .map_err(|error| AppError::new("effect_dispatch_archive", error.to_string()))
+    }
+
     pub fn list_audit(&self, account_id: &str, limit: usize) -> AppResult<Vec<AuditEvent>> {
         self.with_connection(|connection| { let mut statement = connection.prepare("SELECT id,account_id,group_id,user_id,actor,event,level,details,created_at FROM audit_events WHERE account_id=? ORDER BY created_at DESC,id DESC LIMIT ?")?; let rows = statement.query_map(params![account_id,limit.clamp(1,1000) as i64], |row| Ok(AuditEvent { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, user_id: row.get(3)?, actor: row.get(4)?, event: row.get(5)?, level: row.get(6)?, details: row.get(7)?, created_at: parse_time(row.get(8)?) }))?; rows.collect::<Result<Vec<_>,_>>() }).map_err(|error| AppError::new("audit_read", error.to_string()))
     }
@@ -831,6 +938,36 @@ impl Database {
 }
 
 impl DatabaseExecutor {
+    pub(crate) async fn query_messages(
+        &self,
+        query: crate::MessageQuery,
+    ) -> AppResult<Vec<Message>> {
+        self.execute(move |database| database.query_messages(&query))
+            .await
+    }
+
+    pub async fn archive_effect_dispatch(
+        &self,
+        outbox_id: i64,
+        status: String,
+        error: String,
+        receipt_json: String,
+        action: Option<ActionRecord>,
+        audit: AuditEvent,
+    ) -> AppResult<bool> {
+        self.execute(move |database| {
+            database.archive_effect_dispatch(
+                outbox_id,
+                &status,
+                &error,
+                &receipt_json,
+                action.as_ref(),
+                &audit,
+            )
+        })
+        .await
+    }
+
     pub async fn set_setting(&self, key: String, value: String, sensitive: bool) -> AppResult<()> {
         self.execute(move |database| database.set_setting(&key, &value, sensitive))
             .await
@@ -1025,6 +1162,31 @@ impl DatabaseExecutor {
     }
 }
 
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        group_id: row.get(2)?,
+        server_message_id: row.get(3)?,
+        sequence: row.get(4)?,
+        user_id: row.get(5)?,
+        sender_name: row.get(6)?,
+        kind: row.get(7)?,
+        text: row.get(8)?,
+        sent_at: parse_time(row.get::<_, String>(9)?),
+        received_at: parse_time(row.get::<_, String>(10)?),
+        processed_at: optional_time(row.get(11)?),
+        acknowledged_at: optional_time(row.get(12)?),
+        processing_state: row.get(13)?,
+        attempts: row.get(14)?,
+        next_attempt_at: optional_time(row.get(15)?),
+        last_error: row.get(16)?,
+        mentions_json: row.get(17)?,
+        source_kind: row.get(18)?,
+        flow: row.get(19)?,
+    })
+}
+
 fn value_to_string(value: &Option<DateTime<Utc>>) -> Option<String> {
     value.as_ref().map(DateTime::to_rfc3339)
 }
@@ -1195,7 +1357,7 @@ fn optional_time(value: Option<String>) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Account, Group};
+    use crate::models::{Account, EffectOutboxRequest, Group};
     use crate::paths::AppPaths;
     use tempfile::tempdir;
 
@@ -1237,6 +1399,206 @@ mod tests {
             .unwrap();
         database
     }
+
+    #[test]
+    fn message_query_filters_and_paginates_in_sqlite() {
+        let database = database();
+        let now = Utc::now();
+        let first = Message {
+            id: 0,
+            account_id: "a".into(),
+            group_id: 1,
+            server_message_id: "message-1".into(),
+            sequence: 1,
+            user_id: 7,
+            sender_name: "广州校长".into(),
+            kind: "text".into(),
+            text: "第一条业务消息".into(),
+            sent_at: now,
+            received_at: now,
+            processed_at: None,
+            acknowledged_at: None,
+            processing_state: "pending".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: "[]".into(),
+            source_kind: Some("nim".into()),
+            flow: Some("inbound".into()),
+        };
+        let mut second = first.clone();
+        second.server_message_id = "message-2".into();
+        second.sequence = 2;
+        second.text = "第二条业务消息".into();
+        let first_id = database.insert_message(&first).unwrap().id;
+        let second_id = database.insert_message(&second).unwrap().id;
+
+        let page = database
+            .query_messages(&crate::MessageQuery {
+                account_id: "a".into(),
+                group_ids: vec![1],
+                keyword: Some("业务".into()),
+                kind: Some("text".into()),
+                processing_state: Some("pending".into()),
+                cursor: None,
+                limit: Some(1),
+            })
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, second_id);
+
+        let previous = database
+            .query_messages(&crate::MessageQuery {
+                account_id: "a".into(),
+                group_ids: vec![1],
+                keyword: Some("第一条".into()),
+                kind: Some("text".into()),
+                processing_state: Some("pending".into()),
+                cursor: Some(second_id.to_string()),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous[0].id, first_id);
+    }
+
+    #[test]
+    fn effect_dispatch_archive_is_atomic_across_outbox_action_and_audit() {
+        let database = database();
+        let effect = database
+            .enqueue_effect(&EffectOutboxRequest {
+                account_id: "a".into(),
+                group_id: 1,
+                effect_type: "send_text".into(),
+                payload_json: r#"{"text":"hello"}"#.into(),
+                dedupe_key: "atomic-effect".into(),
+            })
+            .unwrap();
+        let claimed = database.claim_effect_outbox(Some("a"), 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, effect.id);
+        let now = Utc::now();
+        let action = ActionRecord {
+            id: 0,
+            account_id: "a".into(),
+            group_id: 1,
+            user_id: 2,
+            message_id: Some(3),
+            rule_id: Some(4),
+            kind: "reply".into(),
+            mode: "automatic".into(),
+            duration_seconds: 0,
+            reason: "atomic".into(),
+            success: true,
+            error: String::new(),
+            receipt_json: r#"{"status":"succeeded"}"#.into(),
+            dedupe_key: "atomic-effect".into(),
+            created_at: now,
+        };
+        let audit = AuditEvent {
+            id: 0,
+            account_id: "a".into(),
+            group_id: 1,
+            user_id: 2,
+            actor: "DH BOT".into(),
+            event: "effect_dispatched".into(),
+            level: "info".into(),
+            details: r#"{"status":"succeeded"}"#.into(),
+            created_at: now,
+        };
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_effect_audit
+                     BEFORE INSERT ON audit_events
+                     WHEN NEW.event='effect_dispatched'
+                     BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END;",
+                )
+            })
+            .unwrap();
+        let error = database
+            .archive_effect_dispatch(
+                effect.id,
+                "succeeded",
+                "",
+                &action.receipt_json,
+                Some(&action),
+                &audit,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "effect_dispatch_archive");
+        let (state, actions, audits): (String, i64, i64) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT state FROM effect_outbox WHERE id=?",
+                        params![effect.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM actions WHERE dedupe_key='atomic-effect'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM audit_events WHERE event='effect_dispatched'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((state.as_str(), actions, audits), ("processing", 0, 0));
+
+        database
+            .with_connection(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_effect_audit")
+            })
+            .unwrap();
+        assert!(database
+            .archive_effect_dispatch(
+                effect.id,
+                "succeeded",
+                "",
+                &action.receipt_json,
+                Some(&action),
+                &audit,
+            )
+            .unwrap());
+        assert!(!database
+            .archive_effect_dispatch(
+                effect.id,
+                "succeeded",
+                "",
+                &action.receipt_json,
+                Some(&action),
+                &audit,
+            )
+            .unwrap());
+        let (state, actions, audits): (String, i64, i64) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT state FROM effect_outbox WHERE id=?",
+                        params![effect.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM actions WHERE dedupe_key='atomic-effect'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM audit_events WHERE event='effect_dispatched'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((state.as_str(), actions, audits), ("succeeded", 1, 1));
+    }
+
     #[test]
     fn rules_and_actions_round_trip() {
         let database = database();

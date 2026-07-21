@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
@@ -1220,6 +1221,79 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
     Ok(())
 }
 
+fn recover_processing_effects(
+    connection: &mut Connection,
+    reason: &str,
+) -> rusqlite::Result<usize> {
+    let pending = {
+        let mut statement = connection.prepare(
+            "SELECT id,account_id,group_id,effect_type,payload_json,dedupe_key FROM effect_outbox WHERE state='processing' ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let receipt_json = serde_json::json!({
+        "status": "unknown",
+        "businessMessage": reason,
+    })
+    .to_string();
+    let now = Utc::now().to_rfc3339();
+    let transaction = connection.transaction()?;
+    for (id, account_id, group_id, effect_type, payload_json, dedupe_key) in &pending {
+        let payload: Value = serde_json::from_str(payload_json).unwrap_or(Value::Null);
+        let user_id = payload.get("userId").and_then(Value::as_i64).unwrap_or(0);
+        transaction.execute(
+            "UPDATE effect_outbox SET state='unknown',next_attempt_at=NULL,claimed_at=NULL,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
+            params![reason, receipt_json, id],
+        )?;
+        if payload
+            .get("recordAction")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let kind = payload
+                .get("actionKind")
+                .and_then(Value::as_str)
+                .unwrap_or(effect_type);
+            transaction.execute(
+                "INSERT INTO actions(account_id,group_id,user_id,message_id,rule_id,kind,mode,duration_seconds,reason,success,error,receipt_json,dedupe_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,dedupe_key) WHERE dedupe_key<>'' DO UPDATE SET success=excluded.success,error=excluded.error,receipt_json=excluded.receipt_json,reason=excluded.reason,created_at=excluded.created_at",
+                params![account_id,group_id,user_id,payload.get("messageId").and_then(Value::as_i64),payload.get("ruleId").and_then(Value::as_i64),kind,payload.get("mode").and_then(Value::as_str).unwrap_or("automatic"),payload.get("durationSeconds").and_then(Value::as_i64).unwrap_or(0),payload.get("reason").and_then(Value::as_str).unwrap_or_default(),0,reason,receipt_json,dedupe_key,now],
+            )?;
+        }
+        let details = serde_json::json!({
+            "effect": effect_type,
+            "success": false,
+            "status": "unknown",
+            "error": reason,
+            "receipt": {
+                "status": "unknown",
+                "businessMessage": reason,
+            },
+        })
+        .to_string();
+        transaction.execute(
+            "INSERT INTO audit_events(account_id,group_id,user_id,actor,event,level,details,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            params![account_id,group_id,user_id,"DH BOT","effect_recovered_unknown","warning",details,now],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(pending.len())
+}
+
 impl Database {
     pub fn open(paths: &AppPaths) -> AppResult<Self> {
         if let Some(parent) = paths.database.parent() {
@@ -1270,10 +1344,7 @@ impl Database {
                 "UPDATE gateway_inbox SET state='retry',next_attempt_at=NULL,claimed_at=NULL,last_error='DH BOT 重启后已恢复处理' WHERE state='processing'",
                 [],
             )?;
-            connection.execute(
-                "UPDATE effect_outbox SET state='unknown',next_attempt_at=NULL,claimed_at=NULL,last_error='DH BOT 重启，远端执行结果未知',receipt_json='{\"status\":\"unknown\",\"businessMessage\":\"DH BOT 重启，远端执行结果未知\"}' WHERE state='processing'",
-                [],
-            )?;
+            recover_processing_effects(connection, "DH BOT 重启，远端执行结果未知")?;
             connection.execute(
                 "UPDATE tasks SET reminder_state='retry',reminder_next_attempt_at=NULL,reminder_claimed_at=NULL,reminder_last_error='DH BOT 重启后已恢复提醒' WHERE reminder_state='processing' AND reminder_sent_at IS NULL",
                 [],
@@ -1494,7 +1565,13 @@ impl Database {
                 params![bool_i(blacklisted), Utc::now().to_rfc3339(), account_id, group_id, user_id],
             )
         })
-        .map(|_| ())
+        .and_then(|changed| {
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            }
+        })
         .map_err(|error| AppError::new("member_blacklist", error.to_string()))
     }
 
@@ -1966,18 +2043,8 @@ impl Database {
     }
 
     pub fn mark_processing_effects_unknown(&self, reason: &str) -> AppResult<usize> {
-        let receipt = serde_json::json!({
-            "status": "unknown",
-            "businessMessage": reason,
-        })
-        .to_string();
-        self.with_connection(|connection| {
-            connection.execute(
-                "UPDATE effect_outbox SET state='unknown',next_attempt_at=NULL,claimed_at=NULL,last_error=?,receipt_json=? WHERE state='processing'",
-                params![reason, receipt],
-            )
-        })
-        .map_err(|error| AppError::new("effect_outbox_shutdown", error.to_string()))
+        self.with_connection(|connection| recover_processing_effects(connection, reason))
+            .map_err(|error| AppError::new("effect_outbox_shutdown", error.to_string()))
     }
 
     pub fn retry_effect_outbox(&self, id: i64) -> AppResult<bool> {
@@ -2567,6 +2634,54 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v2_and_v3_to_v5_idempotently() {
+        for version in [2_i64, 3_i64] {
+            let directory = tempdir().unwrap();
+            let paths = AppPaths {
+                root: directory.path().to_path_buf(),
+                v3: directory.path().join("3.0"),
+                database: directory.path().join("3.0/dh.db"),
+                secrets: directory.path().join("3.0/secrets.dat"),
+                logs: directory.path().join("3.0/logs"),
+                legacy_backups: directory.path().join("legacy-backups"),
+                runtime_mode_file: directory.path().join("runtime-mode"),
+            };
+            std::fs::create_dir_all(&paths.v3).unwrap();
+            let legacy = Connection::open(&paths.database).unwrap();
+            legacy.execute_batch(SCHEMA).unwrap();
+            legacy
+                .execute_batch(&format!(
+                    "ALTER TABLE actions DROP COLUMN receipt_json;
+                     ALTER TABLE effect_outbox DROP COLUMN receipt_json;
+                     PRAGMA user_version={version};"
+                ))
+                .unwrap();
+            drop(legacy);
+
+            let database = Database::open(&paths).unwrap();
+            assert_eq!(database.status().unwrap().schema_version, 5);
+            for table in ["actions", "effect_outbox"] {
+                assert!(database
+                    .with_connection(|connection| {
+                        table_has_column(connection, table, "receipt_json")
+                    })
+                    .unwrap());
+            }
+            assert_eq!(
+                std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
+                1
+            );
+            drop(database);
+            let reopened = Database::open(&paths).unwrap();
+            assert_eq!(reopened.status().unwrap().schema_version, 5);
+            assert_eq!(
+                std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_messages_are_idempotent() {
         let directory = tempdir().unwrap();
         let paths = AppPaths {
@@ -2739,6 +2854,111 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(database.enqueue_effect(&effect).unwrap().state, "succeeded");
+    }
+
+    #[test]
+    fn restart_recovers_dispatched_effect_as_unknown_with_action_and_audit() {
+        let directory = tempdir().unwrap();
+        let paths = AppPaths {
+            root: directory.path().to_path_buf(),
+            v3: directory.path().join("3.0"),
+            database: directory.path().join("3.0/dh.db"),
+            secrets: directory.path().join("3.0/secrets.dat"),
+            logs: directory.path().join("3.0/logs"),
+            legacy_backups: directory.path().join("legacy-backups"),
+            runtime_mode_file: directory.path().join("runtime-mode"),
+        };
+        let database = Database::open(&paths).unwrap();
+        let now = Utc::now();
+        database
+            .upsert_account(&Account {
+                id: "a".into(),
+                display_name: "A".into(),
+                role: "admin".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        database
+            .upsert_group(&Group {
+                account_id: "a".into(),
+                group_id: 1,
+                name: "G".into(),
+                owner_user_id: 1,
+                enabled: true,
+                ai_enabled: true,
+                moderation_enabled: true,
+                manual_takeover: false,
+                welcome_message: String::new(),
+                updated_at: now,
+            })
+            .unwrap();
+        let effect = database
+            .enqueue_effect(&EffectOutboxRequest {
+                account_id: "a".into(),
+                group_id: 1,
+                effect_type: "send_text".into(),
+                payload_json: serde_json::json!({
+                    "text": "hello",
+                    "recordAction": true,
+                    "actionKind": "reply",
+                    "userId": 2,
+                    "messageId": 3,
+                    "ruleId": 4,
+                    "mode": "automatic",
+                    "reason": "restart-cutpoint",
+                })
+                .to_string(),
+                dedupe_key: "restart-cutpoint-effect".into(),
+            })
+            .unwrap();
+        assert_eq!(database.claim_effect_outbox(Some("a"), 1).unwrap().len(), 1);
+        drop(database);
+
+        let recovered = Database::open(&paths).unwrap();
+        let (state, outbox_receipt, action_success, action_receipt, audit_details): (
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ) = recovered
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT state FROM effect_outbox WHERE id=?",
+                        params![effect.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT receipt_json FROM effect_outbox WHERE id=?",
+                        params![effect.id],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT success FROM actions WHERE dedupe_key='restart-cutpoint-effect'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT receipt_json FROM actions WHERE dedupe_key='restart-cutpoint-effect'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT details FROM audit_events WHERE event='effect_recovered_unknown'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(state, "unknown");
+        assert_eq!(action_success, 0);
+        for archived in [outbox_receipt, action_receipt, audit_details] {
+            assert!(archived.contains("unknown"));
+            assert!(archived.contains("远端执行结果未知"));
+        }
     }
 
     #[test]
@@ -3050,7 +3270,14 @@ mod tests {
                 account_id: "a".into(),
                 group_id: 1,
                 effect_type: "send_text".into(),
-                payload_json: "{\"text\":\"hello\"}".into(),
+                payload_json: serde_json::json!({
+                    "text": "hello",
+                    "recordAction": true,
+                    "actionKind": "reply",
+                    "userId": 2,
+                    "reason": "shutdown-cutpoint",
+                })
+                .to_string(),
                 dedupe_key: "shutdown-unknown".into(),
             })
             .await
@@ -3070,22 +3297,42 @@ mod tests {
                 .unwrap(),
             1
         );
-        let (state, receipt): (String, String) = executor
+        let (state, receipt, action_receipt, audit_details): (String, String, String, String) = executor
             .execute(|database| {
                 database
                     .with_connection(|connection| {
-                        connection.query_row(
-                            "SELECT state,receipt_json FROM effect_outbox WHERE dedupe_key='shutdown-unknown'",
-                            [],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
+                        Ok((
+                            connection.query_row(
+                                "SELECT state FROM effect_outbox WHERE dedupe_key='shutdown-unknown'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                            connection.query_row(
+                                "SELECT receipt_json FROM effect_outbox WHERE dedupe_key='shutdown-unknown'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                            connection.query_row(
+                                "SELECT receipt_json FROM actions WHERE dedupe_key='shutdown-unknown'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                            connection.query_row(
+                                "SELECT details FROM audit_events WHERE event='effect_recovered_unknown'",
+                                [],
+                                |row| row.get(0),
+                            )?,
+                        ))
                     })
                     .map_err(|error| AppError::new("test_query", error.to_string()))
             })
             .await
             .unwrap();
         assert_eq!(state, "unknown");
-        assert!(receipt.contains("退出等待超时"));
+        for archived in [receipt, action_receipt, audit_details] {
+            assert!(archived.contains("退出等待超时"));
+            assert!(archived.contains("unknown"));
+        }
         executor.shutdown().await.unwrap();
     }
 

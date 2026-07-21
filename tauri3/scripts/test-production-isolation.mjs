@@ -1,9 +1,10 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const root = path.resolve(import.meta.dirname, '..')
+const projectRoot = path.resolve(root, '..')
 const verifier = path.join(root, 'scripts', 'verify-production.mjs')
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'dh-production-scan-'))
 
@@ -25,14 +26,17 @@ try {
   const clean = path.join(temporary, 'clean')
   await mkdir(clean)
   await writeFile(path.join(clean, 'DH-BOT.exe'), fakePe(2))
+  await copyFile(path.join(projectRoot, 'docs', 'DH使用手册.md'), path.join(clean, 'DH-Manual-ZH.md'))
+  await copyFile(path.join(projectRoot, 'docs', 'DH-Manual-ZH.pdf'), path.join(clean, 'DH-Manual-ZH.pdf'))
+  await copyFile(path.join(projectRoot, 'package', 'ZCG-Compatible-Rules.json'), path.join(clean, 'ZCG-Compatible-Rules.json'))
   const cleanResult = verify(clean)
   if (cleanResult.status !== 0) throw new Error(cleanResult.stderr || cleanResult.stdout)
 
   const cases = [
     ['fixture binary', 'DH-Fixture.exe', 'placeholder'],
     ['fixture command', 'DH-BOT.exe', 'start_fixture_host'],
-    ['fixture devtools', 'DH-BOT.exe', '127.0.0.1:9233'],
-    ['fixture server', 'DH-BOT.exe', '127.0.0.1:51300'],
+    ['fixture devtools', 'DH-BOT.exe', '9233'],
+    ['fixture server', 'DH-BOT.exe', '51300'],
     ['fixture data path', 'DH-BOT.exe', '%APPDATA%\\DH\\fixture'],
     ['fixture environment', 'DH-BOT.exe', 'DH_RUNTIME_MODE'],
   ]

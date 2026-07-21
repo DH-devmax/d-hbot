@@ -7,6 +7,7 @@ const readJson = async relative => JSON.parse(await readFile(path.join(root, rel
 const packageJson = await readJson('package.json')
 const production = await readJson('src-tauri/tauri.conf.json')
 const developer = await readJson('src-tauri/tauri.fixture.conf.json')
+const cargoToml = await readFile(path.join(root, 'src-tauri/Cargo.toml'), 'utf8')
 const scripts = packageJson.scripts || {}
 
 function assert(condition, message) {
@@ -18,9 +19,15 @@ const productionRustBuild = scripts['build:rust:production'] || ''
 const developerBuild = scripts['tauri:build:developer'] || ''
 const resources = production.bundle?.resources || []
 const developerResources = developer.bundle?.resources || []
+const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
 
 assert(production.productName === 'DH BOT', '生产产品名必须为 DH BOT')
 assert(production.identifier === 'cloud.daha6.dhbot', '生产 identifier 不正确')
+assert(packageJson.version === production.version, 'package.json 与 Tauri 版本不一致')
+assert(packageJson.version === cargoVersion, 'package.json 与 Cargo 版本不一致')
+if (process.env.GITHUB_REF?.startsWith('refs/tags/v3.')) {
+  assert(process.env.GITHUB_REF.slice('refs/tags/v'.length) === packageJson.version, '正式标签与应用版本不一致')
+}
 assert(Array.isArray(resources) && resources.length === 0, '生产 Tauri 配置必须显式使用空 resources')
 assert(!JSON.stringify(production).toLowerCase().includes('fixture'), '生产 Tauri 配置含 Fixture 标记')
 assert(productionBuild.includes('--no-default-features'), '生产 Tauri 构建未显式关闭默认 feature')

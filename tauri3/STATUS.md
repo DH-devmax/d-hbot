@@ -1,6 +1,6 @@
 # DH BOT 3.0 beta.1 状态
 
-当前 Rust + Tauri 重构的代码闭环约 **98%**，考虑尚未获得的 Windows 实机、Authenticode 和真实旺商聊契约证据，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、主要界面与自动化测试已落地；剩余百分比由 Windows 发布闭环、真实旺商聊契约校准和实机 RC 验收解锁。
+当前 Rust + Tauri 重构的代码闭环约 **99%**，考虑尚未获得的 Windows 实机、Authenticode 和真实旺商聊契约证据，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、业务页面与自动化测试已落地；剩余百分比由 Windows 发布闭环、真实旺商聊契约校准和实机 RC 验收解锁。
 
 ## 已完成
 
@@ -22,21 +22,26 @@
 - 9222 只接受带旺商聊标识的 DevTools 页面；其他程序占用端口时不结束任何进程。自动与人工启动共用互斥锁，确认重启遇到 UAC 时保留原进程，维护完成后自动续跑。
 - 托盘单击/双击恢复、动态暂停/恢复文案、最小化通知、关闭选择记忆和真正退出已接通。`tray-icon 0.24.1` 的 Windows 实现原生处理 `TaskbarCreated`。
 - React 页面、事件刷新、离线缓存、批量部分失败、关闭对话框和开发 Fixture Playwright 工作流已覆盖。
+- 消息台的群、关键词、类型、处理状态和游标均由 SQLite 查询，页面按 30 条真实分页，不再一次读取 500/1000 条后在前端裁切。
+- 成员批量禁言、解禁、移出、加入/移出黑名单统一返回逐项结果；注销状态参与失效成员清理，单个成员失败不会中断后续成员。
+- 规则编辑器已接通全部 matcher、窗口、次数、语义阈值、角色豁免和成员白名单；知识库及文档启停、审计成员/事件筛选与过滤后导出已接通。
+- 运行时可注入时钟、事件、AI、语义分类和预测数据源；真实浏览器 headless 测试完整经过 CDP、NIM、Runtime、SQLite、outbox、动作及审计。
 - 当前 Tauri 界面已重新截图，并生成 11 页 A4 横向中文图解 PDF。
 - Go 2.7 代码归档到 `go-2.7-final` 标签；当前 Rust 分支已移除 Go 构建入口和源码。
 
 ## 当前验证
 
-- `cargo test --no-default-features`：110 项（含 schema v1/v4/v5、损坏库原文件保护、ACK 事务回滚、序号阻塞、并发 claim、执行器排空、回执脱敏、端口占用识别、生产能力校准、自动启动和关闭偏好校验）。
-- `cargo test --features fixture`：111 项 + 1 项真实浏览器 CDP 集成测试，包含 1000 条突发、101 条分批和版本/脚本哈希校准。
+- `cargo test --no-default-features`：114 项（含 schema v1/v4/v5、损坏库原文件保护、ACK 事务回滚、序号阻塞、并发 claim、执行器排空、回执脱敏、数据库消息筛选分页、端口占用识别、生产能力校准、自动启动和关闭偏好校验）。
+- `cargo test --features fixture`：115 项 + 2 项真实浏览器 CDP 集成测试，包含 1000 条突发、101 条分批、完整 Runtime 副作用链和版本/脚本哈希校准。
 - 两套 `cargo clippy --all-targets -- -D warnings` 通过。
-- `pnpm test`：9 个文件、20 项 RTL/Vitest 通过，包含确认重启后等待 UAC 并续跑的回归测试。
+- `pnpm test`：9 个文件、24 项 RTL/Vitest 通过，包含确认重启后等待 UAC 并续跑、规则完整字段、知识启停、审计筛选和消息游标分页回归测试。
 - `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用。
 - Contract v2 采集组装与脱敏器 9 项测试及自检，可在多 DevTools 页面中唯一选择旺商聊；生产/开发构建边界、9 场景生产隔离扫描、前端生产扫描、Rust release 构建和两套文档目录扫描通过。
 - `DH-Manual-ZH.pdf`：11 页，全页重新渲染为 PNG 并通过联系表视觉检查。
 - macOS Tauri 桌面包已连接真实旺商聊 2.6.3 的 `127.0.0.1:9222`；能识别登录路由和 `nim-not-ready`，本地 Rust 诊断桥正常返回。关闭窗口的“取消 / 挂到托盘 / 退出”确认框与后台进程存活已通过 Computer Use 实测。
 - 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
-- 已生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `52b418cc6116e92fcb6df38250f7647a0aa396ff392252d22c3977d25d6a1db8`，ZIP 为 `8280a50fb86f2bcba1c2a3851c0d57c22ba77fcb436c41b7e21c1289b5f1b842`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。它只用于内部 beta，不替代 NSIS、Authenticode 和 Windows 实机验收。
+- 已用当前代码生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned-rust-final.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `97d2ca4075ff08573cfcba823ad660925406375b0b026fe830f38ff472b28880`，ZIP 为 `5610866f9fa594a110b1a7ed0011fe501e428f59f3e8a33b176696bd5afb4d4c`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。它只用于内部 beta，不替代 NSIS、Authenticode 和 Windows 实机验收。
+- Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
 - GitHub Actions 生产与开发工作流已经触发，但 GitHub 在 runner 启动前以账户付款或额度状态拒绝作业；这不是源码编译失败，账户恢复后需重新运行 Windows MSVC 门禁。
 
 ## Beta.2 / RC 必须由外部环境证明的门禁

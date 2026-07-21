@@ -752,7 +752,25 @@ impl CdpGateway {
 
     pub async fn read_batch(&self) -> AppResult<GatewayBatch> {
         let value = self.cdp.evaluate(READ_BATCH_EXPRESSION).await?;
-        let batch = parse_gateway_batch(value)?;
+        let mut batch = parse_gateway_batch(value)?;
+        let groups = self.group_infos().await.unwrap_or_default();
+        for record in &mut batch.records {
+            if record.kind != GatewayRecordKind::Message
+                || int_field(&record.payload, &["groupId"]) > 0
+            {
+                continue;
+            }
+            let team_id = text_field(&record.payload, &["teamId", "to"]);
+            if let Some(group_id) = groups
+                .iter()
+                .find(|group| group.cloud_id == team_id)
+                .map(|group| group.group_id)
+            {
+                if let Some(payload) = record.payload.as_object_mut() {
+                    payload.insert("groupId".into(), Value::from(group_id));
+                }
+            }
+        }
         *self.listener_session.write().await = batch.session.clone();
         Ok(batch)
     }

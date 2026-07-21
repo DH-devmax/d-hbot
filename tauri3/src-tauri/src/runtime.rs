@@ -47,6 +47,86 @@ enum EffectDispatchStatus {
     Unknown,
 }
 
+pub trait Clock: Send + Sync {
+    fn now_utc(&self) -> DateTime<Utc>;
+    fn now_local(&self) -> DateTime<Local>;
+}
+
+#[derive(Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_utc(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn now_local(&self) -> DateTime<Local> {
+        Local::now()
+    }
+}
+
+pub trait RuntimeEventSink: Send + Sync {
+    fn emit(&self, event: &str, payload: Value);
+}
+
+#[derive(Default)]
+pub struct NoopEventSink;
+
+impl RuntimeEventSink for NoopEventSink {
+    fn emit(&self, _event: &str, _payload: Value) {}
+}
+
+pub struct TauriEventSink {
+    app: AppHandle,
+}
+
+impl TauriEventSink {
+    fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl RuntimeEventSink for TauriEventSink {
+    fn emit(&self, event: &str, payload: Value) {
+        let _ = self.app.emit(event, payload);
+    }
+}
+
+pub trait AiProviderFactory: Send + Sync {
+    fn create(&self, config: AiConfig) -> AppResult<Arc<dyn AiProvider>>;
+}
+
+#[derive(Default)]
+pub struct ConfiguredAiProviderFactory;
+
+impl AiProviderFactory for ConfiguredAiProviderFactory {
+    fn create(&self, config: AiConfig) -> AppResult<Arc<dyn AiProvider>> {
+        Ok(Arc::new(ConfiguredProvider::new(config)?))
+    }
+}
+
+pub struct RuntimeDependencies {
+    pub clock: Arc<dyn Clock>,
+    pub events: Arc<dyn RuntimeEventSink>,
+    pub ai_factory: Arc<dyn AiProviderFactory>,
+    pub semantic_classifier: Arc<dyn moderation::SemanticClassifier>,
+    pub prediction_source: Arc<dyn prediction::PredictionSource>,
+}
+
+impl RuntimeDependencies {
+    pub fn production() -> AppResult<Self> {
+        Ok(Self {
+            clock: Arc::new(SystemClock),
+            events: Arc::new(NoopEventSink),
+            ai_factory: Arc::new(ConfiguredAiProviderFactory),
+            semantic_classifier: Arc::new(moderation::DeterministicSemanticClassifier::default()),
+            prediction_source: Arc::new(prediction::HttpPredictionSource::new(
+                Duration::from_secs(8),
+            )?),
+        })
+    }
+}
+
 impl EffectDispatchStatus {
     fn succeeded(self) -> bool {
         matches!(self, Self::Succeeded)
@@ -60,6 +140,11 @@ pub struct BackendRuntime {
     secrets: SecretStore,
     shutdown: Arc<ShutdownSignal>,
     logger: Logger,
+    clock: Arc<dyn Clock>,
+    events: Arc<dyn RuntimeEventSink>,
+    ai_factory: Arc<dyn AiProviderFactory>,
+    semantic_classifier: Arc<dyn moderation::SemanticClassifier>,
+    prediction_source: Arc<dyn prediction::PredictionSource>,
 }
 
 impl BackendRuntime {
@@ -70,16 +155,35 @@ impl BackendRuntime {
         shutdown: Arc<ShutdownSignal>,
         logger: Logger,
     ) -> Self {
+        let dependencies = RuntimeDependencies::production()
+            .expect("production runtime dependencies must initialize");
+        Self::with_dependencies(database, gateway, secrets, shutdown, logger, dependencies)
+    }
+
+    pub fn with_dependencies(
+        database: DatabaseExecutor,
+        gateway: Arc<dyn RuntimeGateway>,
+        secrets: SecretStore,
+        shutdown: Arc<ShutdownSignal>,
+        logger: Logger,
+        dependencies: RuntimeDependencies,
+    ) -> Self {
         Self {
             database,
             gateway,
             secrets,
             shutdown,
             logger,
+            clock: dependencies.clock,
+            events: dependencies.events,
+            ai_factory: dependencies.ai_factory,
+            semantic_classifier: dependencies.semantic_classifier,
+            prediction_source: dependencies.prediction_source,
         }
     }
 
-    pub fn spawn(self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+    pub fn spawn(mut self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+        self.events = Arc::new(TauriEventSink::new(app.clone()));
         let mut workers = Vec::with_capacity(6);
         let card_queue = self.clone();
         let card_app = app.clone();
@@ -273,15 +377,90 @@ impl BackendRuntime {
         let error_text = redact(&error_text);
         let receipt = redact_gateway_receipt(receipt);
         let receipt_json = serde_json::to_string(&receipt).unwrap_or_default();
-        let _ = if status == EffectDispatchStatus::Unknown {
-            self.database
-                .finish_effect_outbox_unknown(item.id, error_text.clone(), receipt_json.clone())
-                .await
-        } else {
-            self.database
-                .finish_effect_outbox(item.id, success, error_text.clone(), receipt_json.clone())
-                .await
+        let should_record_action = payload
+            .get("recordAction")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let action_kind = payload
+            .get("actionKind")
+            .and_then(Value::as_str)
+            .unwrap_or(&item.effect_type)
+            .to_string();
+        let action = should_record_action.then(|| ActionRecord {
+            id: 0,
+            account_id: item.account_id.clone(),
+            group_id: item.group_id,
+            user_id,
+            message_id: payload.get("messageId").and_then(Value::as_i64),
+            rule_id: payload.get("ruleId").and_then(Value::as_i64),
+            kind: action_kind.clone(),
+            mode: payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("automatic")
+                .into(),
+            duration_seconds: duration,
+            reason: payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            success,
+            error: error_text.clone(),
+            receipt_json: receipt_json.clone(),
+            dedupe_key: item.dedupe_key.clone(),
+            created_at: Utc::now(),
+        });
+        let status_name = match status {
+            EffectDispatchStatus::Succeeded => "succeeded",
+            EffectDispatchStatus::Failed => "failed",
+            EffectDispatchStatus::Unknown => "unknown",
         };
+        let audit = AuditEvent {
+            id: 0,
+            account_id: item.account_id.clone(),
+            group_id: item.group_id,
+            user_id,
+            actor: "DH BOT".into(),
+            event: "effect_dispatched".into(),
+            level: match status {
+                EffectDispatchStatus::Succeeded => "info",
+                EffectDispatchStatus::Failed => "error",
+                EffectDispatchStatus::Unknown => "warning",
+            }
+            .into(),
+            details: serde_json::json!({
+                "effect": item.effect_type,
+                "success": success,
+                "status": status_name,
+                "error": error_text,
+                "receipt": receipt,
+            })
+            .to_string(),
+            created_at: Utc::now(),
+        };
+        match self
+            .database
+            .archive_effect_dispatch(
+                item.id,
+                status_name.into(),
+                error_text.clone(),
+                receipt_json,
+                action.clone(),
+                audit,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.logger.write(
+                    "ERROR",
+                    &format!("副作用结果原子归档失败：{}", error.message),
+                );
+                return;
+            }
+        }
 
         if let Some(task_id) = payload.get("taskId").and_then(Value::as_i64) {
             if status == EffectDispatchStatus::Unknown {
@@ -331,41 +510,7 @@ impl BackendRuntime {
                 let _ = self.database.mark_card_welcome_sent(card_job_id).await;
             }
         }
-        if payload
-            .get("recordAction")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let kind = payload
-                .get("actionKind")
-                .and_then(Value::as_str)
-                .unwrap_or(&item.effect_type);
-            let action = ActionRecord {
-                id: 0,
-                account_id: item.account_id.clone(),
-                group_id: item.group_id,
-                user_id,
-                message_id: payload.get("messageId").and_then(Value::as_i64),
-                rule_id: payload.get("ruleId").and_then(Value::as_i64),
-                kind: kind.into(),
-                mode: payload
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("automatic")
-                    .into(),
-                duration_seconds: duration,
-                reason: payload
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .into(),
-                success,
-                error: error_text.clone(),
-                receipt_json: receipt_json.clone(),
-                dedupe_key: item.dedupe_key.clone(),
-                created_at: Utc::now(),
-            };
-            let _ = self.database.record_action(action).await;
+        if action.is_some() {
             if success {
                 if let Some(rule_ids) = payload.get("contributorRuleIds").and_then(Value::as_array)
                 {
@@ -384,39 +529,12 @@ impl BackendRuntime {
                 }
             }
             if let Some(app) = app {
-                let _ = app.emit("action-recorded", json_action(kind, success, &error_text));
+                let _ = app.emit(
+                    "action-recorded",
+                    json_action(&action_kind, success, &error_text),
+                );
             }
         }
-        let _ = self
-            .database
-            .record_audit(AuditEvent {
-                id: 0,
-                account_id: item.account_id,
-                group_id: item.group_id,
-                user_id,
-                actor: "DH BOT".into(),
-                event: "effect_dispatched".into(),
-                level: match status {
-                    EffectDispatchStatus::Succeeded => "info",
-                    EffectDispatchStatus::Failed => "error",
-                    EffectDispatchStatus::Unknown => "warning",
-                }
-                .into(),
-                details: serde_json::json!({
-                    "effect": item.effect_type,
-                    "success": success,
-                    "status": match status {
-                        EffectDispatchStatus::Succeeded => "succeeded",
-                        EffectDispatchStatus::Failed => "failed",
-                        EffectDispatchStatus::Unknown => "unknown",
-                    },
-                    "error": error_text,
-                    "receipt": receipt,
-                })
-                .to_string(),
-                created_at: Utc::now(),
-            })
-            .await;
     }
 
     fn worker_for(
@@ -489,7 +607,7 @@ impl BackendRuntime {
                         .flatten()
                         .and_then(|value| serde_json::from_str(&value).ok())
                         .unwrap_or_default();
-                    let now = Local::now();
+                    let now = self.clock.now_local();
                     let due = NaiveTime::parse_from_str(&time, "%H:%M")
                         .map(|value| now.time() >= value)
                         .unwrap_or(false);
@@ -593,7 +711,7 @@ impl BackendRuntime {
                 "当前群今天还没有可供总结的消息",
             ));
         }
-        let provider = ConfiguredProvider::new(AiConfig {
+        let provider = self.ai_factory.create(AiConfig {
             base_url: self
                 .database
                 .get_setting("ai.base_url".into())
@@ -646,7 +764,7 @@ impl BackendRuntime {
             local_date: local_date.into(),
             content: decision.reply,
             source: "scheduled-ai".into(),
-            created_at: Utc::now(),
+            created_at: self.clock.now_utc(),
         };
         let id = self.database.save_daily_summary(summary.clone()).await?;
         Ok(DailySummary { id, ..summary })
@@ -655,7 +773,11 @@ impl BackendRuntime {
     async fn reminder_loop(&self, app: AppHandle) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
-                if let Ok(tasks) = self.database.claim_due_task_reminders(Utc::now(), 20).await {
+                if let Ok(tasks) = self
+                    .database
+                    .claim_due_task_reminders(self.clock.now_utc(), 20)
+                    .await
+                {
                     for task in tasks {
                         let text = format!(
                             "任务提醒：{}{}",
@@ -931,9 +1053,25 @@ impl BackendRuntime {
                 member.updated_at = member.last_seen_at;
                 let _ = self.database.upsert_member(member.clone()).await;
                 if !baseline && newly_discovered.contains(&member.user_id) && member.blacklisted {
-                    let removed = self
-                        .gateway
-                        .remove_member(group.group_id, member.user_id)
+                    let queued = self
+                        .enqueue_effect(
+                            account_id,
+                            group.group_id,
+                            "remove",
+                            serde_json::json!({
+                                "userId": member.user_id,
+                                "recordAction": true,
+                                "actionKind": "remove",
+                                "mode": "automatic",
+                                "reason": "blacklisted_member_rejoined",
+                            }),
+                            format!(
+                                "blacklist-roster-rejoin:{account_id}:{}:{}:{}",
+                                group.group_id,
+                                member.user_id,
+                                member.discovered_at.timestamp_millis()
+                            ),
+                        )
                         .await
                         .is_ok();
                     let _ = self
@@ -945,11 +1083,11 @@ impl BackendRuntime {
                             user_id: member.user_id,
                             actor: "DH BOT".into(),
                             event: "blacklisted_member_rejoined".into(),
-                            level: if removed { "info" } else { "error" }.into(),
-                            details: if removed {
-                                "黑名单成员重新入群，已自动移出"
+                            level: if queued { "info" } else { "error" }.into(),
+                            details: if queued {
+                                "黑名单成员重新入群，已进入自动移出队列"
                             } else {
-                                "黑名单成员重新入群，自动移出失败"
+                                "黑名单成员重新入群，自动移出入队失败"
                             }
                             .into(),
                             created_at: Utc::now(),
@@ -1029,9 +1167,11 @@ impl BackendRuntime {
                     if let Ok(schedules) = self.database.list_schedules(account_id.clone()).await {
                         for schedule in schedules.into_iter().filter(|schedule| schedule.enabled) {
                             for group_id in &schedule.group_ids {
-                                let Ok(decision) =
-                                    scheduler::evaluate(&schedule, *group_id, chrono::Local::now())
-                                else {
+                                let Ok(decision) = scheduler::evaluate(
+                                    &schedule,
+                                    *group_id,
+                                    self.clock.now_local(),
+                                ) else {
                                     continue;
                                 };
                                 if !self
@@ -1142,7 +1282,10 @@ impl BackendRuntime {
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
         'connection: loop {
             let diagnostic = self.gateway.diagnose().await;
-            let _ = app.emit("connection-status", &diagnostic);
+            self.events.emit(
+                "connection-status",
+                serde_json::to_value(&diagnostic).unwrap_or(Value::Null),
+            );
             let _ = app.emit("gateway-capabilities", self.gateway.capabilities());
             if diagnostic.status != ConnectionStatus::Ready {
                 tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
@@ -1978,6 +2121,8 @@ impl BackendRuntime {
         }
         let group_id = if let Some(group_id) = decoded.pointer("/to/id").and_then(value_i64) {
             Some(group_id)
+        } else if let Some(group_id) = value.get("groupId").and_then(value_i64) {
+            Some(group_id)
         } else if let Some(raw) = value.get("to").and_then(value_i64) {
             self.database
                 .list_groups(Some(account_id.to_string()))
@@ -1992,11 +2137,28 @@ impl BackendRuntime {
         if group_id <= 0 {
             return Err("群身份无效".into());
         }
-        let user_id = decoded
+        let nim_sender = value.get("from").and_then(Value::as_str);
+        let mut user_id = decoded
             .pointer("/from/id")
             .and_then(value_i64)
             .or_else(|| value.get("from").and_then(value_i64))
             .unwrap_or(0);
+        if user_id <= 0 {
+            if let Some(nim_id) = nim_sender {
+                user_id = self
+                    .database
+                    .list_members(account_id.to_string(), group_id)
+                    .await
+                    .ok()
+                    .and_then(|members| {
+                        members
+                            .into_iter()
+                            .find(|member| member.nim_id == nim_id)
+                            .map(|member| member.user_id)
+                    })
+                    .unwrap_or(0);
+            }
+        }
         if user_id <= 0 {
             return Err("发送者身份未识别".into());
         }
@@ -2007,6 +2169,7 @@ impl BackendRuntime {
             .pointer("/content/data")
             .and_then(Value::as_str)
             .or_else(|| value.get("text").and_then(Value::as_str))
+            .or_else(|| value.get("content").and_then(Value::as_str))
             .unwrap_or_else(|| {
                 if decoded.is_null() {
                     "[消息解码失败]"
@@ -2020,14 +2183,21 @@ impl BackendRuntime {
             .and_then(value_i64)
             .or_else(|| value.get("msgFormat").and_then(value_i64))
             .unwrap_or(99);
-        let kind = match format {
-            0 => "text",
-            1 => "image",
-            13 => "card",
-            7 | 8 => "notice",
-            _ => "other",
+        let kind = match value.get("type").and_then(Value::as_str) {
+            Some("text") => "text",
+            Some("image") => "image",
+            Some("card") => "card",
+            Some("notification") | Some("notice") => "notice",
+            Some(_) => "other",
+            None => match format {
+                0 => "text",
+                1 => "image",
+                13 => "card",
+                7 | 8 => "notice",
+                _ => "other",
+            },
         };
-        let now = Utc::now();
+        let now = self.clock.now_utc();
         Ok(IncomingJob {
             sequence,
             message: Message {
@@ -2158,7 +2328,7 @@ impl BackendRuntime {
                     member: &member,
                     kind: &job.message.kind,
                     text: &job.message.text,
-                    now: Utc::now(),
+                    now: self.clock.now_utc(),
                     recent: &recent_events,
                     rename_violations: member.violation_count,
                 };
@@ -2174,7 +2344,7 @@ impl BackendRuntime {
                     moderation::evaluate_with_classifier(
                         &rules,
                         &input,
-                        &moderation::DeterministicSemanticClassifier::default(),
+                        self.semantic_classifier.as_ref(),
                     )
                 } else {
                     match self
@@ -2202,7 +2372,7 @@ impl BackendRuntime {
                             moderation::evaluate_with_classifier(
                                 &rules,
                                 &input,
-                                &moderation::DeterministicSemanticClassifier::default(),
+                                self.semantic_classifier.as_ref(),
                             )
                         }
                     }
@@ -2224,7 +2394,7 @@ impl BackendRuntime {
                                     account_id.to_string(),
                                     group.group_id,
                                     member.user_id,
-                                    Utc::now(),
+                                    self.clock.now_utc(),
                                     cooldown,
                                 )
                                 .await
@@ -2262,7 +2432,12 @@ impl BackendRuntime {
             && message_explicitly_mentions(&job.message, account_id)
         {
             if job.message.text.contains("预测") {
-                match prediction::fetch(&job.message.text).await {
+                match prediction::fetch_with_source(
+                    &job.message.text,
+                    self.prediction_source.as_ref(),
+                )
+                .await
+                {
                     Ok(Ok(result)) => {
                         let _ = self
                                 .enqueue_text_effect(
@@ -2486,7 +2661,7 @@ impl BackendRuntime {
         message: &Message,
         categories: &[String],
     ) -> AppResult<HashMap<String, f64>> {
-        let provider = ConfiguredProvider::new(AiConfig {
+        let provider = self.ai_factory.create(AiConfig {
             base_url: self
                 .database
                 .get_setting("ai.base_url".into())
@@ -2561,7 +2736,7 @@ impl BackendRuntime {
                 .await?
                 .unwrap_or_else(|| "deepseek-v4-pro".into());
             let api_key = self.gateway_secret("ai.api_key").await;
-            let provider = ConfiguredProvider::new(AiConfig {
+            let provider = self.ai_factory.create(AiConfig {
                 base_url,
                 webhook_url,
                 model,
@@ -2739,6 +2914,137 @@ impl BackendRuntime {
             .ok()
             .and_then(|values| values.get(key).cloned())
             .unwrap_or_default()
+    }
+
+    #[cfg(feature = "fixture")]
+    pub async fn headless_ingest_once(&self) -> AppResult<usize> {
+        let diagnostic = self.gateway.diagnose().await;
+        if diagnostic.status != ConnectionStatus::Ready {
+            return Err(AppError::new(
+                "headless_gateway_not_ready",
+                "Headless 运行时等待协议会话就绪",
+            ));
+        }
+        let (sender_id, account_id) = self.gateway.session_identity().await?;
+        let now = self.clock.now_utc();
+        self.database
+            .upsert_account(Account {
+                id: account_id.clone(),
+                display_name: diagnostic.nim_account,
+                role: "unknown".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .await?;
+        let groups = self.gateway.list_groups().await?;
+        for mut group in groups {
+            group.account_id = account_id.clone();
+            let group_id = group.group_id;
+            self.database.upsert_group(group).await?;
+            let roster = self.gateway.list_members(group_id).await?;
+            for mut member in roster.members {
+                member.account_id = account_id.clone();
+                member.group_id = group_id;
+                self.database.upsert_member(member).await?;
+            }
+        }
+        self.gateway.install_message_listener().await?;
+        let batch = self.gateway.read_batch().await?;
+        if batch.records.is_empty() {
+            return Ok(0);
+        }
+        let inbox = batch
+            .records
+            .iter()
+            .map(|record| GatewayInboxEvent {
+                account_id: account_id.clone(),
+                bridge_session: record.session.clone(),
+                bridge_sequence: record.sequence as i64,
+                event_id: gateway_record_id(record),
+                event_type: "message".into(),
+                payload_json: record.payload.to_string(),
+                received_at: self.clock.now_utc(),
+            })
+            .collect::<Vec<_>>();
+        let mut normalized = Vec::new();
+        let mut ackable = HashSet::new();
+        for record in &batch.records {
+            if record.kind != GatewayRecordKind::Message {
+                continue;
+            }
+            let mut raw = record.payload.clone();
+            if let Some(object) = raw.as_object_mut() {
+                object.insert("seq".into(), Value::from(record.sequence));
+                object.insert("source".into(), Value::from(record.source.clone()));
+            }
+            match self.normalize_message(&account_id, sender_id, &raw).await {
+                Ok(job) => {
+                    ackable.insert(gateway_record_id(record));
+                    normalized.push(job);
+                }
+                Err(reason) => self.events.emit(
+                    "headless-message-ignored",
+                    serde_json::json!({"reason": reason, "payload": raw}),
+                ),
+            }
+        }
+        let (_, persisted) = self
+            .database
+            .ingest_gateway_batch(
+                inbox,
+                normalized.iter().map(|job| job.message.clone()).collect(),
+            )
+            .await?;
+        let ack_sequence = contiguous_ack_sequence(&batch.records, &ackable);
+        if ack_sequence == 0 {
+            return Ok(0);
+        }
+        self.gateway.ack(&batch.session, ack_sequence).await?;
+        self.database
+            .commit_gateway_ack(
+                account_id.clone(),
+                batch
+                    .records
+                    .iter()
+                    .take_while(|record| record.sequence <= ack_sequence)
+                    .map(gateway_record_id)
+                    .collect(),
+                persisted.iter().map(|message| message.id).collect(),
+            )
+            .await?;
+        for (job, persisted) in normalized.into_iter().zip(&persisted) {
+            self.enqueue_text_effect(
+                &account_id,
+                job.message.group_id,
+                "DH BOT Headless 回执",
+                "headless-e2e",
+                format!("headless-e2e:{}", persisted.id),
+                serde_json::json!({
+                    "recordAction": true,
+                    "actionKind": "reply",
+                    "messageId": persisted.id,
+                    "userId": job.message.user_id,
+                    "mode": "automatic",
+                    "reason": "CDP headless end-to-end",
+                }),
+            )
+            .await?;
+        }
+        self.events.emit(
+            "message-received",
+            serde_json::json!({"count": persisted.len(), "accountId": account_id}),
+        );
+        Ok(persisted.len())
+    }
+
+    #[cfg(feature = "fixture")]
+    pub async fn headless_dispatch_once(&self) -> AppResult<usize> {
+        let items = self.database.claim_effect_outbox(None, 100).await?;
+        let count = items.len();
+        for item in items {
+            self.dispatch_effect(None, item).await;
+        }
+        Ok(count)
     }
 }
 

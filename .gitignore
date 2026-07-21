@@ -13,6 +13,8 @@ tauri3/src-tauri/resources/tools/
 tauri3/contracts/raw/
 output/playwright/
 .playwright-cli/
+__pycache__/
+*.pyc
 *.db
 *.db-shm
 *.db-wal

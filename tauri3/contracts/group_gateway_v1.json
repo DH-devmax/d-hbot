@@ -6,6 +6,7 @@
     {"name":"mute","route":"/v1/group/set-member-mute","request":{"groupId":10001,"userId":20001,"min":10}},
     {"name":"unmute","route":"/v1/group/member-mute-cancel","request":{"groupId":10001,"userId":20001}},
     {"name":"rename","route":"/v1/group/set-member-nickname","request":{"groupId":10001,"userId":20001,"nick":"DH群员0001"}},
+    {"name":"recall","route":"/v1/group/message-rollback","request":{"groupCloudId":"GROUP_001","userId":20001,"msgId":"MESSAGE_001"}},
     {"name":"remove","route":"/v1/group/remove-group-member","request":{"groupId":10001,"groupMemberIds":[20001]}},
     {"name":"groupMute","route":"/v1/group/set-group-mute","request":{"groupId":10001,"muteMode":"MUTE_MEMBER"}}
   ]

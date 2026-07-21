@@ -2,7 +2,7 @@
 
 DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管理工作台。
 
-3.0 代码位于 [`tauri3/`](tauri3/)，正式程序只使用 Rust/Tauri，不再包含 Go 运行时或 Go sidecar。Go 2.7 实现已归档在 `go-2.7-final` 标签。
+3.0 代码位于 [`tauri3/`](tauri3/)，Rust/Tauri 是当前唯一活动架构。正式程序不包含 Go 运行时、Go sidecar 或 Go 构建入口。旧 Go 2.7 实现只作为只读架构参考，可通过 `go-2.7-final` 标签或 [`archive/go-2.7-final/`](archive/go-2.7-final/) 中的源码 ZIP 查阅，不参与任何生产构建。
 
 ## 产品范围
 
@@ -41,6 +41,7 @@ pnpm tauri:build:developer
 - `package/ZCG-Compatible-Rules.json`：默认兼容规则模板。
 - `docs/DH使用手册.md`：中文使用手册。
 - `docs/DH-Manual-ZH.pdf`：当前 Tauri 界面图解手册。
+- `archive/go-2.7-final/`：旧 Go 2.7 只读源码 ZIP、说明和 SHA-256；当前工作树不保留 Go 源码。
 
 ## 数据与发布
 

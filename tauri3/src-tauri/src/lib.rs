@@ -49,6 +49,28 @@ use paths::AppPaths;
 use secrets::SecretStore;
 use shutdown::ShutdownSignal;
 
+pub use ai::{
+    AiConfig as RuntimeAiConfig, AiProvider as RuntimeAiProvider, AiRequest as RuntimeAiRequest,
+};
+#[cfg(feature = "fixture")]
+pub use database::{Database as FixtureDatabase, DatabaseExecutor as FixtureDatabaseExecutor};
+#[cfg(feature = "fixture")]
+pub use diagnostics::Logger as FixtureLogger;
+pub use moderation::{DeterministicSemanticClassifier, SemanticClassifier};
+#[cfg(feature = "fixture")]
+pub use paths::AppPaths as FixtureAppPaths;
+#[cfg(feature = "fixture")]
+pub use prediction::FixturePredictionSource;
+pub use prediction::{PredictionSource, PredictionSourceResult};
+pub use runtime::{
+    AiProviderFactory, BackendRuntime, Clock, ConfiguredAiProviderFactory, NoopEventSink,
+    RuntimeDependencies, RuntimeEventSink, SystemClock,
+};
+#[cfg(feature = "fixture")]
+pub use secrets::SecretStore as FixtureSecretStore;
+#[cfg(feature = "fixture")]
+pub use shutdown::ShutdownSignal as FixtureShutdownSignal;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Health {
@@ -83,6 +105,7 @@ struct MessageQuery {
     group_ids: Vec<i64>,
     keyword: Option<String>,
     kind: Option<String>,
+    processing_state: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
 }
@@ -252,7 +275,7 @@ fn wang_auto_start_enabled(value: Option<&str>) -> bool {
 fn health(state: State<'_, AppState>) -> Health {
     Health {
         name: "DH BOT",
-        version: "3.0.0-beta.1",
+        version: env!("CARGO_PKG_VERSION"),
         data_dir: state.paths.v3.display().to_string(),
         clean_database: true,
         runtime_mode: state.paths.runtime_mode(),
@@ -791,30 +814,11 @@ async fn send_text_batch(
 #[tauri::command]
 async fn query_messages(
     state: State<'_, AppState>,
-    query: MessageQuery,
+    mut query: MessageQuery,
 ) -> AppResult<Page<Message>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let cursor = query
-        .cursor
-        .as_deref()
-        .and_then(|value| value.parse::<i64>().ok());
-    let keyword = query.keyword.unwrap_or_default().trim().to_lowercase();
-    let kind = query.kind.unwrap_or_default();
-    let mut items = state
-        .database_executor
-        .list_messages(query.account_id.clone(), None, 1000)
-        .await?
-        .into_iter()
-        .filter(|message| query.group_ids.is_empty() || query.group_ids.contains(&message.group_id))
-        .filter(|message| cursor.map(|value| message.id < value).unwrap_or(true))
-        .filter(|message| kind.is_empty() || message.kind == kind)
-        .filter(|message| {
-            keyword.is_empty()
-                || message.text.to_lowercase().contains(&keyword)
-                || message.sender_name.to_lowercase().contains(&keyword)
-        })
-        .take(limit + 1)
-        .collect::<Vec<_>>();
+    query.limit = Some(limit + 1);
+    let mut items = state.database_executor.query_messages(query).await?;
     let next_cursor = if items.len() > limit {
         items.truncate(limit);
         items.last().map(|message| message.id.to_string())
@@ -1781,7 +1785,7 @@ async fn execute_member_batch(
     let action = input.action.trim().to_ascii_lowercase();
     if !matches!(
         action.as_str(),
-        "mute" | "unmute" | "remove" | "blacklist" | "rename"
+        "mute" | "unmute" | "remove" | "blacklist" | "unblacklist" | "rename"
     ) {
         return Err(AppError::new("batch_action", "成员批量动作不受支持"));
     }
@@ -1793,35 +1797,44 @@ async fn execute_member_batch(
     for member in input.members {
         let user_id = member.user_id.unwrap_or_default();
         let nim_id = member.nim_id.clone();
-        let result = match action.as_str() {
-            "mute" => {
-                state
-                    .gateway
-                    .mute(
-                        input.group_id,
-                        user_id,
-                        input.duration_seconds.unwrap_or(600),
-                    )
+        let result = if user_id <= 0 && action != "rename" {
+            Err(AppError::new("member_identity", "该成员尚未解析出旺商号"))
+        } else {
+            match action.as_str() {
+                "mute" => {
+                    state
+                        .gateway
+                        .mute(
+                            input.group_id,
+                            user_id,
+                            input.duration_seconds.unwrap_or(600),
+                        )
+                        .await
+                }
+                "unmute" => state.gateway.unmute(input.group_id, user_id).await,
+                "remove" => state.gateway.remove_member(input.group_id, user_id).await,
+                "rename" => {
+                    state
+                        .gateway
+                        .rename(
+                            input.group_id,
+                            &member,
+                            input.nickname.as_deref().unwrap_or("").trim(),
+                        )
+                        .await
+                }
+                "blacklist" => state
+                    .database_executor
+                    .set_member_blacklisted(account_id.clone(), input.group_id, user_id, true)
                     .await
-            }
-            "unmute" => state.gateway.unmute(input.group_id, user_id).await,
-            "remove" => state.gateway.remove_member(input.group_id, user_id).await,
-            "rename" => {
-                state
-                    .gateway
-                    .rename(
-                        input.group_id,
-                        &member,
-                        input.nickname.as_deref().unwrap_or("").trim(),
-                    )
+                    .map(|_| GatewayReceipt::succeeded("database.member.blacklist")),
+                "unblacklist" => state
+                    .database_executor
+                    .set_member_blacklisted(account_id.clone(), input.group_id, user_id, false)
                     .await
+                    .map(|_| GatewayReceipt::succeeded("database.member.unblacklist")),
+                _ => unreachable!(),
             }
-            "blacklist" => state
-                .database_executor
-                .set_member_blacklisted(account_id.clone(), input.group_id, user_id, true)
-                .await
-                .map(|_| GatewayReceipt::succeeded("database.member.blacklist")),
-            _ => unreachable!(),
         };
         let archived = archive_manual_gateway_result(
             &state,
@@ -1936,6 +1949,7 @@ fn manual_event_name(kind: &str) -> &'static str {
         "rename" => "人工修改群名片",
         "remove" => "人工移出成员",
         "blacklist" => "人工加入黑名单",
+        "unblacklist" => "人工移出黑名单",
         "group_mute" => "人工设置全群发言",
         _ => "人工群管操作",
     }

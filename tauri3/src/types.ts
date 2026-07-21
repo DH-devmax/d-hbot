@@ -84,6 +84,7 @@ export type KnowledgeDocument = {
   content: string
   source: string
   contentHash: string
+  enabled: boolean
 }
 
 export type TaskItem = {
@@ -156,6 +157,16 @@ export type Audit = {
   level: string
   details: string
   createdAt: string
+}
+
+export type AuditFilters = {
+  groupId?: number
+  userId?: number
+  event?: string
+  level?: string
+  from?: string
+  to?: string
+  cursor?: string
 }
 
 export type AiSettings = { base_url: string; webhook_url: string; model: string; api_key_configured: boolean }

@@ -9,8 +9,19 @@ $Root = Split-Path -Parent $PSScriptRoot
 $ProjectRoot = Split-Path -Parent $Root
 $Target = Join-Path $Root 'src-tauri\target\release'
 $Dist = Join-Path $Root "dist\$Channel"
-$Version = '3.0.0-beta.1'
+$Package = Get-Content (Join-Path $Root 'package.json') -Raw | ConvertFrom-Json
+$Version = [string]$Package.version
+if ([string]::IsNullOrWhiteSpace($Version)) {
+  throw 'package.json 缺少版本号'
+}
 $RequireSignature = $env:GITHUB_REF -like 'refs/tags/v3.*'
+
+if ($RequireSignature) {
+  $TagVersion = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
+  if ($TagVersion -ne $Version) {
+    throw "正式标签版本 $TagVersion 与应用版本 $Version 不一致"
+  }
+}
 
 if ($RequireSignature -and -not $env:DH_SIGN_PFX) {
   throw '正式标签发布必须配置 Authenticode 证书 DH_SIGN_PFX'
