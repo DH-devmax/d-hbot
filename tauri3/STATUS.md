@@ -30,6 +30,7 @@
 - Contract v2 脱敏器、生产/开发构建边界、前端生产扫描、Rust release 构建和两套文档目录扫描通过。
 - `DH-Manual-ZH.pdf`：11 页，全页重新渲染为 PNG 并通过联系表视觉检查。
 - macOS Tauri 桌面包已连接真实旺商聊 2.6.3 的 `127.0.0.1:9222`；能识别登录路由和 `nim-not-ready`，本地 Rust 诊断桥正常返回。关闭窗口的“取消 / 挂到托盘 / 退出”确认框与后台进程存活已通过 Computer Use 实测。
+- 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。
 - GitHub Actions 生产与开发工作流已经触发，但 GitHub 在 runner 启动前以账户付款或额度状态拒绝作业；这不是源码编译失败，账户恢复后需重新运行 Windows MSVC 门禁。
 
 ## Beta.2 / RC 必须由外部环境证明的门禁

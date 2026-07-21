@@ -55,14 +55,14 @@ impl SecretStore {
 #[cfg(windows)]
 fn protect(value: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
-    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, DATA_BLOB};
-    use windows_sys::Win32::System::Memory::LocalFree;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
 
-    let mut input = DATA_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: value.len() as u32,
         pbData: value.as_ptr() as *mut u8,
     };
-    let mut output = DATA_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
@@ -83,7 +83,7 @@ fn protect(value: &[u8]) -> Result<Vec<u8>, String> {
     let result =
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
-        LocalFree(output.pbData as isize);
+        LocalFree(output.pbData.cast());
     }
     Ok(result)
 }
@@ -91,14 +91,14 @@ fn protect(value: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(windows)]
 fn unprotect(value: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
-    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, DATA_BLOB};
-    use windows_sys::Win32::System::Memory::LocalFree;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
-    let mut input = DATA_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: value.len() as u32,
         pbData: value.as_ptr() as *mut u8,
     };
-    let mut output = DATA_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
@@ -119,7 +119,7 @@ fn unprotect(value: &[u8]) -> Result<Vec<u8>, String> {
     let result =
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe {
-        LocalFree(output.pbData as isize);
+        LocalFree(output.pbData.cast());
     }
     Ok(result)
 }
