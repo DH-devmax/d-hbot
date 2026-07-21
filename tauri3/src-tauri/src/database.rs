@@ -609,6 +609,16 @@ impl Database {
         }).map_err(|error| AppError::new("members_lifecycle", error.to_string()))
     }
 
+    pub fn mark_member_not_present(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| connection.execute("UPDATE members SET present=0,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?", params![Utc::now().to_rfc3339(), account_id, group_id, user_id]))
+            .map(|_| ()).map_err(|error| AppError::new("member_left", error.to_string()))
+    }
+
     pub fn increment_member_violation(
         &self,
         account_id: &str,

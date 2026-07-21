@@ -13,7 +13,7 @@ use crate::ai::{self, AiConfig, AiContextMessage, AiProvider, AiRequest, Configu
 use crate::database::Database;
 use crate::diagnostics::Logger;
 use crate::error::{AppError, AppResult};
-use crate::gateway::{ConnectionStatus, RuntimeGateway};
+use crate::gateway::{ConnectionStatus, GatewayEvent, RuntimeGateway};
 use crate::models::{
     Account, ActionRecord, AuditEvent, DailySummary, Group, Member, MemberRef, Message, RuleAction,
     TaskItem,
@@ -765,6 +765,9 @@ impl BackendRuntime {
                 }
             }
             loop {
+                for event in self.gateway.poll_events().await.unwrap_or_default() {
+                    self.handle_gateway_event(&app, &account_id, event).await;
+                }
                 if Utc::now()
                     .signed_duration_since(last_roster_sync)
                     .num_seconds()
@@ -852,6 +855,99 @@ impl BackendRuntime {
                 tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.notified() => return }
             }
             tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.notified() => break }
+        }
+    }
+
+    async fn handle_gateway_event(&self, app: &AppHandle, account_id: &str, event: GatewayEvent) {
+        match event {
+            GatewayEvent::MemberJoined {
+                group_id,
+                mut member,
+            } => {
+                member.account_id = account_id.into();
+                member.join_source = "online-joined".into();
+                member.present = true;
+                member.prompt_read = false;
+                member.joined_at = Some(Utc::now());
+                member.discovered_at = Utc::now();
+                member.last_seen_at = Utc::now();
+                let _ = self.database.upsert_member(&member);
+                let _ = app.emit("sync-progress", serde_json::json!({"phase":"member-joined","groupId":group_id,"userId":member.user_id,"source":"online-joined"}));
+                self.enqueue_member_card_job(account_id, group_id, &member)
+                    .await;
+            }
+            GatewayEvent::MemberLeft { group_id, member } => {
+                let _ = self
+                    .database
+                    .mark_member_not_present(account_id, group_id, member.user_id);
+                let _ = self.database.record_audit(&AuditEvent {
+                    id: 0,
+                    account_id: account_id.into(),
+                    group_id,
+                    user_id: member.user_id,
+                    actor: "DH BOT".into(),
+                    event: "member_left".into(),
+                    level: "info".into(),
+                    details: "收到 NIM 离群事件".into(),
+                    created_at: Utc::now(),
+                });
+            }
+            GatewayEvent::MemberUpdated {
+                group_id,
+                mut member,
+            } => {
+                member.account_id = account_id.into();
+                member.last_seen_at = Utc::now();
+                member.updated_at = Utc::now();
+                let _ = self.database.upsert_member(&member);
+                let _ = app.emit("sync-progress", serde_json::json!({"phase":"member-updated","groupId":group_id,"userId":member.user_id}));
+            }
+            GatewayEvent::Message { message } => {
+                let _ = app.emit("message-received", &message);
+            }
+            GatewayEvent::ConnectionChanged { diagnostic } => {
+                let _ = app.emit("connection-status", diagnostic);
+            }
+        }
+    }
+
+    async fn enqueue_member_card_job(&self, account_id: &str, group_id: i64, member: &Member) {
+        if self
+            .database
+            .get_setting(&format!("card.auto.{account_id}.{group_id}"))
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("true")
+        {
+            return;
+        }
+        let prefix = self
+            .database
+            .get_setting(&format!("card.prefix.{account_id}.{group_id}"))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "DH".into());
+        let members = self
+            .database
+            .list_members(account_id, group_id)
+            .unwrap_or_default();
+        let sender_id = self
+            .gateway
+            .session_identity()
+            .await
+            .map(|value| value.0)
+            .unwrap_or_default();
+        if let Ok(preview) = crate::cardnames::preview(group_id, &prefix, members, sender_id) {
+            if let Some(plan) = preview
+                .items
+                .into_iter()
+                .find(|plan| plan.member.user_id == member.user_id && plan.status == "planned")
+            {
+                let _ = self
+                    .database
+                    .enqueue_card_job(account_id, group_id, &plan, true);
+            }
         }
     }
 
