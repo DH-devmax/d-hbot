@@ -17,8 +17,8 @@ pub fn spawn(
     gateway: Arc<dyn RuntimeGateway>,
     shutdown: Arc<Notify>,
     logger: Logger,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
         let router = Router::new()
             .route("/ping", get(ping))
             .route("/v1/group/get-group-list", post(list_groups))

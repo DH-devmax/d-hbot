@@ -64,35 +64,35 @@ impl BackendRuntime {
         }
     }
 
-    pub fn spawn(self, app: AppHandle) -> Vec<tokio::task::JoinHandle<()>> {
+    pub fn spawn(self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
         let mut workers = Vec::with_capacity(6);
         let card_queue = self.clone();
         let card_app = app.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             card_queue.card_queue_loop(card_app).await;
         }));
         let scheduler = self.clone();
         let scheduler_app = app.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             scheduler.schedule_loop(scheduler_app).await;
         }));
         let connection = self.clone();
         let connection_app = app.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             connection.connection_loop(connection_app).await;
         }));
         let reminders = self.clone();
         let reminders_app = app.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             reminders.reminder_loop(reminders_app).await;
         }));
         let summaries = self.clone();
         let summaries_app = app.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             summaries.summary_loop(summaries_app).await;
         }));
         let effects = self.clone();
-        workers.push(tokio::spawn(async move {
+        workers.push(tauri::async_runtime::spawn(async move {
             effects.effect_loop(app).await;
         }));
         workers

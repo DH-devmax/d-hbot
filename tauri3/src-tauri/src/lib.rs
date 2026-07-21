@@ -23,7 +23,7 @@ mod scheduler;
 mod secrets;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -154,9 +154,10 @@ pub struct AppState {
     pub secrets: SecretStore,
     pub gateway: Arc<dyn RuntimeGateway>,
     pub shutdown: Arc<Notify>,
-    pub runtime_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pub runtime_tasks: Arc<Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>>,
     pub exit_started: Arc<AtomicBool>,
     pub tray_notice_shown: Arc<AtomicBool>,
+    pub close_behavior: Arc<RwLock<String>>,
     pub logger: diagnostics::Logger,
 }
 
@@ -182,8 +183,31 @@ impl AppState {
             runtime_tasks: Arc::new(Mutex::new(Vec::new())),
             exit_started: Arc::new(AtomicBool::new(false)),
             tray_notice_shown: Arc::new(AtomicBool::new(false)),
+            close_behavior: Arc::new(RwLock::new("ask".into())),
             logger: diagnostics::Logger::new(logs),
         })
+    }
+}
+
+fn normalize_close_behavior(value: Option<&str>) -> &'static str {
+    match value {
+        Some("tray") => "tray",
+        Some("exit") => "exit",
+        _ => "ask",
+    }
+}
+
+fn cached_close_behavior(state: &AppState) -> String {
+    state
+        .close_behavior
+        .read()
+        .map(|value| normalize_close_behavior(Some(value.as_str())).to_string())
+        .unwrap_or_else(|_| "ask".into())
+}
+
+fn cache_close_behavior(state: &AppState, value: &str) {
+    if let Ok(mut current) = state.close_behavior.write() {
+        *current = normalize_close_behavior(Some(value)).to_string();
     }
 }
 
@@ -277,12 +301,7 @@ async fn database_status(state: State<'_, AppState>) -> AppResult<DatabaseStatus
 
 #[tauri::command]
 async fn get_close_behavior(state: State<'_, AppState>) -> AppResult<String> {
-    Ok(state
-        .database_executor
-        .get_setting("window.close_behavior".into())
-        .await?
-        .filter(|value| matches!(value.as_str(), "tray" | "exit"))
-        .unwrap_or_else(|| "ask".into()))
+    Ok(cached_close_behavior(&state))
 }
 
 #[tauri::command]
@@ -290,7 +309,9 @@ async fn reset_close_behavior(state: State<'_, AppState>) -> AppResult<()> {
     state
         .database_executor
         .set_setting("window.close_behavior".into(), "ask".into(), false)
-        .await
+        .await?;
+    cache_close_behavior(&state, "ask");
+    Ok(())
 }
 
 #[tauri::command]
@@ -308,6 +329,7 @@ async fn resolve_close_action(
             .database_executor
             .set_setting("window.close_behavior".into(), action.clone(), false)
             .await?;
+        cache_close_behavior(&state, &action);
     }
     if action == "tray" {
         if let Some(window) = app.get_webview_window("main") {
@@ -1905,8 +1927,17 @@ pub fn run() {
             let app_handle = app.handle().clone();
             set_tray_menu(app.handle(), false)?;
             let initial_database = app.state::<AppState>().database_executor.clone();
+            let initial_close_behavior = app.state::<AppState>().close_behavior.clone();
             let initial_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let close_behavior = initial_database
+                    .get_setting("window.close_behavior".into())
+                    .await
+                    .ok()
+                    .flatten();
+                if let Ok(mut current) = initial_close_behavior.write() {
+                    *current = normalize_close_behavior(close_behavior.as_deref()).to_string();
+                }
                 let paused = initial_database
                     .get_setting("automation.mode".into())
                     .await
@@ -1983,28 +2014,28 @@ pub fn run() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let app = window.app_handle().clone();
-                let database = app.state::<AppState>().database_executor.clone();
-                tauri::async_runtime::spawn(async move {
-                    match database
-                        .get_setting("window.close_behavior".into())
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                    {
-                        Some("tray") => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
-                            show_tray_notification(&app);
+                let behavior = cached_close_behavior(&app.state::<AppState>());
+                app.state::<AppState>()
+                    .logger
+                    .write("INFO", &format!("收到窗口关闭请求，处理方式：{behavior}"));
+                match behavior.as_str() {
+                    "tray" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
                         }
-                        Some("exit") => request_graceful_exit(app),
-                        _ => {
-                            show_main_window(&app);
-                            let _ = app.emit("close-requested", ());
+                        show_tray_notification(&app);
+                    }
+                    "exit" => request_graceful_exit(app),
+                    _ => {
+                        show_main_window(&app);
+                        let _ = app.emit("close-requested", ());
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval(
+                                "window.dispatchEvent(new CustomEvent('dh-close-requested'))",
+                            );
                         }
                     }
-                });
+                }
             }
             WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
                 let _ = window.hide();
@@ -2014,4 +2045,18 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("DH BOT 3.0 failed to start");
+}
+
+#[cfg(test)]
+mod close_behavior_tests {
+    use super::normalize_close_behavior;
+
+    #[test]
+    fn accepts_only_persisted_close_choices() {
+        assert_eq!(normalize_close_behavior(Some("tray")), "tray");
+        assert_eq!(normalize_close_behavior(Some("exit")), "exit");
+        assert_eq!(normalize_close_behavior(Some("ask")), "ask");
+        assert_eq!(normalize_close_behavior(Some("fixture")), "ask");
+        assert_eq!(normalize_close_behavior(None), "ask");
+    }
 }

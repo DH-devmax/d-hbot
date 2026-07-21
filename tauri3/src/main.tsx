@@ -86,13 +86,18 @@ function App() {
   useEffect(() => {
     void refresh()
     if (!isTauriRuntime()) return
+    const showClosePrompt = () => setClosePrompt(true)
+    window.addEventListener('dh-close-requested', showClosePrompt)
     const listeners: Promise<UnlistenFn>[] = []
     listeners.push(listen<Diagnostic>('connection-status', event => { setDiagnostic(event.payload); if (event.payload.nimAccount) setAccountId(event.payload.nimAccount) }))
     for (const eventName of ['sync-progress', 'message-received', 'task-progress', 'schedule-updated', 'gateway-capabilities']) listeners.push(listen(eventName, () => setPageEpoch(value => value + 1)))
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
     listeners.push(listen<{ paused?: boolean } | boolean>('automation-paused', event => setAutomationPaused(typeof event.payload === 'boolean' ? event.payload : Boolean(event.payload.paused))))
     listeners.push(listen('close-requested', () => setClosePrompt(true)))
-    return () => { void Promise.all(listeners).then(values => values.forEach(unlisten => unlisten())) }
+    return () => {
+      window.removeEventListener('dh-close-requested', showClosePrompt)
+      void Promise.all(listeners).then(values => values.forEach(unlisten => unlisten()))
+    }
   }, [])
 
   const resolveClose = async (action: 'tray' | 'exit') => {
