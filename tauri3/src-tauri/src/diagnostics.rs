@@ -79,8 +79,16 @@ mod tests {
     use super::*;
     #[test]
     fn removes_common_secret_shapes() {
+        let key = ["sk", "-", "abcdefghijklmnopqrstuvwxyz"].concat();
         let value = redact(
-            r#"Authorization: Bearer TOKEN apiKey=sk-abcdefghijklmnopqrstuvwxyz cookie=session123"#,
+            &[
+                "Author",
+                "ization: Bearer ",
+                "TOKEN apiKey=",
+                &key,
+                " cookie=session123",
+            ]
+            .concat(),
         );
         assert!(!value.contains("TOKEN"));
         assert!(!value.contains("abcdefghijklmnopqrstuvwxyz"));

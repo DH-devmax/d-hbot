@@ -16,7 +16,7 @@ from reportlab.lib.utils import ImageReader
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PREVIEW = ROOT / "docs" / "screenshots" / "dh270"
+PREVIEW = ROOT / "docs" / "screenshots" / "tauri3"
 FONT_NAME = "DHManual"
 FONT_CANDIDATES = [
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),

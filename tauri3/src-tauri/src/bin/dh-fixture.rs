@@ -42,6 +42,8 @@ struct MemberEventInput {
     nim_id: Option<String>,
     name: Option<String>,
     role: Option<String>,
+    account_state: Option<String>,
+    blacklisted: Option<bool>,
 }
 
 async fn snapshot(State(state): State<HostState>) -> Json<FixtureSnapshot> {
@@ -115,6 +117,31 @@ async fn member_left(
     let gateway = state.gateway.read().await.clone();
     gateway
         .member_left(input.group_id.unwrap_or(FIXTURE_GROUP), input.user_id)
+        .await
+        .map(|_| Json(serde_json::json!({"ok":true})))
+        .map_err(|error| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok":false,"error":error.message})),
+            )
+        })
+}
+
+async fn member_updated(
+    State(state): State<HostState>,
+    Json(input): Json<MemberEventInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    validate_version(input.version)?;
+    let gateway = state.gateway.read().await.clone();
+    gateway
+        .member_updated(
+            input.group_id.unwrap_or(FIXTURE_GROUP),
+            input.user_id,
+            input.name,
+            input.role,
+            input.account_state,
+            input.blacklisted,
+        )
         .await
         .map(|_| Json(serde_json::json!({"ok":true})))
         .map_err(|error| {
@@ -252,8 +279,14 @@ async fn evaluate_fixture(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let payload = input.get("payload").cloned().unwrap_or_else(|| json!({}));
+        let request_id = stable_fixture_request_id(route, &payload);
         let response = gateway.wire_route(route, payload).await?;
-        return Ok(json!({"transportCode":200,"errno":0,"response":response.to_string()}));
+        return Ok(json!({
+            "transportCode": 200,
+            "errno": 0,
+            "requestId": format!("fixture-ipc-{request_id}"),
+            "response": response.to_string()
+        }));
     }
     if expression.contains("getTeamMembers") {
         return Ok(gateway.wire_nim_members(FIXTURE_GROUP).await);
@@ -265,7 +298,8 @@ async fn evaluate_fixture(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let nickname = input
-            .get("nick")
+            .get("nickInTeam")
+            .or_else(|| input.get("nick"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let user_id = gateway
@@ -299,27 +333,51 @@ async fn evaluate_fixture(
                     .unwrap_or_default(),
             )
             .await?;
-        return Ok(json!({"ok":true,"idServer":delivery,"idClient":delivery}));
+        return Ok(json!({
+            "ok": true,
+            "idServer": delivery.message_id,
+            "idClient": delivery.request_id,
+            "requestId": delivery.request_id,
+        }));
     }
-    if expression.contains("state.queue.slice") {
-        return gateway.poll_messages().await;
+    if expression.contains("state.queue.slice") && expression.contains("records") {
+        return Ok(gateway.wire_batch().await);
     }
-    if let Some(sequence) = expression
-        .split("Number(item.seq)>")
-        .nth(1)
-        .and_then(|value| {
-            value
-                .split(|character: char| !character.is_ascii_digit())
-                .next()
-        })
-        .and_then(|value| value.parse::<u64>().ok())
+    if expression.contains("acknowledgedThrough")
+        && expression.contains("LISTENER_SESSION_MISMATCH")
     {
-        return gateway.acknowledge_messages(sequence).await;
+        let input = extract_input(expression)?;
+        let session = input
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sequence = input
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let receipt = gateway.ack(session, sequence).await?;
+        return Ok(json!({
+            "ok": true,
+            "session": receipt.session,
+            "acknowledgedThrough": receipt.acknowledged_through,
+            "acked": receipt.acknowledged,
+            "remaining": receipt.remaining,
+            "dropped": receipt.dropped,
+        }));
     }
     if expression.contains("__dhBridgeMessages") || expression.contains("const nim=window.nim") {
         return gateway.install_message_listener().await;
     }
     Ok(json!({"ok":true}))
+}
+
+fn stable_fixture_request_id(route: &str, payload: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{route}:{payload}").as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn extract_input(expression: &str) -> dh_bot_lib::error::AppResult<Value> {
@@ -358,6 +416,7 @@ async fn main() {
         .route("/fixture/events/message", post(emit_message))
         .route("/fixture/events/member-joined", post(member_joined))
         .route("/fixture/events/member-left", post(member_left))
+        .route("/fixture/events/member-updated", post(member_updated))
         .route("/fixture/faults", post(faults))
         .with_state(state);
     let fixture_listener = tokio::net::TcpListener::bind(("127.0.0.1", http_port))

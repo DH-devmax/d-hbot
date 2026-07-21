@@ -1,0 +1,175 @@
+import { expect, test, type Page } from '@playwright/test'
+import { mkdir } from 'node:fs/promises'
+import path from 'node:path'
+
+type FixtureState = {
+  rules: Array<Record<string, unknown>>
+  tasks: Array<Record<string, unknown>>
+  schedules: Array<Record<string, unknown>>
+}
+
+const fixtureState: FixtureState = { rules: [], tasks: [], schedules: [] }
+
+async function installDeveloperFixture(page: Page) {
+  await page.addInitScript(({ initialState }) => {
+    const state = structuredClone(initialState)
+    let callbackId = 1
+    const callbacks = new Map<number, (payload: unknown) => void>()
+    const group = { accountId: 'ACCOUNT', groupId: 101, name: '16 人开发测试群', ownerUserId: 1, enabled: true, aiEnabled: true, moderationEnabled: true, manualTakeover: false, welcomeMessage: '欢迎 @「[成员]」' }
+    const member = (userId: number, cardName: string, role = 'member') => ({ groupId: 101, userId, nimId: `NIM-${userId}`, nickname: cardName, cardName, role, accountState: 'ACCOUNT_STATE_GOOD', present: true, originalCardName: cardName, managedCardName: '', cardSuffix: '' })
+    const messages = [{ id: 1, accountId: 'ACCOUNT', groupId: 101, serverMessageId: 'MESSAGE-1', sequence: 1, userId: 2, senderName: '广州校长', kind: 'text', text: '@DH 请查看群规', sentAt: '2026-07-21T08:00:00Z', receivedAt: '2026-07-21T08:00:00Z', processedAt: '2026-07-21T08:00:01Z', acknowledgedAt: '2026-07-21T08:00:01Z', processingState: 'processed' }]
+    const bases = [{ id: 1, accountId: 'ACCOUNT', name: 'DH 群规', description: '开发测试知识库', enabled: true, builtIn: false, readOnly: false }]
+    const documents = [{ id: 1, baseId: 1, baseName: 'DH 群规', title: '文明交流', kind: 'markdown', content: '文明交流，资金问题请联系管理员。', source: 'manual', contentHash: 'HASH' }]
+    const audits = [{ id: 1, accountId: 'ACCOUNT', groupId: 101, userId: 2, actor: 'rule', event: 'message_received', level: 'info', details: '测试环境收到消息', createdAt: '2026-07-21T08:00:01Z' }]
+    const summaries = [{ id: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-21', content: '群内交流正常。', source: 'fixture', createdAt: '2026-07-21T12:00:00Z' }]
+
+    const invoke = async (command: string, args: Record<string, any> = {}) => {
+      switch (command) {
+        case 'plugin:event|listen': return callbackId++
+        case 'plugin:event|unlisten': return null
+        case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Fixture', pageUrl: 'http://127.0.0.1:51300', nimAccount: 'ACCOUNT', detail: '开发 Fixture 已就绪' }
+        case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 5, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
+        case 'get_ai_settings': return { base_url: 'http://127.0.0.1:51300/v1', webhook_url: '', model: 'fixture-model', api_key_configured: true }
+        case 'list_groups': case 'list_cached_groups': return [group]
+        case 'list_audit': return audits
+        case 'query_audit': return { items: audits, nextCursor: null }
+        case 'export_audit': return JSON.stringify(audits)
+        case 'list_daily_summaries': return summaries
+        case 'query_messages': return { items: messages, nextCursor: null }
+        case 'send_text_batch': return (args.groupIds || []).map((groupId: number) => ({ groupId, success: true, messageId: `SENT-${groupId}`, error: '' }))
+        case 'recall_message': return null
+        case 'list_members': return { members: [member(1, '群主', 'owner'), member(2, '广校'), ...Array.from({ length: 14 }, (_, index) => member(index + 3, `DH群员${String(index + 1).padStart(4, '0')}`))], reportedCount: 16, resolvedCount: 16, complete: true, sources: ['fixture'] }
+        case 'get_card_settings': return { prefix: 'DH', autoRename: false, paused: false }
+        case 'get_ai_automation_settings': return { enabled: true, reply: true, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false }
+        case 'list_card_rename_jobs': return []
+        case 'list_rules': return state.rules
+        case 'save_rule': {
+          const next = { ...args.rule, id: args.rule.id || state.rules.length + 1 }
+          state.rules = state.rules.filter((rule: any) => rule.id !== next.id).concat(next)
+          return next.id
+        }
+        case 'delete_rule': state.rules = state.rules.filter((rule: any) => rule.id !== args.ruleId); return null
+        case 'list_knowledge_bases': return bases
+        case 'list_knowledge_documents': return documents
+        case 'list_knowledge_bindings': return [{ baseId: 1, accountId: 'ACCOUNT', groupId: 101, enabled: true }]
+        case 'update_knowledge_base': case 'bind_knowledge_base': case 'save_knowledge_document': return 1
+        case 'list_tasks': return state.tasks
+        case 'save_task': {
+          const next = { ...args.task, id: args.task.id || state.tasks.length + 1 }
+          state.tasks = state.tasks.filter((task: any) => task.id !== next.id).concat(next)
+          return next.id
+        }
+        case 'list_schedules': return state.schedules
+        case 'save_schedule': {
+          const next = { ...args.schedule, id: args.schedule.id || state.schedules.length + 1 }
+          state.schedules = state.schedules.filter((schedule: any) => schedule.id !== next.id).concat(next)
+          return next.id
+        }
+        case 'list_schedule_runs': return []
+        case 'get_summary_settings': return { accountId: 'ACCOUNT', enabled: false, time: '23:00', groupIds: [], timezone: 'Asia/Shanghai' }
+        case 'get_runtime_mode': return { mode: 'fixture', dataDir: '%APPDATA%\\DH\\fixture', restartRequired: false }
+        case 'test_ai': return { decision: { reply: '你好，我可以回答群规和业务问题。', reason: '开发测试', confidence: 0.95 }, elapsedMs: 12, model: 'fixture-model' }
+        case 'get_wang_profile_status': return { state: '开发测试', scriptHash: 'FIXTURE-HASH', backupPath: null, requiresElevation: false, detail: '未读取真实旺商聊目录' }
+        default:
+          if (command.startsWith('save_') || command.startsWith('set_') || command.startsWith('delete_')) return null
+          throw new Error(`Fixture IPC 未实现: ${command}`)
+      }
+    }
+
+    Object.assign(window, {
+      __DH_E2E_FIXTURE__: true,
+      __TAURI_INTERNALS__: {
+        invoke,
+        transformCallback(callback: (payload: unknown) => void, once = false) {
+          const id = callbackId++
+          callbacks.set(id, once ? payload => { callbacks.delete(id); callback(payload) } : callback)
+          return id
+        },
+        unregisterCallback(id: number) { callbacks.delete(id) },
+        runCallback(id: number, payload: unknown) { callbacks.get(id)?.(payload) },
+        convertFileSrc(path: string) { return path },
+        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+      },
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
+    })
+  }, { initialState: fixtureState })
+}
+
+test.beforeEach(async ({ page }) => {
+  await installDeveloperFixture(page)
+  await page.goto('/')
+  await expect(page.getByText('开发 Fixture 已就绪')).toBeVisible()
+})
+
+test('developer fixture covers navigation, data and management workflows', async ({ page }) => {
+  await page.getByRole('button', { name: '群组与成员' }).click()
+  await page.getByRole('button', { name: /16 人开发测试群/ }).click()
+  await expect(page.getByText('广校')).toBeVisible()
+  await expect(page.getByText('群人数').locator('..')).toContainText('16')
+
+  await page.getByRole('button', { name: '消息台' }).click()
+  await expect(page.getByText('@DH 请查看群规')).toBeVisible()
+  await page.locator('label.check-chip').filter({ hasText: '16 人开发测试群' }).click()
+  await page.getByPlaceholder('发送内容只会发到当前勾选的群。').fill('开发测试消息')
+  await page.getByRole('button', { name: '发送文本' }).click()
+
+  await page.getByRole('button', { name: '规则' }).click()
+  await page.getByRole('button', { name: '新建规则' }).click()
+  await page.getByLabel('匹配内容').fill('测试关键词')
+  await page.getByRole('button', { name: '保存规则' }).click()
+  await expect(page.getByText('新规则').first()).toBeVisible()
+
+  await page.getByRole('button', { name: '知识与 AI' }).click()
+  await expect(page.getByRole('heading', { name: 'DH 群规' })).toBeVisible()
+  await expect(page.getByLabel('标题')).toHaveValue('文明交流')
+
+  await page.getByRole('button', { name: '任务与计划' }).click()
+  await page.getByLabel('任务标题').fill('跟进群内问题')
+  await page.getByRole('button', { name: '保存任务' }).click()
+  await expect(page.getByText('跟进群内问题').first()).toBeVisible()
+  await page.getByRole('button', { name: '开关群计划' }).click()
+  await page.locator('label.check-chip').filter({ hasText: '16 人开发测试群' }).click()
+  await page.getByRole('button', { name: '保存计划' }).click()
+  await expect(page.getByText('每日群发言').first()).toBeVisible()
+
+  await page.getByRole('button', { name: '审计' }).click()
+  await expect(page.getByText('测试环境收到消息')).toBeVisible()
+
+  await page.getByRole('button', { name: '设置' }).click()
+  await expect(page.getByText('DH Fixture · 9233')).toBeVisible()
+  await page.getByPlaceholder('输入一条测试问题').fill('你好')
+  await page.getByRole('button', { name: '测试 AI' }).click()
+  await expect(page.getByText(/可以回答群规和业务问题/)).toBeVisible()
+
+  await page.getByRole('button', { name: '调试' }).click()
+  await expect(page.getByText('http://127.0.0.1:9233')).toBeVisible()
+  await expect(page.getByText('FIXTURE-HASH')).toBeVisible()
+})
+
+test('captures current Tauri pages for the manual', async ({ page }) => {
+  test.skip(process.env.DH_CAPTURE_MANUAL !== '1', 'manual capture is an explicit developer task')
+  await page.setViewportSize({ width: 1320, height: 840 })
+  const directory = path.resolve('../docs/screenshots/tauri3')
+  await mkdir(directory, { recursive: true })
+  const capture = async (navigation: string, file: string) => {
+    await page.getByRole('button', { name: navigation }).click()
+    await page.waitForTimeout(100)
+    await page.screenshot({ path: path.join(directory, file), fullPage: false })
+  }
+
+  await page.screenshot({ path: path.join(directory, 'overview.png'), fullPage: false })
+  await page.getByRole('button', { name: '群组与成员' }).click()
+  await page.getByRole('button', { name: /16 人开发测试群/ }).click()
+  await page.screenshot({ path: path.join(directory, 'groups.png'), fullPage: false })
+  await capture('消息台', 'messages.png')
+  await capture('规则', 'rules.png')
+  await capture('知识与 AI', 'knowledge.png')
+  await capture('任务与计划', 'tasks.png')
+  await capture('审计', 'audit.png')
+  await capture('设置', 'settings.png')
+  await page.getByPlaceholder('输入一条测试问题').fill('你好，请简单说明群规')
+  await page.getByRole('button', { name: '测试 AI' }).click()
+  await expect(page.getByText(/可以回答群规和业务问题/)).toBeVisible()
+  await page.screenshot({ path: path.join(directory, 'ai-test.png'), fullPage: false })
+  await capture('调试', 'debug.png')
+})

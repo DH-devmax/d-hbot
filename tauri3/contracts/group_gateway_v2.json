@@ -1,0 +1,147 @@
+{
+  "version": 2,
+  "metadata": {
+    "captureFormat": "dh-contract-v2",
+    "capturedAt": "2026-07-21T00:00:00Z",
+    "appFileVersion": "3.0.0-fixture",
+    "pageTitle": "DH Fixture / 旺商聊",
+    "pageUrl": "http://127.0.0.1:51300/",
+    "mainScriptSha256": "20fd7fecb2ec4573a7c225ecc45a14185ee3400b1097d166aa3a42984d8613ec"
+  },
+  "calibrations": [
+    {
+      "appFileVersion": "3.0.0-fixture",
+      "mainScriptSha256": "20fd7fecb2ec4573a7c225ecc45a14185ee3400b1097d166aa3a42984d8613ec",
+      "verified": true,
+      "capabilities": {
+        "announcement": "unsupported",
+        "mute": "supported",
+        "recall": "supported",
+        "rename": "supported",
+        "removeMember": "supported",
+        "groupMute": "supported",
+        "memberEvents": "supported"
+      }
+    }
+  ],
+  "operations": [
+    {
+      "name": "listGroups",
+      "route": "/v1/group/get-group-list",
+      "request": {"kind":"request","params":{"v":"0"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_001"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{"owner":[],"member":[]}},
+      "normalizedReceipt": {"route":"/v1/group/get-group-list","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"ok"},
+      "expectedNormalizedState": {"groupCount":1,"readOnly":true}
+    },
+    {
+      "name": "listMembers",
+      "route": "/v1/group/get-group-members",
+      "request": {"kind":"request","params":{"groupId":10001,"v":"0"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_002"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{"groupMemberInfo":[]}},
+      "normalizedReceipt": {"route":"/v1/group/get-group-members","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"ok"},
+      "expectedNormalizedState": {"groupId":"GROUP_001","reportedCount":16,"completeness":"complete"}
+    },
+    {
+      "name": "sendText",
+      "route": "nim.sendCustomMsg",
+      "request": {"kind":"nim","params":{"target":"GROUP_001","content":"PAYLOAD_001"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_003"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{"idServer":"MESSAGE_001"}},
+      "normalizedReceipt": {"route":"nim.sendCustomMsg","status":"succeeded","businessCode":0,"businessErrno":0,"businessMessage":"OK","requestId":"REQUEST_003","messageId":"MESSAGE_001"},
+      "expectedNormalizedState": {"action":"send_text","messageId":"MESSAGE_001"}
+    },
+    {
+      "name": "mute",
+      "route": "/v1/group/set-member-mute",
+      "request": {"kind":"request","params":{"groupId":10001,"userId":20001,"min":10}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_004"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/set-member-mute","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"mute","groupId":"GROUP_001","userId":"USER_001","durationSeconds":600}
+    },
+    {
+      "name": "unmute",
+      "route": "/v1/group/member-mute-cancel",
+      "request": {"kind":"request","params":{"groupId":10001,"userId":20001}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_005"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/member-mute-cancel","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"unmute","groupId":"GROUP_001","userId":"USER_001"}
+    },
+    {
+      "name": "rename",
+      "route": "/v1/group/set-member-nickname",
+      "request": {"kind":"request","params":{"groupId":10001,"userId":20001,"nick":"DH群员0001"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_006"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/set-member-nickname","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"rename","groupId":"GROUP_001","userId":"USER_001","cardName":"DH群员0001"}
+    },
+    {
+      "name": "recall",
+      "route": "/v1/group/message-rollback",
+      "request": {"kind":"request","params":{"groupCloudId":"GROUP_001","userId":20001,"msgId":"MESSAGE_001"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_007"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/message-rollback","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK","messageId":"MESSAGE_001"},
+      "expectedNormalizedState": {"action":"recall","messageId":"MESSAGE_001","recalled":true}
+    },
+    {
+      "name": "removeMember",
+      "route": "/v1/group/remove-group-member",
+      "request": {"kind":"request","params":{"groupId":10001,"groupMemberIds":[20001]}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_008"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/remove-group-member","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"remove_member","groupId":"GROUP_001","userId":"USER_001","present":false}
+    },
+    {
+      "name": "groupMute",
+      "route": "/v1/group/set-group-mute",
+      "request": {"kind":"request","params":{"groupId":10001,"muteMode":"MUTE_MEMBER"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_009"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/set-group-mute","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"group_mute","groupId":"GROUP_001","muted":true}
+    }
+  ],
+  "transportFailures": [
+    {"name":"timeout","transportCode":504,"errno":1,"error":"IPC timeout","normalizedErrorKind":"transport"}
+  ],
+  "businessFailures": [
+    {"name":"permission","transportCode":200,"errno":0,"business":{"code":403,"errno":403,"msg":"权限不足"},"normalizedErrorKind":"permission"},
+    {"name":"nimNotReady","transportCode":503,"errno":2,"business":{"code":503,"errno":2,"msg":"NIM 尚未初始化"},"normalizedErrorKind":"nimNotReady"}
+  ],
+  "callbacks": [
+    {"sequence":1,"source":"onmsg","kind":"message","payload":{"idServer":"MESSAGE_001","from":"USER_001","to":"GROUP_001","scene":"team","flow":"in"}},
+    {"sequence":2,"source":"onaddteammembers","kind":"teamMemberJoined","payload":{"teamId":"GROUP_001","members":[{"nimId":"NIM_001","userId":"USER_001"}]}},
+    {"sequence":3,"source":"onupdateteammember","kind":"teamMemberUpdated","payload":{"teamId":"GROUP_001","members":[{"nimId":"NIM_001","userId":"USER_001"}]}},
+    {"sequence":4,"source":"onremoveteammembers","kind":"teamMemberLeft","payload":{"teamId":"GROUP_001","members":[{"nimId":"NIM_001","userId":"USER_001"}]}}
+  ],
+  "batch": {
+    "session": "LISTENER_SESSION_001",
+    "records": [
+      {"session":"LISTENER_SESSION_001","sequence":1,"kind":"message","source":"onmsg","payload":{"idServer":"MESSAGE_001"}},
+      {"session":"LISTENER_SESSION_001","sequence":2,"kind":"teamMemberJoined","source":"onaddteammembers","payload":{"teamId":"GROUP_001"}}
+    ],
+    "remaining": 2,
+    "dropped": 0
+  },
+  "ackReceipt": {
+    "session": "LISTENER_SESSION_001",
+    "acknowledgedThrough": 2,
+    "acknowledged": 2,
+    "remaining": 0,
+    "dropped": 0
+  },
+  "expectedNormalizedState": {
+    "groups": [{"groupId":"GROUP_001","memberCount":16}],
+    "members": [{"groupId":"GROUP_001","userId":"USER_001","nimId":"NIM_001","present":true}],
+    "messages": [{"messageId":"MESSAGE_001","kind":"text","acknowledged":true}],
+    "actions": [],
+    "listener": {"session":"LISTENER_SESSION_001","nextSequence":5,"dropped":0}
+  },
+  "limits": {"batch":100,"queue":5000,"seen":10000}
+}

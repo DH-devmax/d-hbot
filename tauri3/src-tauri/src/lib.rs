@@ -22,7 +22,8 @@ mod runtime;
 mod scheduler;
 mod secrets;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -30,16 +31,18 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{Emitter, Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Notify;
 
 use build_channel::BuildChannel;
-use database::{Database, DatabaseStatus};
+use database::{Database, DatabaseExecutor, DatabaseStatus};
 use error::{AppError, AppResult};
-use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, RuntimeGateway};
+use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
     AuditEvent, CardPlan, CardPreview, CardRenameJob, DailySummary, Group, GroupAiPermissions,
-    GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeDocument, Member, MemberRef,
-    MemberRoster, Message, ModerationRule, Page, ScheduleRun, TaskItem,
+    GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeChunk as StoredKnowledgeChunk,
+    KnowledgeDocument, Member, MemberRef, MemberRoster, Message, ModerationRule, Page, ScheduleRun,
+    TaskItem,
 };
 use paths::AppPaths;
 use secrets::SecretStore;
@@ -147,10 +150,13 @@ struct SummarySettings {
 
 pub struct AppState {
     pub paths: AppPaths,
-    pub database: Database,
+    pub database_executor: DatabaseExecutor,
     pub secrets: SecretStore,
     pub gateway: Arc<dyn RuntimeGateway>,
     pub shutdown: Arc<Notify>,
+    pub runtime_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pub exit_started: Arc<AtomicBool>,
+    pub tray_notice_shown: Arc<AtomicBool>,
     pub logger: diagnostics::Logger,
 }
 
@@ -159,6 +165,7 @@ impl AppState {
         let paths = AppPaths::discover()?;
         let _ = paths.prepare()?;
         let database = Database::open(&paths)?;
+        let database_executor = DatabaseExecutor::start(database)?;
         diagnostics::install_panic_hook(paths.logs.clone());
         let logs = paths.logs.clone();
         // The endpoint is a build-time/runtime-mode decision.  In particular,
@@ -169,9 +176,12 @@ impl AppState {
         Ok(Self {
             secrets: SecretStore::new(paths.secrets.clone()),
             paths,
-            database,
+            database_executor,
             gateway,
             shutdown: Arc::new(Notify::new()),
+            runtime_tasks: Arc::new(Mutex::new(Vec::new())),
+            exit_started: Arc::new(AtomicBool::new(false)),
+            tray_notice_shown: Arc::new(AtomicBool::new(false)),
             logger: diagnostics::Logger::new(logs),
         })
     }
@@ -261,8 +271,53 @@ fn start_fixture_host(app: tauri::AppHandle) -> AppResult<String> {
 }
 
 #[tauri::command]
-fn database_status(state: State<'_, AppState>) -> AppResult<DatabaseStatus> {
-    state.database.status()
+async fn database_status(state: State<'_, AppState>) -> AppResult<DatabaseStatus> {
+    state.database_executor.status().await
+}
+
+#[tauri::command]
+async fn get_close_behavior(state: State<'_, AppState>) -> AppResult<String> {
+    Ok(state
+        .database_executor
+        .get_setting("window.close_behavior".into())
+        .await?
+        .filter(|value| matches!(value.as_str(), "tray" | "exit"))
+        .unwrap_or_else(|| "ask".into()))
+}
+
+#[tauri::command]
+async fn reset_close_behavior(state: State<'_, AppState>) -> AppResult<()> {
+    state
+        .database_executor
+        .set_setting("window.close_behavior".into(), "ask".into(), false)
+        .await
+}
+
+#[tauri::command]
+async fn resolve_close_action(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    action: String,
+    remember: bool,
+) -> AppResult<()> {
+    if !matches!(action.as_str(), "tray" | "exit") {
+        return Err(AppError::new("close_action", "关闭操作不正确"));
+    }
+    if remember {
+        state
+            .database_executor
+            .set_setting("window.close_behavior".into(), action.clone(), false)
+            .await?;
+    }
+    if action == "tray" {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+        show_tray_notification(&app);
+    } else {
+        request_graceful_exit(app);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -274,29 +329,35 @@ async fn diagnose(state: State<'_, AppState>) -> Result<DiagnosticSnapshot, AppE
 async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
     let (_, account_id) = state.gateway.session_identity().await?;
     let now = Utc::now();
-    state.database.upsert_account(&models::Account {
-        id: account_id.clone(),
-        display_name: account_id.clone(),
-        role: "unknown".into(),
-        discovered_at: now,
-        updated_at: now,
-    })?;
+    state
+        .database_executor
+        .upsert_account(models::Account {
+            id: account_id.clone(),
+            display_name: account_id.clone(),
+            role: "unknown".into(),
+            discovered_at: now,
+            updated_at: now,
+        })
+        .await?;
     for group in state.gateway.list_groups().await? {
-        state.database.upsert_group(&group)?;
+        state.database_executor.upsert_group(group).await?;
     }
-    state.database.list_groups(Some(&account_id))
+    state.database_executor.list_groups(Some(account_id)).await
 }
 
 #[tauri::command]
-fn list_cached_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
-    state.database.list_groups(None)
+async fn list_cached_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
+    state.database_executor.list_groups(None).await
 }
 
 #[tauri::command]
 async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<MemberRoster> {
     let mut roster = state.gateway.list_members(group_id).await?;
     let (self_id, account_id) = state.gateway.session_identity().await?;
-    let existing = state.database.list_members(&account_id, group_id)?;
+    let existing = state
+        .database_executor
+        .list_members(account_id.clone(), group_id)
+        .await?;
     let had_baseline = !existing.is_empty();
     let mut newly_discovered = std::collections::HashSet::new();
     for member in &mut roster.members {
@@ -312,52 +373,70 @@ async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<Me
             member.original_card_name = member.card_name.clone();
             newly_discovered.insert(member.user_id);
         }
-        state.database.upsert_member(member)?;
+        state
+            .database_executor
+            .upsert_member(member.clone())
+            .await?;
     }
     let automatic = state
-        .database
-        .get_setting(&format!("card.auto.{account_id}.{group_id}"))?
+        .database_executor
+        .get_setting(format!("card.auto.{account_id}.{group_id}"))
+        .await?
         .as_deref()
         == Some("true");
     if had_baseline && automatic && !newly_discovered.is_empty() {
         let prefix = state
-            .database
-            .get_setting(&format!("card.prefix.{account_id}.{group_id}"))?
+            .database_executor
+            .get_setting(format!("card.prefix.{account_id}.{group_id}"))
+            .await?
             .unwrap_or_else(|| "DH".into());
         let preview = cardnames::preview(
             group_id,
             &prefix,
-            state.database.list_members(&account_id, group_id)?,
+            state
+                .database_executor
+                .list_members(account_id.clone(), group_id)
+                .await?,
             self_id,
         )?;
         for plan in preview.items.into_iter().filter(|plan| {
             plan.status == "planned" && newly_discovered.contains(&plan.member.user_id)
         }) {
             state
-                .database
-                .enqueue_card_job(&account_id, group_id, &plan, true)?;
+                .database_executor
+                .enqueue_card_job(account_id.clone(), group_id, plan, true)
+                .await?;
         }
     }
     Ok(roster)
 }
 
 #[tauri::command]
-fn local_members(
+async fn local_members(
     state: State<'_, AppState>,
     account_id: String,
     group_id: i64,
 ) -> AppResult<Vec<Member>> {
-    state.database.list_members(&account_id, group_id)
+    state
+        .database_executor
+        .list_members(account_id, group_id)
+        .await
 }
 
 #[tauri::command]
-fn get_ai_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+async fn get_ai_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
     let keys = ["ai.base_url", "ai.webhook_url", "ai.model"];
     let mut values = serde_json::Map::new();
     for key in keys {
         values.insert(
             key.trim_start_matches("ai.").replace('.', "_"),
-            serde_json::Value::String(state.database.get_setting(key)?.unwrap_or_default()),
+            serde_json::Value::String(
+                state
+                    .database_executor
+                    .get_setting(key.into())
+                    .await?
+                    .unwrap_or_default(),
+            ),
         );
     }
     values.insert(
@@ -375,32 +454,53 @@ fn get_ai_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
 }
 
 #[tauri::command]
-fn get_ai_automation_settings(
+async fn get_ai_automation_settings(
     state: State<'_, AppState>,
     account_id: String,
     group_id: i64,
 ) -> AppResult<serde_json::Value> {
     let group = state
-        .database
-        .list_groups(Some(&account_id))?
+        .database_executor
+        .list_groups(Some(account_id.clone()))
+        .await?
         .into_iter()
         .find(|group| group.group_id == group_id)
         .ok_or_else(|| AppError::new("group_missing", "没有找到所选群"))?;
-    let permissions = state.database.group_ai_permissions(&account_id, group_id)?;
-    let legacy_permission = |name: &str, default: bool| -> AppResult<bool> {
-        Ok(state
-            .database
-            .get_setting(&format!("ai.permission.{name}.{account_id}.{group_id}"))?
-            .map(|value| value == "true")
-            .unwrap_or(default))
-    };
+    let permissions = state
+        .database_executor
+        .group_ai_permissions(account_id.clone(), group_id)
+        .await?;
+    let legacy_tasks = state
+        .database_executor
+        .get_setting(format!("ai.permission.tasks.{account_id}.{group_id}"))
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(true);
+    let legacy_recall = state
+        .database_executor
+        .get_setting(format!("ai.permission.recall.{account_id}.{group_id}"))
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let legacy_mute = state
+        .database_executor
+        .get_setting(format!("ai.permission.mute.{account_id}.{group_id}"))
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let legacy_remove = state
+        .database_executor
+        .get_setting(format!("ai.permission.remove.{account_id}.{group_id}"))
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(false);
     Ok(serde_json::json!({
         "enabled": group.enabled,
         "reply": permissions.as_ref().map(|value| value.reply).unwrap_or(group.ai_enabled),
-        "tasks": permissions.as_ref().map(|value| value.tasks).unwrap_or(legacy_permission("tasks", true)?),
-        "recall": permissions.as_ref().map(|value| value.recall).unwrap_or(legacy_permission("recall", false)?),
-        "mute": permissions.as_ref().map(|value| value.mute).unwrap_or(legacy_permission("mute", false)?),
-        "remove": permissions.as_ref().map(|value| value.remove).unwrap_or(legacy_permission("remove", false)?),
+        "tasks": permissions.as_ref().map(|value| value.tasks).unwrap_or(legacy_tasks),
+        "recall": permissions.as_ref().map(|value| value.recall).unwrap_or(legacy_recall),
+        "mute": permissions.as_ref().map(|value| value.mute).unwrap_or(legacy_mute),
+        "remove": permissions.as_ref().map(|value| value.remove).unwrap_or(legacy_remove),
         "manualTakeover": group.manual_takeover
     }))
 }
@@ -412,22 +512,26 @@ async fn save_ai_automation_settings(
 ) -> AppResult<()> {
     require_manager(&state, settings.group_id).await?;
     let group = state
-        .database
-        .list_groups(Some(&settings.account_id))?
+        .database_executor
+        .list_groups(Some(settings.account_id.clone()))
+        .await?
         .into_iter()
         .find(|group| group.group_id == settings.group_id)
         .ok_or_else(|| AppError::new("group_missing", "没有找到所选群"))?;
-    state.database.set_group_features(
-        &settings.account_id,
-        settings.group_id,
-        settings.enabled,
-        settings.reply,
-        group.moderation_enabled,
-        settings.manual_takeover,
-    )?;
     state
-        .database
-        .save_group_ai_permissions(&GroupAiPermissions {
+        .database_executor
+        .set_group_features(
+            settings.account_id.clone(),
+            settings.group_id,
+            settings.enabled,
+            settings.reply,
+            group.moderation_enabled,
+            settings.manual_takeover,
+        )
+        .await?;
+    state
+        .database_executor
+        .save_group_ai_permissions(GroupAiPermissions {
             account_id: settings.account_id,
             group_id: settings.group_id,
             reply: settings.reply,
@@ -435,12 +539,13 @@ async fn save_ai_automation_settings(
             recall: settings.recall,
             mute: settings.mute,
             remove: settings.remove,
-        })?;
+        })
+        .await?;
     Ok(())
 }
 
 #[tauri::command]
-fn get_card_settings(
+async fn get_card_settings(
     state: State<'_, AppState>,
     account_id: String,
     group_id: i64,
@@ -449,9 +554,9 @@ fn get_card_settings(
     let auto_key = format!("card.auto.{account_id}.{group_id}");
     let paused_key = format!("card.paused.{account_id}.{group_id}");
     Ok(serde_json::json!({
-        "prefix": state.database.get_setting(&prefix_key)?.unwrap_or_else(|| "DH".into()),
-        "autoRename": state.database.get_setting(&auto_key)?.as_deref() == Some("true"),
-        "paused": state.database.get_setting(&paused_key)?.as_deref() == Some("true")
+        "prefix": state.database_executor.get_setting(prefix_key).await?.unwrap_or_else(|| "DH".into()),
+        "autoRename": state.database_executor.get_setting(auto_key).await?.as_deref() == Some("true"),
+        "paused": state.database_executor.get_setting(paused_key).await?.as_deref() == Some("true")
     }))
 }
 
@@ -470,21 +575,30 @@ async fn save_card_settings(
     } else {
         prefix.trim()
     };
-    state.database.set_setting(
-        &format!("card.prefix.{account_id}.{group_id}"),
-        prefix,
-        false,
-    )?;
-    state.database.set_setting(
-        &format!("card.auto.{account_id}.{group_id}"),
-        if auto_rename { "true" } else { "false" },
-        false,
-    )?;
-    state.database.set_setting(
-        &format!("card.paused.{account_id}.{group_id}"),
-        if paused { "true" } else { "false" },
-        false,
-    )
+    state
+        .database_executor
+        .set_setting(
+            format!("card.prefix.{account_id}.{group_id}"),
+            prefix.into(),
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            format!("card.auto.{account_id}.{group_id}"),
+            if auto_rename { "true" } else { "false" }.into(),
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            format!("card.paused.{account_id}.{group_id}"),
+            if paused { "true" } else { "false" }.into(),
+            false,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -496,12 +610,13 @@ async fn save_group_welcome(
 ) -> AppResult<()> {
     require_manager(&state, group_id).await?;
     state
-        .database
-        .set_group_welcome(&account_id, group_id, &welcome_message)
+        .database_executor
+        .set_group_welcome(account_id, group_id, welcome_message)
+        .await
 }
 
 #[tauri::command]
-fn save_ai_settings(
+async fn save_ai_settings(
     state: State<'_, AppState>,
     base_url: String,
     webhook_url: String,
@@ -519,20 +634,26 @@ fn save_ai_settings(
         ));
     }
     state
-        .database
-        .set_setting("ai.base_url", base_url.trim(), false)?;
+        .database_executor
+        .set_setting("ai.base_url".into(), base_url.trim().into(), false)
+        .await?;
     state
-        .database
-        .set_setting("ai.webhook_url", webhook_url.trim(), false)?;
-    state.database.set_setting(
-        "ai.model",
-        if model.trim().is_empty() {
-            "deepseek-v4-pro"
-        } else {
-            model.trim()
-        },
-        false,
-    )?;
+        .database_executor
+        .set_setting("ai.webhook_url".into(), webhook_url.trim().into(), false)
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            "ai.model".into(),
+            if model.trim().is_empty() {
+                "deepseek-v4-pro"
+            } else {
+                model.trim()
+            }
+            .into(),
+            false,
+        )
+        .await?;
     if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
         let mut values = state.secrets.load()?;
         values.insert("ai.api_key".into(), api_key);
@@ -544,7 +665,11 @@ fn save_ai_settings(
 #[tauri::command]
 async fn send_text(state: State<'_, AppState>, group_id: i64, text: String) -> AppResult<String> {
     require_manager(&state, group_id).await?;
-    state.gateway.send_text(group_id, &text).await
+    state
+        .gateway
+        .send_text(group_id, &text)
+        .await
+        .map(|receipt| receipt.message_id)
 }
 
 #[tauri::command]
@@ -562,10 +687,10 @@ async fn send_text_batch(
     let mut results = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
         match state.gateway.send_text(group_id, text.trim()).await {
-            Ok(message_id) => results.push(BatchSendResult {
+            Ok(receipt) => results.push(BatchSendResult {
                 group_id,
                 success: true,
-                message_id,
+                message_id: receipt.message_id,
                 error: String::new(),
             }),
             Err(error) => results.push(BatchSendResult {
@@ -580,7 +705,10 @@ async fn send_text_batch(
 }
 
 #[tauri::command]
-fn query_messages(state: State<'_, AppState>, query: MessageQuery) -> AppResult<Page<Message>> {
+async fn query_messages(
+    state: State<'_, AppState>,
+    query: MessageQuery,
+) -> AppResult<Page<Message>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let cursor = query
         .cursor
@@ -589,8 +717,9 @@ fn query_messages(state: State<'_, AppState>, query: MessageQuery) -> AppResult<
     let keyword = query.keyword.unwrap_or_default().trim().to_lowercase();
     let kind = query.kind.unwrap_or_default();
     let mut items = state
-        .database
-        .list_messages(&query.account_id, None, 1000)?
+        .database_executor
+        .list_messages(query.account_id.clone(), None, 1000)
+        .await?
         .into_iter()
         .filter(|message| query.group_ids.is_empty() || query.group_ids.contains(&message.group_id))
         .filter(|message| cursor.map(|value| message.id < value).unwrap_or(true))
@@ -612,15 +741,16 @@ fn query_messages(state: State<'_, AppState>, query: MessageQuery) -> AppResult<
 }
 
 #[tauri::command]
-fn recent_messages(
+async fn recent_messages(
     state: State<'_, AppState>,
     account_id: String,
     group_id: Option<i64>,
     limit: Option<usize>,
 ) -> AppResult<Vec<Message>> {
     state
-        .database
-        .list_messages(&account_id, group_id, limit.unwrap_or(100))
+        .database_executor
+        .list_messages(account_id, group_id, limit.unwrap_or(100))
+        .await
 }
 
 #[tauri::command]
@@ -635,23 +765,29 @@ async fn set_group_features(
 ) -> AppResult<()> {
     require_account(&state, &account_id).await?;
     require_manager(&state, group_id).await?;
-    state.database.set_group_features(
-        &account_id,
-        group_id,
-        enabled,
-        ai_enabled,
-        moderation_enabled,
-        manual_takeover,
-    )
+    state
+        .database_executor
+        .set_group_features(
+            account_id,
+            group_id,
+            enabled,
+            ai_enabled,
+            moderation_enabled,
+            manual_takeover,
+        )
+        .await
 }
 
 #[tauri::command]
-fn list_rules(
+async fn list_rules(
     state: State<'_, AppState>,
     account_id: String,
     group_id: Option<i64>,
 ) -> AppResult<Vec<ModerationRule>> {
-    state.database.list_rules(&account_id, group_id)
+    state
+        .database_executor
+        .list_rules(account_id, group_id)
+        .await
 }
 
 #[tauri::command]
@@ -660,7 +796,7 @@ async fn save_rule(state: State<'_, AppState>, rule: ModerationRule) -> AppResul
     if rule.group_id != 0 {
         require_manager(&state, rule.group_id).await?;
     }
-    state.database.save_rule(&rule)
+    state.database_executor.save_rule(rule).await
 }
 
 #[tauri::command]
@@ -670,12 +806,15 @@ async fn delete_rule(
     rule_id: i64,
 ) -> AppResult<()> {
     require_account(&state, &account_id).await?;
-    state.database.delete_rule(&account_id, rule_id)
+    state
+        .database_executor
+        .delete_rule(account_id, rule_id)
+        .await
 }
 
 #[tauri::command]
-fn export_rules(state: State<'_, AppState>, account_id: String) -> AppResult<String> {
-    let rules = state.database.list_rules(&account_id, None)?;
+async fn export_rules(state: State<'_, AppState>, account_id: String) -> AppResult<String> {
+    let rules = state.database_executor.list_rules(account_id, None).await?;
     serde_json::to_string_pretty(&serde_json::json!({"version":1,"rules":rules}))
         .map_err(|error| AppError::new("rules_export", error.to_string()))
 }
@@ -715,27 +854,33 @@ async fn import_rules(
         }
         rules.push(rule);
     }
-    state.database.import_rules(&account_id, &rules)
+    state
+        .database_executor
+        .import_rules(account_id, rules)
+        .await
 }
 
 #[tauri::command]
-fn list_knowledge_bases(
+async fn list_knowledge_bases(
     state: State<'_, AppState>,
     account_id: String,
 ) -> AppResult<Vec<KnowledgeBase>> {
-    state.database.list_knowledge_bases(&account_id)
+    state
+        .database_executor
+        .list_knowledge_bases(account_id)
+        .await
 }
 
 #[tauri::command]
 async fn create_knowledge_base(state: State<'_, AppState>, base: KnowledgeBase) -> AppResult<i64> {
     require_account(&state, &base.account_id).await?;
-    state.database.create_knowledge_base(&base)
+    state.database_executor.create_knowledge_base(base).await
 }
 
 #[tauri::command]
 async fn update_knowledge_base(state: State<'_, AppState>, base: KnowledgeBase) -> AppResult<()> {
     require_account(&state, &base.account_id).await?;
-    state.database.update_knowledge_base(&base)
+    state.database_executor.update_knowledge_base(base).await
 }
 
 #[tauri::command]
@@ -747,8 +892,9 @@ async fn clone_knowledge_base(
 ) -> AppResult<i64> {
     require_account(&state, &account_id).await?;
     state
-        .database
-        .clone_knowledge_base(&account_id, base_id, &name)
+        .database_executor
+        .clone_knowledge_base(account_id, base_id, name)
+        .await
 }
 
 #[tauri::command]
@@ -758,15 +904,21 @@ async fn delete_knowledge_base(
     base_id: i64,
 ) -> AppResult<()> {
     require_account(&state, &account_id).await?;
-    state.database.delete_knowledge_base(&account_id, base_id)
+    state
+        .database_executor
+        .delete_knowledge_base(account_id, base_id)
+        .await
 }
 
 #[tauri::command]
-fn list_knowledge_documents(
+async fn list_knowledge_documents(
     state: State<'_, AppState>,
     base_id: i64,
 ) -> AppResult<Vec<KnowledgeDocument>> {
-    state.database.list_knowledge_documents(base_id)
+    state
+        .database_executor
+        .list_knowledge_documents(base_id)
+        .await
 }
 
 #[tauri::command]
@@ -774,9 +926,34 @@ async fn save_knowledge_document(
     state: State<'_, AppState>,
     document: KnowledgeDocument,
 ) -> AppResult<i64> {
-    let account_id = state.database.knowledge_base_account(document.base_id)?;
+    let account_id = state
+        .database_executor
+        .knowledge_base_account(document.base_id)
+        .await?;
     require_account(&state, &account_id).await?;
-    state.database.upsert_knowledge_document(&document)
+    let document_id = state
+        .database_executor
+        .upsert_knowledge_document(document.clone())
+        .await?;
+    let mut stored_document = document;
+    stored_document.id = document_id;
+    let chunks = knowledge::chunk_document(&stored_document, 800, 120)
+        .into_iter()
+        .map(|chunk| StoredKnowledgeChunk {
+            id: 0,
+            document_id,
+            chunk_index: chunk.index as i64,
+            token_count: chunk.text.chars().count() as i64,
+            content: chunk.text,
+            content_hash: chunk.content_hash,
+            enabled: stored_document.enabled,
+        })
+        .collect::<Vec<_>>();
+    state
+        .database_executor
+        .replace_knowledge_chunks(document_id, chunks)
+        .await?;
+    Ok(document_id)
 }
 
 #[tauri::command]
@@ -785,11 +962,15 @@ async fn delete_knowledge_document(
     base_id: i64,
     document_id: i64,
 ) -> AppResult<()> {
-    let account_id = state.database.knowledge_base_account(base_id)?;
+    let account_id = state
+        .database_executor
+        .knowledge_base_account(base_id)
+        .await?;
     require_account(&state, &account_id).await?;
     state
-        .database
+        .database_executor
         .delete_knowledge_document(base_id, document_id)
+        .await
 }
 
 #[tauri::command]
@@ -804,33 +985,40 @@ async fn bind_knowledge_base(
         require_manager(&state, *group_id).await?;
     }
     state
-        .database
-        .bind_knowledge_base(base_id, &account_id, &group_ids)
+        .database_executor
+        .bind_knowledge_base(account_id, base_id, group_ids)
+        .await
 }
 
 #[tauri::command]
-fn list_knowledge_bindings(
+async fn list_knowledge_bindings(
     state: State<'_, AppState>,
     account_id: String,
     base_id: Option<i64>,
 ) -> AppResult<Vec<KnowledgeBinding>> {
-    state.database.list_knowledge_bindings(&account_id, base_id)
+    state
+        .database_executor
+        .list_knowledge_bindings(account_id, base_id)
+        .await
 }
 
 #[tauri::command]
-fn list_tasks(
+async fn list_tasks(
     state: State<'_, AppState>,
     account_id: String,
     group_id: Option<i64>,
 ) -> AppResult<Vec<TaskItem>> {
-    state.database.list_tasks(&account_id, group_id)
+    state
+        .database_executor
+        .list_tasks(account_id, group_id)
+        .await
 }
 
 #[tauri::command]
 async fn save_task(state: State<'_, AppState>, task: TaskItem) -> AppResult<i64> {
     require_account(&state, &task.account_id).await?;
     require_manager(&state, task.group_id).await?;
-    state.database.save_task(&task)
+    state.database_executor.save_task(task).await
 }
 
 #[tauri::command]
@@ -840,12 +1028,18 @@ async fn delete_task(
     task_id: i64,
 ) -> AppResult<()> {
     require_account(&state, &account_id).await?;
-    state.database.delete_task(&account_id, task_id)
+    state
+        .database_executor
+        .delete_task(account_id, task_id)
+        .await
 }
 
 #[tauri::command]
-fn list_schedules(state: State<'_, AppState>, account_id: String) -> AppResult<Vec<GroupSchedule>> {
-    state.database.list_schedules(&account_id)
+async fn list_schedules(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<Vec<GroupSchedule>> {
+    state.database_executor.list_schedules(account_id).await
 }
 
 #[tauri::command]
@@ -864,7 +1058,7 @@ async fn save_schedule(state: State<'_, AppState>, mut schedule: GroupSchedule) 
         schedule.timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
     }
     let _ = scheduler::evaluate_utc(&schedule, schedule.group_ids[0], Utc::now())?;
-    state.database.save_schedule(&schedule)
+    state.database_executor.save_schedule(schedule).await
 }
 
 #[tauri::command]
@@ -874,35 +1068,45 @@ async fn delete_schedule(
     schedule_id: i64,
 ) -> AppResult<()> {
     require_account(&state, &account_id).await?;
-    state.database.delete_schedule(&account_id, schedule_id)
+    state
+        .database_executor
+        .delete_schedule(account_id, schedule_id)
+        .await
 }
 
 #[tauri::command]
-fn list_schedule_runs(
+async fn list_schedule_runs(
     state: State<'_, AppState>,
     account_id: String,
     schedule_id: Option<i64>,
     limit: Option<usize>,
 ) -> AppResult<Vec<ScheduleRun>> {
     state
-        .database
-        .list_schedule_runs(&account_id, schedule_id, limit.unwrap_or(100))
+        .database_executor
+        .list_schedule_runs(account_id, schedule_id, limit.unwrap_or(100))
+        .await
 }
 
 #[tauri::command]
-fn list_audit(
+async fn list_audit(
     state: State<'_, AppState>,
     account_id: String,
     limit: Option<usize>,
 ) -> AppResult<Vec<AuditEvent>> {
-    state.database.list_audit(&account_id, limit.unwrap_or(200))
+    state
+        .database_executor
+        .list_audit(account_id, limit.unwrap_or(200))
+        .await
 }
 
 #[tauri::command]
-fn query_audit(state: State<'_, AppState>, mut query: AuditQuery) -> AppResult<Page<AuditEvent>> {
+async fn query_audit(
+    state: State<'_, AppState>,
+    mut query: AuditQuery,
+) -> AppResult<Page<AuditEvent>> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     query.limit = Some(limit + 1);
-    let mut items = state.database.query_audit(&query)?;
+    let mut items = state.database_executor.query_audit(query).await?;
     let next_cursor = if items.len() > limit {
         items.truncate(limit);
         items.last().map(|item| item.id.to_string())
@@ -913,14 +1117,14 @@ fn query_audit(state: State<'_, AppState>, mut query: AuditQuery) -> AppResult<P
 }
 
 #[tauri::command]
-fn export_audit(
+async fn export_audit(
     state: State<'_, AppState>,
     mut query: AuditQuery,
     format: String,
 ) -> AppResult<String> {
     query.cursor = None;
     query.limit = Some(1000);
-    let events = state.database.query_audit(&query)?;
+    let events = state.database_executor.query_audit(query).await?;
     if format.eq_ignore_ascii_case("json") {
         return serde_json::to_string_pretty(&events)
             .map_err(|error| AppError::new("audit_export", error.to_string()));
@@ -949,33 +1153,37 @@ fn export_audit(
 }
 
 #[tauri::command]
-fn list_daily_summaries(
+async fn list_daily_summaries(
     state: State<'_, AppState>,
     account_id: String,
     limit: Option<usize>,
 ) -> AppResult<Vec<DailySummary>> {
     state
-        .database
-        .list_daily_summaries(&account_id, limit.unwrap_or(30))
+        .database_executor
+        .list_daily_summaries(account_id, limit.unwrap_or(30))
+        .await
 }
 
 #[tauri::command]
-fn get_summary_settings(
+async fn get_summary_settings(
     state: State<'_, AppState>,
     account_id: String,
 ) -> AppResult<SummarySettings> {
     let enabled = state
-        .database
-        .get_setting(&format!("summary.enabled.{account_id}"))?
+        .database_executor
+        .get_setting(format!("summary.enabled.{account_id}"))
+        .await?
         .as_deref()
         == Some("true");
     let time = state
-        .database
-        .get_setting(&format!("summary.time.{account_id}"))?
+        .database_executor
+        .get_setting(format!("summary.time.{account_id}"))
+        .await?
         .unwrap_or_else(|| "23:00".into());
     let group_ids = state
-        .database
-        .get_setting(&format!("summary.groups.{account_id}"))?
+        .database_executor
+        .get_setting(format!("summary.groups.{account_id}"))
+        .await?
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default();
     Ok(SummarySettings {
@@ -998,22 +1206,31 @@ async fn save_summary_settings(
     for group_id in &settings.group_ids {
         require_manager(&state, *group_id).await?;
     }
-    state.database.set_setting(
-        &format!("summary.enabled.{}", settings.account_id),
-        if settings.enabled { "true" } else { "false" },
-        false,
-    )?;
-    state.database.set_setting(
-        &format!("summary.time.{}", settings.account_id),
-        &settings.time,
-        false,
-    )?;
-    state.database.set_setting(
-        &format!("summary.groups.{}", settings.account_id),
-        &serde_json::to_string(&settings.group_ids)
-            .map_err(|error| AppError::new("summary_settings", error.to_string()))?,
-        false,
-    )
+    state
+        .database_executor
+        .set_setting(
+            format!("summary.enabled.{}", settings.account_id),
+            if settings.enabled { "true" } else { "false" }.into(),
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            format!("summary.time.{}", settings.account_id),
+            settings.time,
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
+            format!("summary.groups.{}", settings.account_id),
+            serde_json::to_string(&settings.group_ids)
+                .map_err(|error| AppError::new("summary_settings", error.to_string()))?,
+            false,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -1025,8 +1242,9 @@ async fn generate_daily_summary(
     require_manager(&state, group_id).await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let messages = state
-        .database
-        .list_messages(&account_id, Some(group_id), 1000)?
+        .database_executor
+        .list_messages(account_id.clone(), Some(group_id), 1000)
+        .await?
         .into_iter()
         .filter(|message| {
             message
@@ -1045,16 +1263,19 @@ async fn generate_daily_summary(
         ));
     }
     let base_url = state
-        .database
-        .get_setting("ai.base_url")?
+        .database_executor
+        .get_setting("ai.base_url".into())
+        .await?
         .unwrap_or_default();
     let webhook_url = state
-        .database
-        .get_setting("ai.webhook_url")?
+        .database_executor
+        .get_setting("ai.webhook_url".into())
+        .await?
         .unwrap_or_default();
     let model = state
-        .database
-        .get_setting("ai.model")?
+        .database_executor
+        .get_setting("ai.model".into())
+        .await?
         .unwrap_or_else(|| "deepseek-v4-pro".into());
     let api_key = state
         .secrets
@@ -1070,8 +1291,9 @@ async fn generate_daily_summary(
         timeout: Duration::from_secs(30),
     })?;
     let group_name = state
-        .database
-        .list_groups(Some(&account_id))?
+        .database_executor
+        .list_groups(Some(account_id.clone()))
+        .await?
         .into_iter()
         .find(|group| group.group_id == group_id)
         .map(|group| group.name)
@@ -1109,7 +1331,10 @@ async fn generate_daily_summary(
         source: "ai".into(),
         created_at: Utc::now(),
     };
-    let id = state.database.save_daily_summary(&summary)?;
+    let id = state
+        .database_executor
+        .save_daily_summary(summary.clone())
+        .await?;
     Ok(DailySummary { id, ..summary })
 }
 
@@ -1120,16 +1345,19 @@ async fn test_ai(
     recent_context: Vec<ai::AiContextMessage>,
 ) -> AppResult<ai::AiTestResult> {
     let base_url = state
-        .database
-        .get_setting("ai.base_url")?
+        .database_executor
+        .get_setting("ai.base_url".into())
+        .await?
         .unwrap_or_default();
     let webhook_url = state
-        .database
-        .get_setting("ai.webhook_url")?
+        .database_executor
+        .get_setting("ai.webhook_url".into())
+        .await?
         .unwrap_or_default();
     let model = state
-        .database
-        .get_setting("ai.model")?
+        .database_executor
+        .get_setting("ai.model".into())
+        .await?
         .unwrap_or_else(|| "deepseek-v4-pro".into());
     let api_key = state
         .secrets
@@ -1222,6 +1450,7 @@ async fn recall_message(
         .gateway
         .recall(group_id, sender_user_id, &message_id)
         .await
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -1236,12 +1465,13 @@ async fn mute_member(
         .gateway
         .mute(group_id, user_id, duration_seconds)
         .await
+        .map(|_| ())
 }
 
 #[tauri::command]
 async fn unmute_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state.gateway.unmute(group_id, user_id).await
+    state.gateway.unmute(group_id, user_id).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -1252,19 +1482,31 @@ async fn rename_member(
     nickname: String,
 ) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state.gateway.rename(group_id, &member, &nickname).await
+    state
+        .gateway
+        .rename(group_id, &member, &nickname)
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
 async fn remove_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state.gateway.remove_member(group_id, user_id).await
+    state
+        .gateway
+        .remove_member(group_id, user_id)
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
 async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) -> AppResult<()> {
     require_manager(&state, group_id).await?;
-    state.gateway.set_group_mute(group_id, muted).await
+    state
+        .gateway
+        .set_group_mute(group_id, muted)
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -1277,17 +1519,19 @@ async fn get_group_management_context(
     let is_manager = roster.members.iter().any(|member| {
         member.user_id == sender_id && matches!(member.role.as_str(), "owner" | "admin")
     });
+    let capabilities = state.gateway.capabilities();
+    let announcement_status = match capabilities.announcement {
+        gateway::CapabilityStatus::Supported => "可用",
+        gateway::CapabilityStatus::Unverified => "当前版本待校准",
+        gateway::CapabilityStatus::Unsupported => "功能未开放",
+    };
     Ok(GroupManagementContext {
         group_id,
         sender_id,
         is_manager,
-        capabilities: state.gateway.capabilities(),
+        capabilities,
         member_count: roster.members.len(),
-        announcement_status: if state.gateway.capabilities().announcement {
-            "可用".into()
-        } else {
-            "功能未开放".into()
-        },
+        announcement_status: announcement_status.into(),
     })
 }
 
@@ -1343,12 +1587,16 @@ async fn execute_member_batch(
                     )
                     .await
             }
-            "blacklist" => state.database.set_member_blacklisted(
-                &account_id,
-                input.group_id,
-                member.user_id.unwrap_or_default(),
-                true,
-            ),
+            "blacklist" => state
+                .database_executor
+                .set_member_blacklisted(
+                    account_id.clone(),
+                    input.group_id,
+                    member.user_id.unwrap_or_default(),
+                    true,
+                )
+                .await
+                .map(|_| GatewayReceipt::succeeded("database.member.blacklist")),
             _ => unreachable!(),
         };
         results.push(MemberBatchResult {
@@ -1373,7 +1621,10 @@ async fn preview_card_names(
     cardnames::preview(
         group_id,
         &prefix,
-        state.database.list_members(&account_id, group_id)?,
+        state
+            .database_executor
+            .list_members(account_id, group_id)
+            .await?,
         self_id,
     )
 }
@@ -1392,8 +1643,9 @@ async fn apply_card_names(
         .filter(|plan| plan.status == "planned" && !plan.suggested_name.is_empty())
     {
         if state
-            .database
-            .enqueue_card_job(&account_id, group_id, &plan, false)?
+            .database_executor
+            .enqueue_card_job(account_id.clone(), group_id, plan, false)
+            .await?
         {
             queued += 1;
         }
@@ -1402,15 +1654,16 @@ async fn apply_card_names(
 }
 
 #[tauri::command]
-fn list_card_rename_jobs(
+async fn list_card_rename_jobs(
     state: State<'_, AppState>,
     account_id: String,
     group_id: i64,
     limit: Option<usize>,
 ) -> AppResult<Vec<CardRenameJob>> {
     state
-        .database
-        .list_card_jobs(&account_id, group_id, limit.unwrap_or(200))
+        .database_executor
+        .list_card_jobs(account_id, group_id, limit.unwrap_or(200))
+        .await
 }
 
 #[tauri::command]
@@ -1420,7 +1673,10 @@ async fn retry_card_rename_jobs(
     group_id: i64,
 ) -> AppResult<usize> {
     require_manager(&state, group_id).await?;
-    state.database.retry_failed_card_jobs(&account_id, group_id)
+    state
+        .database_executor
+        .retry_failed_card_jobs(account_id, group_id)
+        .await
 }
 
 async fn require_manager(state: &State<'_, AppState>, group_id: i64) -> AppResult<()> {
@@ -1455,6 +1711,9 @@ macro_rules! dh_handlers {
         tauri::generate_handler![
             health,
             database_status,
+            get_close_behavior,
+            reset_close_behavior,
+            resolve_close_action,
             diagnose,
             list_groups,
             list_cached_groups,
@@ -1534,6 +1793,73 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn set_tray_menu(app: &tauri::AppHandle, paused: bool) -> tauri::Result<()> {
+    let pause_label = if paused {
+        "恢复全部自动化"
+    } else {
+        "暂停全部自动化"
+    };
+    let tray_menu = MenuBuilder::new(app)
+        .text("show", "显示 DH BOT")
+        .text("pause", pause_label)
+        .separator()
+        .text("exit", "退出 DH BOT")
+        .build()?;
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_menu(Some(tray_menu))?;
+    }
+    Ok(())
+}
+
+fn show_tray_notification(app: &tauri::AppHandle) {
+    let should_show = app
+        .try_state::<AppState>()
+        .map(|state| !state.tray_notice_shown.swap(true, Ordering::AcqRel))
+        .unwrap_or(false);
+    if should_show {
+        let _ = app
+            .notification()
+            .builder()
+            .title("DH BOT 已在后台运行")
+            .body("可从 Windows 右下角托盘恢复窗口。")
+            .show();
+    }
+}
+
+fn request_graceful_exit(app: tauri::AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        app.exit(0);
+        return;
+    };
+    if state.exit_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    state.shutdown.notify_waiters();
+    let database = state.database_executor.clone();
+    let tasks = state.runtime_tasks.clone();
+    tauri::async_runtime::spawn(async move {
+        let handles = tasks
+            .lock()
+            .map(|mut handles| std::mem::take(&mut *handles))
+            .unwrap_or_default();
+        let worker_wait = async move {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        };
+        let timed_out = tokio::time::timeout(Duration::from_secs(4), worker_wait)
+            .await
+            .is_err();
+        if timed_out {
+            let _ = database
+                .mark_processing_effects_unknown("DH BOT 退出等待超时，远端执行结果未确认".into())
+                .await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), database.shutdown()).await;
+        app.exit(0);
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if platform::run_maintenance_if_requested() {
@@ -1541,8 +1867,9 @@ pub fn run() {
     }
     // Register single-instance arbitration before opening SQLite, logs or any
     // background worker. A second launch only restores the existing window.
-    let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app)
         }));
     #[cfg(feature = "fixture")]
@@ -1576,63 +1903,74 @@ pub fn run() {
             let shutdown = state.shutdown.clone();
             app.manage(state);
             let app_handle = app.handle().clone();
-            let tray_menu = MenuBuilder::new(app)
-                .text("show", "显示 DH BOT")
-                .text("pause", "暂停全部自动化")
-                .separator()
-                .text("exit", "退出 DH BOT")
-                .build()?;
-            if let Some(tray) = app.tray_by_id("main") {
-                tray.set_menu(Some(tray_menu))?;
-            }
+            set_tray_menu(app.handle(), false)?;
+            let initial_database = app.state::<AppState>().database_executor.clone();
+            let initial_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let paused = initial_database
+                    .get_setting("automation.mode".into())
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("paused");
+                let _ = set_tray_menu(&initial_app, paused);
+                let _ =
+                    initial_app.emit("automation-paused", serde_json::json!({"paused": paused}));
+            });
             app.on_menu_event(|app, event| match event.id().as_ref() {
                 "show" => {
                     show_main_window(app);
                 }
                 "pause" => {
                     if let Some(state) = app.try_state::<AppState>() {
-                        let current = state
-                            .database
-                            .get_setting("automation.mode")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "observe".into());
-                        let next = if current == "paused" {
-                            "observe"
-                        } else {
-                            "paused"
-                        };
-                        let _ = state.database.set_setting("automation.mode", next, false);
-                        let _ = app.emit(
-                            "automation-paused",
-                            serde_json::json!({
-                                "paused": next == "paused"
-                            }),
-                        );
+                        let database = state.database_executor.clone();
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let current = database
+                                .get_setting("automation.mode".into())
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| "observe".into());
+                            let next = if current == "paused" {
+                                "observe"
+                            } else {
+                                "paused"
+                            };
+                            let _ = database
+                                .set_setting("automation.mode".into(), next.into(), false)
+                                .await;
+                            let _ = set_tray_menu(&app, next == "paused");
+                            let _ = app.emit(
+                                "automation-paused",
+                                serde_json::json!({"paused": next == "paused"}),
+                            );
+                        });
                     }
                 }
                 "exit" => {
-                    if let Some(state) = app.try_state::<AppState>() {
-                        state.shutdown.notify_waiters();
-                    }
-                    app.exit(0);
+                    request_graceful_exit(app.clone());
                 }
                 _ => {}
             });
             let runtime_gateway: Arc<dyn RuntimeGateway> = app.state::<AppState>().gateway.clone();
-            runtime::BackendRuntime::new(
-                app.state::<AppState>().database.clone(),
+            let mut runtime_tasks = runtime::BackendRuntime::new(
+                app.state::<AppState>().database_executor.clone(),
                 runtime_gateway,
                 app.state::<AppState>().secrets.clone(),
                 app.state::<AppState>().shutdown.clone(),
                 app.state::<AppState>().logger.clone(),
             )
             .spawn(app_handle.clone());
-            bridge::spawn(
+            runtime_tasks.push(bridge::spawn(
                 app.state::<AppState>().gateway.clone(),
                 app.state::<AppState>().shutdown.clone(),
                 app.state::<AppState>().logger.clone(),
-            );
+            ));
+            if let Ok(mut tasks) = app.state::<AppState>().runtime_tasks.lock() {
+                *tasks = runtime_tasks;
+            }
             tauri::async_runtime::spawn(async move {
                 shutdown.notified().await;
                 if let Some(window) = app_handle.get_webview_window("main") {
@@ -1641,11 +1979,38 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.hide();
+                let app = window.app_handle().clone();
+                let database = app.state::<AppState>().database_executor.clone();
+                tauri::async_runtime::spawn(async move {
+                    match database
+                        .get_setting("window.close_behavior".into())
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                    {
+                        Some("tray") => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.hide();
+                            }
+                            show_tray_notification(&app);
+                        }
+                        Some("exit") => request_graceful_exit(app),
+                        _ => {
+                            show_main_window(&app);
+                            let _ = app.emit("close-requested", ());
+                        }
+                    }
+                });
             }
+            WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                let _ = window.hide();
+                show_tray_notification(window.app_handle());
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("DH BOT 3.0 failed to start");

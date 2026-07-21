@@ -1,14 +1,15 @@
 # DH BOT 3.0 Rust + Tauri migration workspace
 
-This directory contains the DH BOT 3.0 Rust + Tauri beta.1. The Go/Win32
-application remains the production implementation for 2.7.x.
+This directory contains the DH BOT 3.0 Rust + Tauri beta.1. The production
+application is Rust/Tauri only; the former Go 2.7 implementation is preserved
+by the repository tag `go-2.7-final`.
 
 ## Target layout
 
 - `src-tauri/`: Rust application shell, SQLite, tray, single-instance and
   protocol services.
 - `src/`: React + TypeScript GPT-style workspace UI.
-- `contracts/`: versioned JSON fixtures shared by Go and Rust tests.
+- `contracts/`: versioned, redacted protocol fixtures plus archived Go expectations.
 
 The 3.0 beta deliberately uses a clean database at `%APPDATA%\\DH\\3.0\\dh.db`.
 On first run it archives legacy `dh.db` and `secrets.dat` under
@@ -26,3 +27,15 @@ pnpm test
 pnpm tauri:dev
 pnpm tauri:build
 ```
+
+Production and internal developer packages are separate build channels:
+
+```sh
+pnpm tauri:build:production   # real wangshangliao, port 9222, no Fixture feature
+pnpm tauri:build:developer    # internal DH BOT Dev + DH-Fixture
+pnpm test:production-isolation
+```
+
+The production build clears staged developer resources, compiles `dh-bot` with
+no default Cargo features, and scans the frontend and Windows artifacts for
+Fixture commands, ports and data paths before release.

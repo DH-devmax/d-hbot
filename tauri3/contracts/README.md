@@ -11,7 +11,24 @@ The first frozen contracts are:
 - `GroupSchedule`: local daily open/close times, group bindings and idempotent
   run key.
 
-The fixture files are `group_gateway_v1.json`, `ai_provider_v1.json`,
-`prediction_v1.json` and `schedule_v1.json`. Rust tests validate their version
-and shape without opening the Go runtime; protocol replay against a real
-旺商聊 session remains an alpha acceptance step.
+The fixture files are `group_gateway_v1.json`, `group_gateway_v2.json`,
+`ai_provider_v1.json`, `prediction_v1.json` and `schedule_v1.json`.
+
+`group_gateway_v2.json` freezes the application file version, page title/URL,
+main-script SHA-256, request, transport envelope, business envelope, normalized
+receipt, callbacks and expected normalized state. Capability calibration uses
+the exact `(appFileVersion, mainScriptSha256)` pair. A new or changed build is
+`Unverified` until its sanitized trace is replayed successfully.
+
+Raw traces belong in `contracts/raw/`, whose contents are ignored by Git. Before
+adding or updating a frozen trace, run:
+
+```text
+node scripts/sanitize-contract-capture.mjs contracts/raw/TRACE.json contracts/TRACE.sanitized.json
+node scripts/sanitize-contract-capture.mjs --self-test
+```
+
+The sanitizer sorts object keys, assigns stable `ACCOUNT/GROUP/USER/NIM/MESSAGE`
+placeholders, and stops when it finds API keys, authorization values, cookies,
+passwords, tokens or private keys. Review the sanitized file before replacing a
+frozen contract; raw traces must remain local.

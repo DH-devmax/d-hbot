@@ -15,7 +15,7 @@ export default function RulesPage({ accountId, groups, onError }: { accountId: s
   useEffect(() => { void reload() }, [accountId])
   const current = rules.find(rule => rule.id === selected) || null
   const update = (patch: Partial<Rule>) => { if (!current) return; setRules(values => values.map(rule => rule.id === current.id ? { ...rule, ...patch } : rule)) }
-  const create = () => { const rule = blankRule(accountId); setRules(values => [...values, rule]); setSelected(0) }
+  const create = () => { const rule = blankRule(accountId); setRules(values => [...values, rule]); setSelected(0); setState('ready') }
   const save = async () => { if (!current || !current.name.trim() || !current.pattern.trim()) { onError('规则名称和匹配内容不能为空'); return }; setSaving(true); try { const id = await api.saveRule(current); setRules(values => values.map(rule => rule === current ? { ...rule, id } : rule)); setSelected(id); await reload() } catch (reason) { onError(readableError(reason)) } finally { setSaving(false) } }
   const remove = async () => { if (!current?.id || !window.confirm(`确认删除规则“${current.name}”？`)) return; try { await api.deleteRule(accountId, current.id); await reload() } catch (reason) { onError(readableError(reason)) } }
   const exportRules = async () => { try { const payload = await api.exportRules(accountId, rules); download('dh-rules.json', payload) } catch (reason) { onError(readableError(reason)) } }

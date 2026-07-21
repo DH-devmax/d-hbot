@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Serialize;
 
@@ -44,34 +44,39 @@ pub fn evaluate_utc(
     } else {
         current >= close && current < open
     };
-    let (last_action, next_action, next_date, next_time) = if should_mute {
-        let next_date = if current < open {
-            current_local.date()
-        } else {
-            current_local.date().succ_opt().unwrap()
-        };
-        ("close", "open", next_date, open)
-    } else {
-        let next_date = if current < close {
-            current_local.date()
-        } else {
-            current_local.date().succ_opt().unwrap()
-        };
-        ("open", "close", next_date, close)
-    };
+    let today = current_local.date();
+    let yesterday = today
+        .pred_opt()
+        .ok_or_else(|| AppError::new("schedule_time", "日期超出计划范围"))?;
+    let tomorrow = today
+        .succ_opt()
+        .ok_or_else(|| AppError::new("schedule_time", "日期超出计划范围"))?;
+    let boundaries = [
+        (yesterday.and_time(open), "open", yesterday, open),
+        (yesterday.and_time(close), "close", yesterday, close),
+        (today.and_time(open), "open", today, open),
+        (today.and_time(close), "close", today, close),
+        (tomorrow.and_time(open), "open", tomorrow, open),
+        (tomorrow.and_time(close), "close", tomorrow, close),
+    ];
+    let (_, last_action, last_date, _) = boundaries
+        .iter()
+        .filter(|(boundary, _, _, _)| *boundary <= current_local)
+        .max_by_key(|(boundary, _, _, _)| *boundary)
+        .copied()
+        .ok_or_else(|| AppError::new("schedule_time", "未找到最近计划边界"))?;
+    let (_, next_action, next_date, next_time) = boundaries
+        .iter()
+        .filter(|(boundary, _, _, _)| *boundary > current_local)
+        .min_by_key(|(boundary, _, _, _)| *boundary)
+        .copied()
+        .ok_or_else(|| AppError::new("schedule_time", "未找到下一计划边界"))?;
     let local_next_utc = if let Some(zone) = timezone {
-        zone.from_local_datetime(&next_date.and_time(next_time))
-            .earliest()
-            .ok_or_else(|| AppError::new("schedule_timezone", "下一次计划时间在当前时区不存在"))?
-            .with_timezone(&Utc)
+        resolve_tz_boundary(zone, next_date.and_time(next_time))?
     } else {
-        Local
-            .from_local_datetime(&next_date.and_time(next_time))
-            .earliest()
-            .ok_or_else(|| AppError::new("schedule_timezone", "下一次计划时间在当前时区不存在"))?
-            .with_timezone(&Utc)
+        resolve_local_boundary(next_date.and_time(next_time))?
     };
-    let run_date = current_local.format("%Y-%m-%d");
+    let run_date = last_date.format("%Y-%m-%d");
     Ok(ScheduleDecision {
         should_mute,
         last_action: last_action.into(),
@@ -79,6 +84,34 @@ pub fn evaluate_utc(
         next_at: local_next_utc,
         run_key: format!("{}:{}:{}:{}", schedule.id, group_id, run_date, last_action),
     })
+}
+
+fn resolve_tz_boundary(zone: Tz, value: NaiveDateTime) -> AppResult<DateTime<Utc>> {
+    resolve_boundary(value, |candidate| zone.from_local_datetime(candidate))
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn resolve_local_boundary(value: NaiveDateTime) -> AppResult<DateTime<Utc>> {
+    resolve_boundary(value, |candidate| Local.from_local_datetime(candidate))
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn resolve_boundary<T: TimeZone>(
+    value: NaiveDateTime,
+    resolve: impl Fn(&NaiveDateTime) -> LocalResult<DateTime<T>>,
+) -> AppResult<DateTime<T>> {
+    let mut candidate = value;
+    for _ in 0..=180 {
+        match resolve(&candidate) {
+            LocalResult::Single(datetime) => return Ok(datetime),
+            LocalResult::Ambiguous(first, second) => return Ok(first.min(second)),
+            LocalResult::None => candidate += chrono::Duration::minutes(1),
+        }
+    }
+    Err(AppError::new(
+        "schedule_timezone",
+        "下一次计划时间无有效时区映射",
+    ))
 }
 
 fn parse_time(value: &str) -> AppResult<NaiveTime> {
@@ -150,5 +183,47 @@ mod tests {
         value.timezone = "Asia/Shanghai".into();
         let utc = Utc.with_ymd_and_hms(2026, 7, 20, 0, 30, 0).unwrap();
         assert!(!evaluate_utc(&value, 7, utc).unwrap().should_mute);
+    }
+
+    #[test]
+    fn cross_midnight_run_key_uses_the_actual_last_boundary_date() {
+        let mut value = schedule("20:00", "02:00");
+        value.timezone = "Asia/Shanghai".into();
+        let after_midnight = Utc.with_ymd_and_hms(2026, 7, 20, 17, 0, 0).unwrap();
+        let decision = evaluate_utc(&value, 7, after_midnight).unwrap();
+        assert!(!decision.should_mute);
+        assert_eq!(decision.last_action, "open");
+        assert_eq!(decision.run_key, "1:7:2026-07-20:open");
+        assert_eq!(decision.next_action, "close");
+        assert_eq!(
+            decision.next_at,
+            Utc.with_ymd_and_hms(2026, 7, 20, 18, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn spring_forward_moves_a_missing_boundary_to_first_valid_minute() {
+        let mut value = schedule("01:00", "02:30");
+        value.timezone = "America/New_York".into();
+        let before_gap = Utc.with_ymd_and_hms(2026, 3, 8, 6, 30, 0).unwrap();
+        let decision = evaluate_utc(&value, 7, before_gap).unwrap();
+        assert!(!decision.should_mute);
+        assert_eq!(decision.next_action, "close");
+        assert_eq!(
+            decision.next_at,
+            Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn fall_back_chooses_the_earliest_ambiguous_boundary() {
+        let mut value = schedule("00:30", "01:30");
+        value.timezone = "America/New_York".into();
+        let before_first_close = Utc.with_ymd_and_hms(2026, 11, 1, 5, 0, 0).unwrap();
+        let decision = evaluate_utc(&value, 7, before_first_close).unwrap();
+        assert_eq!(
+            decision.next_at,
+            Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap()
+        );
     }
 }

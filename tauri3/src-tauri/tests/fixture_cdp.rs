@@ -4,7 +4,9 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use dh_bot_lib::fixture::FIXTURE_GROUP;
-use dh_bot_lib::gateway::{CdpClient, CdpGateway, ConnectionStatus, GroupGateway, RuntimeGateway};
+use dh_bot_lib::gateway::{
+    CapabilityStatus, CdpClient, CdpGateway, ConnectionStatus, GroupGateway, RuntimeGateway,
+};
 use serde_json::json;
 
 struct FixtureProcess(Option<Child>);
@@ -33,10 +35,14 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let gateway = CdpGateway::new(CdpClient::new(devtools_base).unwrap());
     let diagnostic = gateway.diagnose().await;
+    let contract: serde_json::Value =
+        serde_json::from_str(include_str!("../../contracts/group_gateway_v2.json")).unwrap();
     assert_eq!(
         diagnostic.status,
         dh_bot_lib::gateway::ConnectionStatus::Ready
     );
+    assert_eq!(diagnostic.page_title, contract["metadata"]["pageTitle"]);
+    assert_eq!(diagnostic.page_url, format!("{http_base}/"));
     assert_eq!(
         gateway.session_identity().await.unwrap().1,
         "fixture-nim-10001"
@@ -45,7 +51,7 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert_eq!(groups.len(), 1);
     let roster = gateway.list_members(FIXTURE_GROUP).await.unwrap();
     assert_eq!(roster.reported_count, 16);
-    gateway
+    let rename_receipt = gateway
         .rename(
             FIXTURE_GROUP,
             &dh_bot_lib::models::MemberRef {
@@ -56,13 +62,18 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         )
         .await
         .unwrap();
-    gateway.mute(FIXTURE_GROUP, 10006, 600).await.unwrap();
-    gateway
+    assert_eq!(rename_receipt.status, "succeeded");
+    assert!(!rename_receipt.request_id.is_empty());
+    let mute_receipt = gateway.mute(FIXTURE_GROUP, 10006, 600).await.unwrap();
+    assert_eq!(mute_receipt.business_code, Some(0));
+    let send_receipt = gateway
         .send_text(FIXTURE_GROUP, "Fixture 发送测试")
         .await
         .unwrap();
-    assert!(gateway.capabilities().rename);
-    assert!(gateway.capabilities().mute);
+    assert!(!send_receipt.request_id.is_empty());
+    assert!(!send_receipt.message_id.is_empty());
+    assert_eq!(gateway.capabilities().rename, CapabilityStatus::Supported);
+    assert_eq!(gateway.capabilities().mute, CapabilityStatus::Supported);
 
     let client = reqwest::Client::new();
     client
@@ -115,5 +126,35 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert!(!partial.complete);
     assert_eq!(partial.resolved_count, 8);
     assert_eq!(partial.reported_count, 17);
+
+    client
+        .post(format!("{http_base}/fixture/reset"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    for sequence in 1..=101_u64 {
+        client
+            .post(format!("{http_base}/fixture/events/message"))
+            .json(&json!({
+                "version": 1,
+                "sequence": sequence,
+                "serverMessageId": format!("cdp-batch-{sequence}"),
+                "text": format!("batch-{sequence}")
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let first = gateway.read_batch().await.unwrap();
+    assert_eq!(first.records.len(), 100);
+    assert_eq!(first.records.last().unwrap().sequence, 100);
+    gateway.ack(&first.session, 100).await.unwrap();
+    let second = gateway.read_batch().await.unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].sequence, 101);
     process.0.as_mut().unwrap().kill().unwrap();
 }

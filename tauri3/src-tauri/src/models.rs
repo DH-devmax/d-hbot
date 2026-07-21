@@ -70,11 +70,28 @@ pub struct MemberRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum RosterCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct MemberRoster {
     pub members: Vec<Member>,
     pub reported_count: usize,
     pub resolved_count: usize,
     pub complete: bool,
+    pub completeness: RosterCompleteness,
+    pub completeness_reason: String,
+    pub http_returned_count: usize,
+    pub http_reported_count: usize,
+    pub http_cursor: Option<String>,
+    pub nim_returned_count: usize,
+    pub nim_reported_count: usize,
+    pub nim_cursor: Option<String>,
+    pub authority: String,
     pub sources: Vec<String>,
 }
 
@@ -98,6 +115,12 @@ pub struct Message {
     pub attempts: i64,
     pub next_attempt_at: Option<DateTime<Utc>>,
     pub last_error: String,
+    #[serde(default = "default_json_array")]
+    pub mentions_json: String,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +129,81 @@ pub struct PersistedMessage {
     pub id: i64,
     pub inserted: bool,
     pub processed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayInboxEvent {
+    pub account_id: String,
+    pub bridge_session: String,
+    pub bridge_sequence: i64,
+    pub event_id: String,
+    pub event_type: String,
+    pub payload_json: String,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayInboxItem {
+    pub id: i64,
+    pub account_id: String,
+    pub bridge_session: String,
+    pub bridge_sequence: i64,
+    pub event_id: String,
+    pub event_type: String,
+    pub payload_json: String,
+    pub state: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub received_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub processed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchIngestResult {
+    pub inserted: usize,
+    pub duplicates: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectOutboxRequest {
+    pub account_id: String,
+    pub group_id: i64,
+    pub effect_type: String,
+    pub payload_json: String,
+    pub dedupe_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectOutboxItem {
+    pub id: i64,
+    pub account_id: String,
+    pub group_id: i64,
+    pub effect_type: String,
+    pub payload_json: String,
+    pub dedupe_key: String,
+    pub state: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub receipt_json: String,
+    pub created_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueuedEffect {
+    pub id: i64,
+    pub inserted: bool,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,6 +259,20 @@ pub struct KnowledgeDocument {
     pub content: String,
     pub source: String,
     pub content_hash: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeChunk {
+    pub id: i64,
+    pub document_id: i64,
+    pub chunk_index: i64,
+    pub content: String,
+    pub content_hash: String,
+    pub token_count: i64,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,6 +358,22 @@ pub struct DailySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct UniqueRun {
+    pub id: i64,
+    pub account_id: String,
+    pub group_id: i64,
+    pub run_key: String,
+    pub state: String,
+    pub attempts: i64,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditEvent {
     pub id: i64,
     pub account_id: String,
@@ -273,6 +401,7 @@ pub struct ActionRecord {
     pub reason: String,
     pub success: bool,
     pub error: String,
+    pub receipt_json: String,
     pub dedupe_key: String,
     pub created_at: DateTime<Utc>,
 }
@@ -361,4 +490,12 @@ pub struct PredictionResult {
     pub confidence: f64,
     pub updated_at: DateTime<Utc>,
     pub freshness: String,
+}
+
+fn default_json_array() -> String {
+    "[]".into()
+}
+
+fn default_true() -> bool {
+    true
 }

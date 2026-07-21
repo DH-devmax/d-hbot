@@ -3,6 +3,10 @@ run-name: DH BOT Windows production - ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "tauri3/**"
+      - ".github/workflows/tauri-windows.yml"
   push:
     tags:
       - "v3.*"
@@ -28,10 +32,33 @@ jobs:
           cache: pnpm
           cache-dependency-path: tauri3/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Verify production build boundary
+        run: pnpm verify:production:boundary
+      - name: Test production isolation scanner
+        run: pnpm test:production-isolation
+      - name: Test Contract v2 sanitizer
+        run: pnpm test:contract-sanitizer
+      - name: Test React pages and interactions
+        run: pnpm test:ui
       - run: pnpm test:production
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
       - run: pnpm tauri:build:production
-      - run: pnpm package:windows:production
+      - name: Prepare Authenticode certificate
+        if: startsWith(github.ref, 'refs/tags/v3.')
+        shell: pwsh
+        env:
+          DH_SIGN_PFX_B64: ${{ secrets.DH_SIGN_PFX_B64 }}
+          DH_SIGN_PASSWORD_SECRET: ${{ secrets.DH_SIGN_PASSWORD }}
+        run: |
+          if (-not $env:DH_SIGN_PFX_B64) { throw '正式标签发布缺少 DH_SIGN_PFX_B64' }
+          $path = Join-Path $env:RUNNER_TEMP 'dh-signing.pfx'
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:DH_SIGN_PFX_B64))
+          "DH_SIGN_PFX=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DH_SIGN_PASSWORD=$env:DH_SIGN_PASSWORD_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Package and deeply scan production artifacts
+        run: pnpm package:windows:production
+      - name: Recheck Windows production artifacts
+        run: pnpm verify:windows:production
       - uses: actions/upload-artifact@v4
         with:
           name: DH-BOT-3.0.0-beta.1-windows-production

@@ -22,8 +22,20 @@ jobs:
           cache: pnpm
           cache-dependency-path: tauri3/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Verify production build boundary
+        run: pnpm verify:production:boundary
+      - name: Test production isolation scanner
+        run: pnpm test:production-isolation
+      - name: Test Contract v2 sanitizer
+        run: pnpm test:contract-sanitizer
+      - name: Test React pages and interactions
+        run: pnpm test:ui
       - run: pnpm test:fixture
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+      - name: Install developer browser test runtime
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Test developer Fixture workflows
+        run: pnpm test:e2e:fixture
       - run: pnpm tauri:build:developer
       - run: pnpm package:windows:developer
       - uses: actions/upload-artifact@v4

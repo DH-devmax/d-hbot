@@ -1,13 +1,13 @@
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 
-use crate::database::Database;
+use crate::database::{Database, DatabaseExecutor};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ActionRecord, AuditEvent, DailySummary, GroupAiPermissions, GroupSchedule, KnowledgeBase,
-    KnowledgeBinding, KnowledgeDocument, Message, ModerationRule, RuleAction, ScheduleRun,
-    TaskItem,
+    KnowledgeBinding, KnowledgeChunk, KnowledgeDocument, Message, ModerationRule, RuleAction,
+    ScheduleRun, TaskItem, UniqueRun,
 };
 
 impl Database {
@@ -101,8 +101,8 @@ impl Database {
         limit: usize,
     ) -> AppResult<Vec<Message>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error FROM messages WHERE account_id=? AND (?2 IS NULL OR group_id=?2) ORDER BY received_at DESC,id DESC LIMIT ?3")?;
-            let rows = statement.query_map(params![account_id, group_id, limit.clamp(1, 1000) as i64], |row| Ok(Message { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, server_message_id: row.get(3)?, sequence: row.get(4)?, user_id: row.get(5)?, sender_name: row.get(6)?, kind: row.get(7)?, text: row.get(8)?, sent_at: parse_time(row.get::<_, String>(9)?), received_at: parse_time(row.get::<_, String>(10)?), processed_at: optional_time(row.get(11)?), acknowledged_at: optional_time(row.get(12)?), processing_state: row.get(13)?, attempts: row.get(14)?, next_attempt_at: optional_time(row.get(15)?), last_error: row.get(16)? }))?;
+            let mut statement = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=? AND (?2 IS NULL OR group_id=?2) ORDER BY received_at DESC,id DESC LIMIT ?3")?;
+            let rows = statement.query_map(params![account_id, group_id, limit.clamp(1, 1000) as i64], |row| Ok(Message { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, server_message_id: row.get(3)?, sequence: row.get(4)?, user_id: row.get(5)?, sender_name: row.get(6)?, kind: row.get(7)?, text: row.get(8)?, sent_at: parse_time(row.get::<_, String>(9)?), received_at: parse_time(row.get::<_, String>(10)?), processed_at: optional_time(row.get(11)?), acknowledged_at: optional_time(row.get(12)?), processing_state: row.get(13)?, attempts: row.get(14)?, next_attempt_at: optional_time(row.get(15)?), last_error: row.get(16)?, mentions_json: row.get(17)?, source_kind: row.get(18)?, flow: row.get(19)? }))?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("messages_read", error.to_string()))
     }
@@ -125,30 +125,42 @@ impl Database {
         Ok(messages)
     }
 
-    pub fn record_rule_runtime(
+    pub fn rule_cooldown_allows(
         &self,
         rule_id: i64,
         account_id: &str,
         group_id: i64,
         user_id: i64,
         now: DateTime<Utc>,
-        window_seconds: i64,
+        cooldown_seconds: i64,
     ) -> AppResult<bool> {
         self.with_connection(|connection| {
-            let existing: Option<(Option<String>, i64, Option<String>)> = connection.query_row(
-                "SELECT window_started_at,window_count,last_executed_at FROM rule_runtime_state WHERE rule_id=? AND account_id=? AND group_id=? AND user_id=?",
+            let last_executed: Option<String> = connection.query_row(
+                "SELECT last_executed_at FROM rule_runtime_state WHERE rule_id=? AND account_id=? AND group_id=? AND user_id=?",
                 params![rule_id, account_id, group_id, user_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).optional()?;
-            let cooldown_blocked = existing.as_ref().and_then(|(_, _, last)| last.as_deref()).and_then(|last| chrono::DateTime::parse_from_rfc3339(last).ok()).map(|last| now.signed_duration_since(last.with_timezone(&Utc)).num_seconds() < window_seconds).unwrap_or(false);
-            if cooldown_blocked {
-                return Ok(false);
-            }
+                |row| row.get(0),
+            ).optional()?.flatten();
+            Ok(last_executed
+                .and_then(|last| chrono::DateTime::parse_from_rfc3339(&last).ok())
+                .map(|last| now.signed_duration_since(last.with_timezone(&Utc)).num_seconds() >= cooldown_seconds)
+                .unwrap_or(true))
+        }).map_err(|error| AppError::new("rule_runtime", error.to_string()))
+    }
+
+    pub fn mark_rule_executed(
+        &self,
+        rule_id: i64,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        now: DateTime<Utc>,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO rule_runtime_state(rule_id,account_id,group_id,user_id,window_started_at,window_count,last_executed_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(rule_id,account_id,group_id,user_id) DO UPDATE SET window_started_at=excluded.window_started_at,window_count=rule_runtime_state.window_count+1,last_executed_at=excluded.last_executed_at,updated_at=excluded.updated_at",
                 params![rule_id, account_id, group_id, user_id, now.to_rfc3339(), 1_i64, now.to_rfc3339(), now.to_rfc3339()],
             )?;
-            Ok(true)
+            Ok(())
         }).map_err(|error| AppError::new("rule_runtime", error.to_string()))
     }
 
@@ -272,7 +284,7 @@ impl Database {
             )?;
             let new_id = transaction.last_insert_rowid();
             transaction.execute(
-                "INSERT INTO knowledge_documents(base_id,title,kind,content,source,content_hash,created_at,updated_at) SELECT ?,title,kind,content,source,content_hash,created_at,updated_at FROM knowledge_documents WHERE base_id=?",
+                "INSERT INTO knowledge_documents(base_id,title,kind,content,source,content_hash,enabled,created_at,updated_at) SELECT ?,title,kind,content,source,content_hash,enabled,created_at,updated_at FROM knowledge_documents WHERE base_id=?",
                 params![new_id, base_id],
             )?;
             transaction.commit()?;
@@ -325,10 +337,10 @@ impl Database {
             }
             let now = Utc::now().to_rfc3339();
             if document.id > 0 {
-                connection.execute("UPDATE knowledge_documents SET title=?,kind=?,content=?,source=?,content_hash=?,updated_at=? WHERE id=? AND base_id=?", params![document.title,document.kind,document.content,document.source,hash,now,document.id,document.base_id])?;
+                connection.execute("UPDATE knowledge_documents SET title=?,kind=?,content=?,source=?,content_hash=?,enabled=?,updated_at=? WHERE id=? AND base_id=?", params![document.title,document.kind,document.content,document.source,hash,bool_i(document.enabled),now,document.id,document.base_id])?;
                 Ok(document.id)
             } else {
-                connection.execute("INSERT INTO knowledge_documents(base_id,title,kind,content,source,content_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(base_id,content_hash) DO UPDATE SET title=excluded.title,kind=excluded.kind,source=excluded.source,updated_at=excluded.updated_at", params![document.base_id,document.title,document.kind,document.content,document.source,hash,now,now])?;
+                connection.execute("INSERT INTO knowledge_documents(base_id,title,kind,content,source,content_hash,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(base_id,content_hash) DO UPDATE SET title=excluded.title,kind=excluded.kind,source=excluded.source,enabled=excluded.enabled,updated_at=excluded.updated_at", params![document.base_id,document.title,document.kind,document.content,document.source,hash,bool_i(document.enabled),now,now])?;
                 connection.query_row("SELECT id FROM knowledge_documents WHERE base_id=? AND content_hash=?", params![document.base_id,hash], |row| row.get(0))
             }
         }).map_err(|error| AppError::new("knowledge_write", error.to_string()))
@@ -348,7 +360,7 @@ impl Database {
     pub fn list_knowledge_documents(&self, base_id: i64) -> AppResult<Vec<KnowledgeDocument>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT d.id,d.base_id,b.name,d.title,d.kind,d.content,d.source,d.content_hash FROM knowledge_documents d JOIN knowledge_bases b ON b.id=d.base_id WHERE d.base_id=? ORDER BY d.title,d.id",
+                "SELECT d.id,d.base_id,b.name,d.title,d.kind,d.content,d.source,d.content_hash,d.enabled FROM knowledge_documents d JOIN knowledge_bases b ON b.id=d.base_id WHERE d.base_id=? ORDER BY d.title,d.id",
             )?;
             let rows = statement.query_map(params![base_id], |row| {
                 Ok(KnowledgeDocument {
@@ -360,11 +372,68 @@ impl Database {
                     content: row.get(5)?,
                     source: row.get(6)?,
                     content_hash: row.get(7)?,
+                    enabled: row.get::<_, i64>(8)? != 0,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
         })
         .map_err(|error| AppError::new("knowledge_documents_read", error.to_string()))
+    }
+
+    pub fn replace_knowledge_chunks(
+        &self,
+        document_id: i64,
+        chunks: &[KnowledgeChunk],
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM knowledge_chunks WHERE document_id=?",
+                params![document_id],
+            )?;
+            let now = Utc::now().to_rfc3339();
+            for (position, chunk) in chunks.iter().enumerate() {
+                let chunk_index = if chunk.chunk_index >= 0 {
+                    chunk.chunk_index
+                } else {
+                    position as i64
+                };
+                transaction.execute(
+                    "INSERT INTO knowledge_chunks(document_id,chunk_index,content,content_hash,token_count,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    params![document_id,chunk_index,chunk.content,chunk.content_hash,chunk.token_count,bool_i(chunk.enabled),now,now],
+                )?;
+            }
+            transaction.commit()
+        })
+        .map_err(|error| AppError::new("knowledge_chunks_write", error.to_string()))
+    }
+
+    pub fn list_knowledge_chunks(
+        &self,
+        document_id: i64,
+        enabled_only: bool,
+    ) -> AppResult<Vec<KnowledgeChunk>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,document_id,chunk_index,content,content_hash,token_count,enabled FROM knowledge_chunks WHERE document_id=? AND (?2=0 OR enabled=1) ORDER BY chunk_index,id",
+            )?;
+            let rows = statement.query_map(
+                params![document_id, bool_i(enabled_only)],
+                |row| {
+                    Ok(KnowledgeChunk {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        chunk_index: row.get(2)?,
+                        content: row.get(3)?,
+                        content_hash: row.get(4)?,
+                        token_count: row.get(5)?,
+                        enabled: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| AppError::new("knowledge_chunks_read", error.to_string()))
     }
 
     pub fn bind_knowledge_base(
@@ -404,9 +473,28 @@ impl Database {
     pub fn save_task(&self, task: &TaskItem) -> AppResult<i64> {
         self.with_connection(|connection| {
             let now = Utc::now().to_rfc3339();
-            if task.id > 0 { connection.execute("UPDATE tasks SET title=?,description=?,status=?,assignee_id=?,created_by=?,due_at=?,reminder_at=?,updated_at=? WHERE id=? AND account_id=?", params![task.title,task.description,task.status,task.assignee_id,task.created_by,task.due_at.map(|value| value.to_rfc3339()),task.reminder_at.map(|value| value.to_rfc3339()),now,task.id,task.account_id])?; Ok(task.id) }
+            if task.id > 0 { let reminder_at=task.reminder_at.map(|value| value.to_rfc3339()); connection.execute("UPDATE tasks SET title=?,description=?,status=?,assignee_id=?,created_by=?,due_at=?,reminder_state=CASE WHEN reminder_at IS NOT ? THEN 'pending' ELSE reminder_state END,reminder_attempts=CASE WHEN reminder_at IS NOT ? THEN 0 ELSE reminder_attempts END,reminder_next_attempt_at=CASE WHEN reminder_at IS NOT ? THEN NULL ELSE reminder_next_attempt_at END,reminder_claimed_at=CASE WHEN reminder_at IS NOT ? THEN NULL ELSE reminder_claimed_at END,reminder_last_error=CASE WHEN reminder_at IS NOT ? THEN '' ELSE reminder_last_error END,reminder_sent_at=CASE WHEN reminder_at IS NOT ? THEN NULL ELSE reminder_sent_at END,reminder_at=?,updated_at=? WHERE id=? AND account_id=?", params![task.title,task.description,task.status,task.assignee_id,task.created_by,task.due_at.map(|value| value.to_rfc3339()),reminder_at,reminder_at,reminder_at,reminder_at,reminder_at,reminder_at,reminder_at,now,task.id,task.account_id])?; Ok(task.id) }
             else { connection.execute("INSERT INTO tasks(account_id,group_id,title,description,status,assignee_id,created_by,due_at,reminder_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", params![task.account_id,task.group_id,task.title,task.description,task.status,task.assignee_id,task.created_by,task.due_at.map(|value| value.to_rfc3339()),task.reminder_at.map(|value| value.to_rfc3339()),now,now])?; Ok(connection.last_insert_rowid()) }
         }).map_err(|error| AppError::new("task_write", error.to_string()))
+    }
+
+    pub fn save_task_once(&self, task: &TaskItem, source_key: &str) -> AppResult<i64> {
+        if source_key.trim().is_empty() {
+            return self.save_task(task);
+        }
+        self.with_connection(|connection| {
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT OR IGNORE INTO tasks(account_id,group_id,title,description,status,assignee_id,created_by,due_at,reminder_at,source_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![task.account_id,task.group_id,task.title,task.description,task.status,task.assignee_id,task.created_by,task.due_at.map(|value|value.to_rfc3339()),task.reminder_at.map(|value|value.to_rfc3339()),source_key,now,now],
+            )?;
+            connection.query_row(
+                "SELECT id FROM tasks WHERE account_id=? AND source_key=?",
+                params![task.account_id, source_key],
+                |row| row.get(0),
+            )
+        })
+        .map_err(|error| AppError::new("task_write", error.to_string()))
     }
 
     pub fn claim_due_task_reminders(
@@ -417,14 +505,45 @@ impl Database {
         self.with_connection(|connection| {
             let tx = connection.transaction()?;
             let rows = {
-                let mut statement = tx.prepare("SELECT id,account_id,group_id,title,description,status,assignee_id,created_by,due_at,reminder_at,reminder_sent_at,created_at,updated_at FROM tasks WHERE reminder_at IS NOT NULL AND reminder_at<=? AND reminder_sent_at IS NULL AND status!='done' ORDER BY reminder_at,id LIMIT ?")?;
-                let result = statement.query_map(params![now.to_rfc3339(), limit.clamp(1, 100) as i64], |row| Ok(TaskItem { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, assignee_id: row.get(6)?, created_by: row.get(7)?, due_at: optional_time(row.get(8)?), reminder_at: optional_time(row.get(9)?), reminder_sent_at: optional_time(row.get(10)?), created_at: parse_time(row.get(11)?), updated_at: parse_time(row.get(12)?) }))?.collect::<Result<Vec<_>, _>>()?;
+                let mut statement = tx.prepare("SELECT id,account_id,group_id,title,description,status,assignee_id,created_by,due_at,reminder_at,reminder_sent_at,created_at,updated_at FROM tasks WHERE reminder_at IS NOT NULL AND reminder_at<=? AND reminder_sent_at IS NULL AND reminder_state IN ('pending','retry') AND (reminder_next_attempt_at IS NULL OR reminder_next_attempt_at<=?) AND status!='done' ORDER BY reminder_at,id LIMIT ?")?;
+                let result = statement.query_map(params![now.to_rfc3339(), now.to_rfc3339(), limit.clamp(1, 100) as i64], |row| Ok(TaskItem { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, assignee_id: row.get(6)?, created_by: row.get(7)?, due_at: optional_time(row.get(8)?), reminder_at: optional_time(row.get(9)?), reminder_sent_at: optional_time(row.get(10)?), created_at: parse_time(row.get(11)?), updated_at: parse_time(row.get(12)?) }))?.collect::<Result<Vec<_>, _>>()?;
                 result
             };
-            for task in &rows { tx.execute("UPDATE tasks SET reminder_sent_at=? WHERE id=? AND reminder_sent_at IS NULL", params![now.to_rfc3339(), task.id])?; }
+            for task in &rows { tx.execute("UPDATE tasks SET reminder_state='processing',reminder_attempts=reminder_attempts+1,reminder_claimed_at=?,reminder_next_attempt_at=NULL WHERE id=? AND reminder_sent_at IS NULL AND reminder_state IN ('pending','retry')", params![now.to_rfc3339(), task.id])?; }
             tx.commit()?;
             Ok(rows)
         }).map_err(|error| AppError::new("task_reminder_claim", error.to_string()))
+    }
+
+    pub fn finish_task_reminder(&self, task_id: i64, success: bool, error: &str) -> AppResult<()> {
+        let now = Utc::now();
+        self.with_connection(|connection| {
+            if success {
+                connection.execute(
+                    "UPDATE tasks SET reminder_sent_at=?,reminder_state='sent',reminder_claimed_at=NULL,reminder_next_attempt_at=NULL,reminder_last_error='',updated_at=? WHERE id=? AND reminder_state='processing'",
+                    params![now.to_rfc3339(), now.to_rfc3339(), task_id],
+                )?;
+            } else {
+                let attempts: i64 = connection
+                    .query_row(
+                        "SELECT reminder_attempts FROM tasks WHERE id=?",
+                        params![task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(1);
+                let state = if attempts >= 5 { "failed" } else { "retry" };
+                let next_retry = (attempts < 5).then(|| {
+                    (now + reminder_retry_delay(attempts)).to_rfc3339()
+                });
+                connection.execute(
+                    "UPDATE tasks SET reminder_state=?,reminder_claimed_at=NULL,reminder_next_attempt_at=?,reminder_last_error=?,updated_at=? WHERE id=? AND reminder_state='processing'",
+                    params![state,next_retry,error,now.to_rfc3339(),task_id],
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|error| AppError::new("task_reminder_finish", error.to_string()))
     }
 
     pub fn delete_task(&self, account_id: &str, task_id: i64) -> AppResult<()> {
@@ -451,6 +570,100 @@ impl Database {
         limit: usize,
     ) -> AppResult<Vec<DailySummary>> {
         self.with_connection(|connection|{let mut statement=connection.prepare("SELECT id,account_id,group_id,local_date,content,source,created_at FROM daily_summaries WHERE account_id=? ORDER BY local_date DESC,id DESC LIMIT ?")?;let rows=statement.query_map(params![account_id,limit.clamp(1,100)as i64],|row|Ok(DailySummary{id:row.get(0)?,account_id:row.get(1)?,group_id:row.get(2)?,local_date:row.get(3)?,content:row.get(4)?,source:row.get(5)?,created_at:parse_time(row.get(6)?)}))?;rows.collect::<Result<Vec<_>,_>>()}).map_err(|error|AppError::new("summary_read",error.to_string()))
+    }
+
+    pub fn claim_ai_run(&self, account_id: &str, group_id: i64, run_key: &str) -> AppResult<bool> {
+        self.with_connection(|connection| {
+            claim_unique_run(connection, "ai_runs", account_id, group_id, run_key, false)
+        })
+        .map_err(|error| AppError::new("ai_run_claim", error.to_string()))
+    }
+
+    pub fn finish_ai_run(
+        &self,
+        account_id: &str,
+        run_key: &str,
+        success: bool,
+        error: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            finish_unique_run(
+                connection, "ai_runs", account_id, None, run_key, success, error,
+            )
+        })
+        .map_err(|error| AppError::new("ai_run_finish", error.to_string()))
+    }
+
+    pub fn ai_run(&self, account_id: &str, run_key: &str) -> AppResult<Option<UniqueRun>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id,account_id,group_id,run_key,state,attempts,next_retry_at,last_error,created_at,updated_at,completed_at FROM ai_runs WHERE account_id=? AND run_key=?",
+                    params![account_id, run_key],
+                    unique_run_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("ai_run_read", error.to_string()))
+    }
+
+    pub fn claim_summary_run(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        run_key: &str,
+    ) -> AppResult<bool> {
+        self.with_connection(|connection| {
+            claim_unique_run(
+                connection,
+                "summary_runs",
+                account_id,
+                group_id,
+                run_key,
+                true,
+            )
+        })
+        .map_err(|error| AppError::new("summary_run_claim", error.to_string()))
+    }
+
+    pub fn finish_summary_run(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        run_key: &str,
+        success: bool,
+        error: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            finish_unique_run(
+                connection,
+                "summary_runs",
+                account_id,
+                Some(group_id),
+                run_key,
+                success,
+                error,
+            )
+        })
+        .map_err(|error| AppError::new("summary_run_finish", error.to_string()))
+    }
+
+    pub fn summary_run(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        run_key: &str,
+    ) -> AppResult<Option<UniqueRun>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id,account_id,group_id,run_key,state,attempts,next_retry_at,last_error,created_at,updated_at,completed_at FROM summary_runs WHERE account_id=? AND group_id=? AND run_key=?",
+                    params![account_id, group_id, run_key],
+                    unique_run_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("summary_run_read", error.to_string()))
     }
 
     pub fn list_schedule_runs(
@@ -536,7 +749,7 @@ impl Database {
 
     pub fn record_action(&self, action: &ActionRecord) -> AppResult<i64> {
         self.with_connection(|connection| {
-            connection.execute("INSERT INTO actions(account_id,group_id,user_id,message_id,rule_id,kind,mode,duration_seconds,reason,success,error,dedupe_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,dedupe_key) WHERE dedupe_key<>'' DO UPDATE SET success=excluded.success,error=excluded.error,reason=excluded.reason,created_at=excluded.created_at", params![action.account_id,action.group_id,action.user_id,action.message_id,action.rule_id,action.kind,action.mode,action.duration_seconds,action.reason,bool_i(action.success),action.error,action.dedupe_key,action.created_at.to_rfc3339()])?;
+            connection.execute("INSERT INTO actions(account_id,group_id,user_id,message_id,rule_id,kind,mode,duration_seconds,reason,success,error,receipt_json,dedupe_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,dedupe_key) WHERE dedupe_key<>'' DO UPDATE SET success=excluded.success,error=excluded.error,receipt_json=excluded.receipt_json,reason=excluded.reason,created_at=excluded.created_at", params![action.account_id,action.group_id,action.user_id,action.message_id,action.rule_id,action.kind,action.mode,action.duration_seconds,action.reason,bool_i(action.success),action.error,action.receipt_json,action.dedupe_key,action.created_at.to_rfc3339()])?;
             if action.dedupe_key.is_empty() {
                 Ok(connection.last_insert_rowid())
             } else {
@@ -595,8 +808,348 @@ impl Database {
     }
 }
 
+impl DatabaseExecutor {
+    pub async fn set_setting(&self, key: String, value: String, sensitive: bool) -> AppResult<()> {
+        self.execute(move |database| database.set_setting(&key, &value, sensitive))
+            .await
+    }
+
+    pub async fn set_group_features(
+        &self,
+        account_id: String,
+        group_id: i64,
+        enabled: bool,
+        ai_enabled: bool,
+        moderation_enabled: bool,
+        manual_takeover: bool,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_features(
+                &account_id,
+                group_id,
+                enabled,
+                ai_enabled,
+                moderation_enabled,
+                manual_takeover,
+            )
+        })
+        .await
+    }
+
+    pub async fn set_group_welcome(
+        &self,
+        account_id: String,
+        group_id: i64,
+        welcome_message: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_welcome(&account_id, group_id, &welcome_message)
+        })
+        .await
+    }
+
+    pub async fn save_group_ai_permissions(&self, value: GroupAiPermissions) -> AppResult<()> {
+        self.execute(move |database| database.save_group_ai_permissions(&value))
+            .await
+    }
+
+    pub async fn save_rule(&self, rule: ModerationRule) -> AppResult<i64> {
+        self.execute(move |database| database.save_rule(&rule))
+            .await
+    }
+
+    pub async fn delete_rule(&self, account_id: String, rule_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_rule(&account_id, rule_id))
+            .await
+    }
+
+    pub async fn import_rules(
+        &self,
+        account_id: String,
+        rules: Vec<ModerationRule>,
+    ) -> AppResult<usize> {
+        self.execute(move |database| database.import_rules(&account_id, &rules))
+            .await
+    }
+
+    pub async fn list_knowledge_bases(&self, account_id: String) -> AppResult<Vec<KnowledgeBase>> {
+        self.execute(move |database| database.list_knowledge_bases(&account_id))
+            .await
+    }
+
+    pub async fn create_knowledge_base(&self, base: KnowledgeBase) -> AppResult<i64> {
+        self.execute(move |database| database.create_knowledge_base(&base))
+            .await
+    }
+
+    pub async fn update_knowledge_base(&self, base: KnowledgeBase) -> AppResult<()> {
+        self.execute(move |database| database.update_knowledge_base(&base))
+            .await
+    }
+
+    pub async fn clone_knowledge_base(
+        &self,
+        account_id: String,
+        base_id: i64,
+        name: String,
+    ) -> AppResult<i64> {
+        self.execute(move |database| database.clone_knowledge_base(&account_id, base_id, &name))
+            .await
+    }
+
+    pub async fn delete_knowledge_base(&self, account_id: String, base_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_knowledge_base(&account_id, base_id))
+            .await
+    }
+
+    pub async fn knowledge_base_account(&self, base_id: i64) -> AppResult<String> {
+        self.execute(move |database| database.knowledge_base_account(base_id))
+            .await
+    }
+
+    pub async fn list_knowledge_documents(
+        &self,
+        base_id: i64,
+    ) -> AppResult<Vec<KnowledgeDocument>> {
+        self.execute(move |database| database.list_knowledge_documents(base_id))
+            .await
+    }
+
+    pub async fn upsert_knowledge_document(&self, document: KnowledgeDocument) -> AppResult<i64> {
+        self.execute(move |database| database.upsert_knowledge_document(&document))
+            .await
+    }
+
+    pub async fn delete_knowledge_document(&self, base_id: i64, document_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_knowledge_document(base_id, document_id))
+            .await
+    }
+
+    pub async fn replace_knowledge_chunks(
+        &self,
+        document_id: i64,
+        chunks: Vec<KnowledgeChunk>,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.replace_knowledge_chunks(document_id, &chunks))
+            .await
+    }
+
+    pub async fn bind_knowledge_base(
+        &self,
+        account_id: String,
+        base_id: i64,
+        group_ids: Vec<i64>,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.bind_knowledge_base(base_id, &account_id, &group_ids))
+            .await
+    }
+
+    pub async fn list_knowledge_bindings(
+        &self,
+        account_id: String,
+        base_id: Option<i64>,
+    ) -> AppResult<Vec<KnowledgeBinding>> {
+        self.execute(move |database| database.list_knowledge_bindings(&account_id, base_id))
+            .await
+    }
+
+    pub async fn list_tasks(
+        &self,
+        account_id: String,
+        group_id: Option<i64>,
+    ) -> AppResult<Vec<TaskItem>> {
+        self.execute(move |database| database.list_tasks(&account_id, group_id))
+            .await
+    }
+
+    pub async fn save_task(&self, task: TaskItem) -> AppResult<i64> {
+        self.execute(move |database| database.save_task(&task))
+            .await
+    }
+
+    pub async fn delete_task(&self, account_id: String, task_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_task(&account_id, task_id))
+            .await
+    }
+
+    pub async fn save_schedule(&self, schedule: GroupSchedule) -> AppResult<i64> {
+        self.execute(move |database| database.save_schedule(&schedule))
+            .await
+    }
+
+    pub async fn delete_schedule(&self, account_id: String, schedule_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_schedule(&account_id, schedule_id))
+            .await
+    }
+
+    pub async fn list_schedule_runs(
+        &self,
+        account_id: String,
+        schedule_id: Option<i64>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduleRun>> {
+        self.execute(move |database| database.list_schedule_runs(&account_id, schedule_id, limit))
+            .await
+    }
+
+    pub async fn list_audit(&self, account_id: String, limit: usize) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.list_audit(&account_id, limit))
+            .await
+    }
+
+    pub(crate) async fn query_audit(&self, query: crate::AuditQuery) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.query_audit(&query))
+            .await
+    }
+}
+
 fn value_to_string(value: &Option<DateTime<Utc>>) -> Option<String> {
     value.as_ref().map(DateTime::to_rfc3339)
+}
+
+fn claim_unique_run(
+    connection: &mut Connection,
+    table: &str,
+    account_id: &str,
+    group_id: i64,
+    run_key: &str,
+    group_scoped: bool,
+) -> rusqlite::Result<bool> {
+    let transaction = connection.transaction()?;
+    let now = Utc::now().to_rfc3339();
+    let changed = transaction.execute(
+        &format!("INSERT OR IGNORE INTO {table}(account_id,group_id,run_key,state,attempts,next_retry_at,last_error,created_at,updated_at,completed_at) VALUES(?,?,?,'processing',1,NULL,'',?,?,NULL)"),
+        params![account_id, group_id, run_key, now, now],
+    )?;
+    if changed == 1 {
+        transaction.commit()?;
+        return Ok(true);
+    }
+    let existing: Option<(String, i64, Option<String>)> = if group_scoped {
+        transaction
+            .query_row(
+                &format!("SELECT state,attempts,next_retry_at FROM {table} WHERE account_id=? AND group_id=? AND run_key=?"),
+                params![account_id, group_id, run_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+    } else {
+        transaction
+            .query_row(
+                &format!("SELECT state,attempts,next_retry_at FROM {table} WHERE account_id=? AND run_key=?"),
+                params![account_id, run_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+    };
+    let claim = existing
+        .map(|(state, attempts, next_retry)| {
+            state == "retry"
+                && attempts < 5
+                && next_retry
+                    .as_deref()
+                    .map(|value| value <= now.as_str())
+                    .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    if claim {
+        if group_scoped {
+            transaction.execute(
+                &format!("UPDATE {table} SET state='processing',attempts=attempts+1,next_retry_at=NULL,last_error='',updated_at=? WHERE account_id=? AND group_id=? AND run_key=? AND state='retry'"),
+                params![now, account_id, group_id, run_key],
+            )?;
+        } else {
+            transaction.execute(
+                &format!("UPDATE {table} SET state='processing',attempts=attempts+1,next_retry_at=NULL,last_error='',updated_at=? WHERE account_id=? AND run_key=? AND state='retry'"),
+                params![now, account_id, run_key],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(claim)
+}
+
+fn finish_unique_run(
+    connection: &mut Connection,
+    table: &str,
+    account_id: &str,
+    group_id: Option<i64>,
+    run_key: &str,
+    success: bool,
+    error: &str,
+) -> rusqlite::Result<()> {
+    let now = Utc::now();
+    let attempts: Option<i64> = if let Some(group_id) = group_id {
+        connection
+            .query_row(
+                &format!(
+                    "SELECT attempts FROM {table} WHERE account_id=? AND group_id=? AND run_key=?"
+                ),
+                params![account_id, group_id, run_key],
+                |row| row.get(0),
+            )
+            .optional()?
+    } else {
+        connection
+            .query_row(
+                &format!("SELECT attempts FROM {table} WHERE account_id=? AND run_key=?"),
+                params![account_id, run_key],
+                |row| row.get(0),
+            )
+            .optional()?
+    };
+    let Some(attempts) = attempts else {
+        return Ok(());
+    };
+    let state = if success {
+        "succeeded"
+    } else if attempts >= 5 {
+        "failed"
+    } else {
+        "retry"
+    };
+    let next_retry_at =
+        (!success && attempts < 5).then(|| (now + reminder_retry_delay(attempts)).to_rfc3339());
+    let completed_at = success.then(|| now.to_rfc3339());
+    let last_error = if success { "" } else { error };
+    if let Some(group_id) = group_id {
+        connection.execute(
+            &format!("UPDATE {table} SET state=?,next_retry_at=?,last_error=?,updated_at=?,completed_at=? WHERE account_id=? AND group_id=? AND run_key=? AND state='processing'"),
+            params![state,next_retry_at,last_error,now.to_rfc3339(),completed_at,account_id,group_id,run_key],
+        )?;
+    } else {
+        connection.execute(
+            &format!("UPDATE {table} SET state=?,next_retry_at=?,last_error=?,updated_at=?,completed_at=? WHERE account_id=? AND run_key=? AND state='processing'"),
+            params![state,next_retry_at,last_error,now.to_rfc3339(),completed_at,account_id,run_key],
+        )?;
+    }
+    Ok(())
+}
+
+fn unique_run_from_row(row: &Row<'_>) -> rusqlite::Result<UniqueRun> {
+    Ok(UniqueRun {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        group_id: row.get(2)?,
+        run_key: row.get(3)?,
+        state: row.get(4)?,
+        attempts: row.get(5)?,
+        next_retry_at: optional_time(row.get(6)?),
+        last_error: row.get(7)?,
+        created_at: parse_time(row.get(8)?),
+        updated_at: parse_time(row.get(9)?),
+        completed_at: optional_time(row.get(10)?),
+    })
+}
+
+fn reminder_retry_delay(attempts: i64) -> chrono::Duration {
+    chrono::Duration::seconds(match attempts {
+        0 | 1 => 5,
+        2 => 30,
+        3 => 120,
+        4 => 600,
+        _ => 1800,
+    })
 }
 
 fn bool_i(value: bool) -> i64 {
@@ -732,6 +1285,7 @@ mod tests {
             reason: "test".into(),
             success: false,
             error: "temporary".into(),
+            receipt_json: r#"{"status":"failed"}"#.into(),
             dedupe_key: "message:9:rule:3:action:recall".into(),
             created_at: now,
         };
@@ -739,8 +1293,211 @@ mod tests {
         assert!(!database.action_succeeded("a", &action.dedupe_key).unwrap());
         action.success = true;
         action.error.clear();
+        action.receipt_json = r#"{"requestId":"request-2","status":"succeeded"}"#.into();
         let second = database.record_action(&action).unwrap();
         assert_eq!(first, second);
         assert!(database.action_succeeded("a", &action.dedupe_key).unwrap());
+        let receipt: String = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT receipt_json FROM actions WHERE id=?",
+                    params![first],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(receipt.contains("request-2"));
+    }
+
+    #[test]
+    fn rule_cooldown_starts_only_after_a_successful_effect() {
+        let database = database();
+        let now = Utc::now();
+        let rule_id = database
+            .save_rule(&ModerationRule {
+                id: 0,
+                account_id: "a".into(),
+                group_id: 1,
+                name: "cooldown".into(),
+                matcher: "contains".into(),
+                pattern: "x".into(),
+                threshold: 0,
+                count: 0,
+                window_seconds: 0,
+                cooldown_seconds: 60,
+                priority: 1,
+                mode: "automatic".into(),
+                enabled: true,
+                semantic_threshold: 0.8,
+                exempt_roles: Vec::new(),
+                exempt_user_ids: Vec::new(),
+                actions: Vec::new(),
+            })
+            .unwrap();
+        assert!(database
+            .rule_cooldown_allows(rule_id, "a", 1, 2, now, 60)
+            .unwrap());
+        assert!(database
+            .rule_cooldown_allows(rule_id, "a", 1, 2, now, 60)
+            .unwrap());
+        database
+            .mark_rule_executed(rule_id, "a", 1, 2, now)
+            .unwrap();
+        assert!(!database
+            .rule_cooldown_allows(rule_id, "a", 1, 2, now + chrono::Duration::seconds(59), 60,)
+            .unwrap());
+        assert!(database
+            .rule_cooldown_allows(rule_id, "a", 1, 2, now + chrono::Duration::seconds(60), 60,)
+            .unwrap());
+    }
+
+    #[test]
+    fn task_reminder_is_completed_only_after_success() {
+        let database = database();
+        let now = Utc::now();
+        let task_id = database
+            .save_task(&TaskItem {
+                id: 0,
+                account_id: "a".into(),
+                group_id: 1,
+                title: "remind".into(),
+                description: String::new(),
+                status: "pending".into(),
+                assignee_id: 2,
+                created_by: 1,
+                due_at: None,
+                reminder_at: Some(now - chrono::Duration::minutes(1)),
+                reminder_sent_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let claimed = database.claim_due_task_reminders(now, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        database
+            .finish_task_reminder(task_id, false, "temporary")
+            .unwrap();
+        let (sent_at, state): (Option<String>, String) = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT reminder_sent_at,reminder_state FROM tasks WHERE id=?",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert!(sent_at.is_none());
+        assert_eq!(state, "retry");
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE tasks SET reminder_next_attempt_at=? WHERE id=?",
+                    params![now.to_rfc3339(), task_id],
+                )
+            })
+            .unwrap();
+        assert_eq!(database.claim_due_task_reminders(now, 10).unwrap().len(), 1);
+        database.finish_task_reminder(task_id, true, "").unwrap();
+        let task = database.list_tasks("a", Some(1)).unwrap().pop().unwrap();
+        assert!(task.reminder_sent_at.is_some());
+        assert!(database
+            .claim_due_task_reminders(Utc::now(), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ai_and_summary_runs_are_unique() {
+        let database = database();
+        assert!(database.claim_ai_run("a", 1, "message:1").unwrap());
+        assert!(!database.claim_ai_run("a", 1, "message:1").unwrap());
+        database.finish_ai_run("a", "message:1", true, "").unwrap();
+        assert_eq!(
+            database.ai_run("a", "message:1").unwrap().unwrap().state,
+            "succeeded"
+        );
+        assert!(!database.claim_ai_run("a", 1, "message:1").unwrap());
+
+        assert!(database.claim_summary_run("a", 1, "2026-07-21").unwrap());
+        assert!(!database.claim_summary_run("a", 1, "2026-07-21").unwrap());
+        database
+            .finish_summary_run("a", 1, "2026-07-21", true, "")
+            .unwrap();
+        assert_eq!(
+            database
+                .summary_run("a", 1, "2026-07-21")
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn knowledge_chunks_replace_as_one_transaction() {
+        let database = database();
+        let base_id = database
+            .create_knowledge_base(&KnowledgeBase {
+                id: 0,
+                account_id: "a".into(),
+                name: "base".into(),
+                description: String::new(),
+                enabled: true,
+                built_in: false,
+                read_only: false,
+            })
+            .unwrap();
+        let document_id = database
+            .upsert_knowledge_document(&KnowledgeDocument {
+                id: 0,
+                base_id,
+                base_name: "base".into(),
+                title: "doc".into(),
+                kind: "text".into(),
+                content: "one two".into(),
+                source: String::new(),
+                content_hash: "doc-hash".into(),
+                enabled: true,
+            })
+            .unwrap();
+        database
+            .replace_knowledge_chunks(
+                document_id,
+                &[
+                    KnowledgeChunk {
+                        id: 0,
+                        document_id,
+                        chunk_index: 0,
+                        content: "one".into(),
+                        content_hash: "one".into(),
+                        token_count: 1,
+                        enabled: true,
+                    },
+                    KnowledgeChunk {
+                        id: 0,
+                        document_id,
+                        chunk_index: 1,
+                        content: "two".into(),
+                        content_hash: "two".into(),
+                        token_count: 1,
+                        enabled: false,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .list_knowledge_chunks(document_id, false)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            database
+                .list_knowledge_chunks(document_id, true)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

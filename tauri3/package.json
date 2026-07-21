@@ -4,9 +4,12 @@
   "private": true,
   "scripts": {
     "build": "pnpm build:production",
-    "build:production": "vite build --mode production",
+    "build:production": "vite build --mode production && node scripts/verify-production.mjs dist --allow-no-executable",
     "build:developer": "vite build --mode developer",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --config vitest.config.ts --passWithNoTests",
+    "test:ui": "pnpm test",
+    "test:e2e:fixture": "playwright test --config playwright.fixture.config.ts",
+    "test:contract-sanitizer": "node scripts/sanitize-contract-capture.mjs --self-test",
     "test:fixture": "cargo test --manifest-path src-tauri/Cargo.toml --features fixture",
     "test:production": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
     "dev": "vite --mode production --host 127.0.0.1",
@@ -15,12 +18,17 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "pnpm tauri:build:production",
     "build:fixture-resource": "cargo build --manifest-path src-tauri/Cargo.toml --release --features fixture --bin dh-fixture && node scripts/stage-fixture.mjs",
+    "build:rust:production": "cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --bin dh-bot",
     "clean:bundle": "node scripts/clean-bundle.mjs",
-    "tauri:build:production": "pnpm clean:bundle && tauri build",
+    "clean:production": "node scripts/prepare-production.mjs",
+    "verify:production:boundary": "node scripts/verify-build-boundary.mjs",
+    "test:production-isolation": "node scripts/test-production-isolation.mjs",
+    "tauri:build:production": "pnpm verify:production:boundary && pnpm clean:production && pnpm build:rust:production && tauri build -- --no-default-features",
     "tauri:build:developer": "pnpm build:fixture-resource && pnpm clean:bundle && tauri build --features fixture --config src-tauri/tauri.fixture.conf.json",
     "package:windows:production": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel production",
     "package:windows:developer": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel developer",
-    "verify:production": "node scripts/verify-production.mjs"
+    "verify:production": "node scripts/verify-production.mjs",
+    "verify:windows:production": "pwsh -NoProfile -File scripts/verify-windows-production.ps1 -ArtifactDirectory dist/production"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -29,8 +37,13 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@testing-library/jest-dom": "^6.8.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
     "@tauri-apps/cli": "^2.11.4",
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.1.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.0",
     "vitest": "^3.2.6"

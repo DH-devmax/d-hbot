@@ -1,10 +1,13 @@
 /build/
 /dist/
 /output/
+/tmp/
 *.log
 tauri3/node_modules/
 tauri3/src-tauri/target/
 tauri3/dist/
+tauri3/test-results/
+tauri3/playwright-report/
 tauri3/src-tauri/gen/
 tauri3/src-tauri/resources/tools/
 output/playwright/

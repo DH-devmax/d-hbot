@@ -6,9 +6,17 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{AiDecision, AiTask, RuleAction};
+use crate::models::{AiDecision, AiTask, Message, RuleAction};
 
 pub const PERSONA: &str = include_str!("../../../AGENTS.md");
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionMetadata {
+    pub alias: String,
+    pub start: usize,
+    pub end: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +70,56 @@ impl AiRequest {
             knowledge: Vec::new(),
         }
     }
+}
+
+pub fn mention_metadata(text: &str) -> Option<MentionMetadata> {
+    let matcher = regex::Regex::new(r"(?i)@\s*dh").expect("static mention regex");
+    let found = matcher.find_iter(text).find_map(|matched| {
+        let boundary = text[matched.end()..].chars().next();
+        if boundary.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_') {
+            return None;
+        }
+        Some(MentionMetadata {
+            alias: text[matched.start()..matched.end()].to_string(),
+            start: matched.start(),
+            end: matched.end(),
+        })
+    });
+    found
+}
+
+pub fn message_without_mention(text: &str) -> String {
+    let Some(metadata) = mention_metadata(text) else {
+        return text.trim().to_string();
+    };
+    let mut message = String::with_capacity(text.len() - (metadata.end - metadata.start));
+    message.push_str(&text[..metadata.start]);
+    message.push_str(&text[metadata.end..]);
+    message.trim().to_string()
+}
+
+/// Builds a chronological, bounded context from messages in any input order.
+pub fn build_recent_context(messages: &[Message], limit: usize) -> Vec<AiContextMessage> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut sorted = messages.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        left.sent_at
+            .cmp(&right.sent_at)
+            .then(left.sequence.cmp(&right.sequence))
+            .then(left.id.cmp(&right.id))
+    });
+    let start = sorted.len().saturating_sub(limit);
+    sorted[start..]
+        .iter()
+        .map(|message| AiContextMessage {
+            user_id: message.user_id,
+            name: message.sender_name.clone(),
+            text: message.text.clone(),
+            time: message.sent_at.timestamp_millis(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -187,9 +245,7 @@ impl ConfiguredProvider {
 #[async_trait]
 impl AiProvider for ConfiguredProvider {
     async fn decide(&self, request: &AiRequest) -> AppResult<AiDecision> {
-        if request.message.trim().is_empty() {
-            return Err(AppError::new("ai_request", "AI 测试内容为空"));
-        }
+        validate_request(request)?;
         if self.config.webhook_url.trim().is_empty() {
             self.decide_openai(request).await
         } else {
@@ -262,15 +318,54 @@ impl From<WireDecision> for AiDecision {
     }
 }
 
-fn decode_decision(content: &str) -> AppResult<AiDecision> {
+pub fn decode_decision(content: &str) -> AppResult<AiDecision> {
     let wire: WireDecision = serde_json::from_str(content.trim())
         .map_err(|error| AppError::new("ai_response", format!("解析 AI 返回内容失败：{error}")))?;
     validate_decision(wire.into())
 }
 
-fn validate_decision(decision: AiDecision) -> AppResult<AiDecision> {
-    if !(0.0..=1.0).contains(&decision.confidence) {
+pub fn validate_request(request: &AiRequest) -> AppResult<()> {
+    if request.version != "1" {
+        return Err(AppError::new("ai_request", "AI 请求版本不受支持"));
+    }
+    if request.event_id.trim().is_empty() || request.message_id.trim().is_empty() {
+        return Err(AppError::new("ai_request", "AI 请求缺少事件或消息标识"));
+    }
+    if request.message.trim().is_empty() {
+        return Err(AppError::new("ai_request", "AI 测试内容为空"));
+    }
+    if request.message.chars().count() > 16_000 {
+        return Err(AppError::new("ai_request", "AI 请求内容过长"));
+    }
+    if request.recent_context.len() > 200 || request.knowledge.len() > 32 {
+        return Err(AppError::new("ai_request", "AI 上下文超出数量限制"));
+    }
+    if request
+        .recent_context
+        .iter()
+        .any(|message| message.text.chars().count() > 16_000)
+        || request
+            .knowledge
+            .iter()
+            .any(|chunk| chunk.text.chars().count() > 8_000)
+    {
+        return Err(AppError::new("ai_request", "AI 上下文单项内容过长"));
+    }
+    Ok(())
+}
+
+pub fn validate_decision(decision: AiDecision) -> AppResult<AiDecision> {
+    if !decision.confidence.is_finite() || !(0.0..=1.0).contains(&decision.confidence) {
         return Err(AppError::new("ai_response", "AI 置信度必须在 0 到 1 之间"));
+    }
+    if decision.reply.chars().count() > 4_000
+        || decision.actions.len() > 32
+        || decision.tasks.len() > 32
+    {
+        return Err(AppError::new(
+            "ai_response",
+            "AI 返回内容超出数量或长度限制",
+        ));
     }
     let allowed = [
         "recall",
@@ -295,6 +390,9 @@ fn validate_decision(decision: AiDecision) -> AppResult<AiDecision> {
                 "AI 禁言时长必须在 1 分钟到 30 天之间",
             ));
         }
+        if action.message.chars().count() > 4_000 {
+            return Err(AppError::new("ai_response", "AI 动作消息过长"));
+        }
     }
     if decision
         .tasks
@@ -307,17 +405,7 @@ fn validate_decision(decision: AiDecision) -> AppResult<AiDecision> {
 }
 
 pub fn is_mentioned(text: &str) -> bool {
-    let normalized = text.to_lowercase().replace("@ dh", "@dh");
-    let bytes = normalized.as_bytes();
-    let mut offset = 0;
-    while let Some(index) = normalized[offset..].find("@dh") {
-        let end = offset + index + 3;
-        if end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_' {
-            return true;
-        }
-        offset = end;
-    }
-    false
+    mention_metadata(text).is_some()
 }
 
 fn completion_url(raw: &str) -> AppResult<String> {
@@ -382,5 +470,66 @@ mod tests {
             r#"{"reply":"ok","actions":[],"tasks":[],"confidence":0.5,"reason":"ok","extra":1}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn mention_metadata_preserves_exact_alias_and_byte_offsets() {
+        let text = "前缀 @ DH 预测";
+        let metadata = mention_metadata(text).unwrap();
+        assert_eq!(metadata.alias, "@ DH");
+        assert_eq!(&text[metadata.start..metadata.end], "@ DH");
+        assert_eq!(message_without_mention(text), "前缀  预测");
+    }
+
+    #[test]
+    fn mention_detection_is_case_insensitive_but_rejects_identifier_suffixes() {
+        assert!(is_mentioned("@dh 你好"));
+        assert!(is_mentioned("请 @Dh 帮忙"));
+        for text in ["DH", "@DH_bot", "@DH2", "预测"] {
+            assert!(!is_mentioned(text), "unexpected mention: {text}");
+        }
+    }
+
+    fn context_message(id: i64, sequence: i64, seconds: i64, text: &str) -> Message {
+        let sent_at = chrono::DateTime::from_timestamp(seconds, 0).unwrap();
+        Message {
+            id,
+            account_id: "a".into(),
+            group_id: 1,
+            server_message_id: format!("m{id}"),
+            sequence,
+            user_id: id,
+            sender_name: format!("成员{id}"),
+            kind: "text".into(),
+            text: text.into(),
+            sent_at,
+            received_at: sent_at,
+            processed_at: None,
+            acknowledged_at: None,
+            processing_state: "done".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: "[]".into(),
+            source_kind: Some("text".into()),
+            flow: Some("in".into()),
+        }
+    }
+
+    #[test]
+    fn recent_context_is_chronological_and_bounded() {
+        let messages = vec![
+            context_message(3, 3, 30, "third"),
+            context_message(1, 1, 10, "first"),
+            context_message(2, 2, 20, "second"),
+        ];
+        assert_eq!(
+            build_recent_context(&messages, 2)
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+        assert!(build_recent_context(&messages, 0).is_empty());
     }
 }

@@ -12,6 +12,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": [],
     "windows": { "webviewInstallMode": { "type": "offlineInstaller" } }
   }
 }

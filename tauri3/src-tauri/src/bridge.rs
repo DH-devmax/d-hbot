@@ -13,8 +13,12 @@ use crate::error::AppError;
 use crate::gateway::RuntimeGateway;
 use crate::models::MemberRef;
 
-pub fn spawn(gateway: Arc<dyn RuntimeGateway>, shutdown: Arc<Notify>, logger: Logger) {
-    tauri::async_runtime::spawn(async move {
+pub fn spawn(
+    gateway: Arc<dyn RuntimeGateway>,
+    shutdown: Arc<Notify>,
+    logger: Logger,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let router = Router::new()
             .route("/ping", get(ping))
             .route("/v1/group/get-group-list", post(list_groups))
@@ -49,7 +53,7 @@ pub fn spawn(gateway: Arc<dyn RuntimeGateway>, shutdown: Arc<Notify>, logger: Lo
         {
             logger.write("ERROR", &format!("本地诊断桥退出：{error}"));
         }
-    });
+    })
 }
 
 type BridgeResponse = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -98,7 +102,7 @@ async fn send_text(
     gateway
         .send_text(input.group_id, &input.text)
         .await
-        .map(|message_id| success(json!({"messageId":message_id})))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 
@@ -116,7 +120,7 @@ async fn recall(
     gateway
         .recall(input.group_id, input.user_id, &input.message_id)
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 
@@ -134,7 +138,7 @@ async fn mute(
     gateway
         .mute(input.group_id, input.user_id, input.duration_seconds)
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 
@@ -151,7 +155,7 @@ async fn unmute(
     gateway
         .unmute(input.group_id, input.user_id)
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 async fn remove_member(
@@ -161,7 +165,7 @@ async fn remove_member(
     gateway
         .remove_member(input.group_id, input.user_id)
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 
@@ -187,7 +191,7 @@ async fn rename(
             &input.nickname,
         )
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 
@@ -204,7 +208,7 @@ async fn set_group_mute(
     gateway
         .set_group_mute(input.group_id, input.muted)
         .await
-        .map(|_| success(Value::Null))
+        .map(|receipt| success(json!(receipt)))
         .map_err(failure)
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,13 +7,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
+use crate::contracts::ContractReplayEngine;
 use crate::error::{AppError, AppResult};
-use crate::gateway::{DiagnosticSnapshot, GatewayCapabilities, GroupGateway, RuntimeGateway};
-use crate::models::{Group, Member, MemberRef, MemberRoster};
+use crate::gateway::{
+    DiagnosticSnapshot, GatewayBatch, GatewayCapabilities, GatewayEvent, GatewayReceipt,
+    GatewayRecord, GatewayRecordKind, GroupGateway, RuntimeGateway,
+};
+use crate::models::{Group, Member, MemberRef, MemberRoster, RosterCompleteness};
 
 pub const FIXTURE_ACCOUNT: &str = "fixture-nim-10001";
 pub const FIXTURE_GROUP: i64 = 1_143_980;
 pub const FIXTURE_DEVTOOLS_URL: &str = "http://127.0.0.1:9233";
+const FIXTURE_SESSION: &str = "fixture-session-1";
 
 fn fixture_now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 21, 0, 0, 0)
@@ -44,30 +49,88 @@ pub struct FixtureAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FixtureEvent {
+    pub kind: String,
+    pub group_id: i64,
+    pub user_id: i64,
+    pub sequence: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixtureMemberMute {
+    pub group_id: i64,
+    pub user_id: i64,
+    pub duration_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixtureMessageOptions {
+    pub msg_format: i64,
+    pub flow: String,
+    pub scene: String,
+    pub decoded: bool,
+    pub source: String,
+}
+
+impl Default for FixtureMessageOptions {
+    fn default() -> Self {
+        Self {
+            msg_format: 0,
+            flow: "in".into(),
+            scene: "team".into(),
+            decoded: true,
+            source: "onmsg".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FixtureSnapshot {
     pub groups: Vec<Group>,
     pub members: Vec<Member>,
     pub queued_messages: usize,
+    pub queued_events: usize,
     pub actions: Vec<FixtureAction>,
+    pub events: Vec<FixtureEvent>,
+    pub member_mutes: Vec<FixtureMemberMute>,
+    pub group_mutes: Vec<i64>,
+    pub recalled_messages: Vec<String>,
     pub faults: FixtureFaults,
 }
 
 #[derive(Debug)]
 struct FixtureState {
     groups: Vec<Group>,
-    members: HashMap<(i64, i64), Member>,
-    messages: VecDeque<Value>,
+    members: BTreeMap<(i64, i64), Member>,
+    queue: BTreeMap<u64, GatewayRecord>,
+    seen_message_ids: BTreeMap<String, u64>,
     actions: Vec<FixtureAction>,
+    events: Vec<FixtureEvent>,
+    member_mutes: BTreeMap<(i64, i64), i64>,
+    group_mutes: BTreeSet<i64>,
+    recalled_messages: BTreeSet<String>,
     faults: FixtureFaults,
     next_sequence: u64,
+    delivered_event_sequence: u64,
 }
 
 #[derive(Clone)]
 pub struct FixtureGateway {
     state: Arc<RwLock<FixtureState>>,
+    contract: Arc<ContractReplayEngine>,
+    capabilities: GatewayCapabilities,
 }
 
 impl FixtureGateway {
+    fn receipt(&self, route: &str, ordinal: usize, message_id: String) -> GatewayReceipt {
+        self.contract
+            .success_receipt(route, ordinal, message_id)
+            .expect("Fixture action must exist in frozen Contract v2")
+    }
+
     pub fn new_default() -> Self {
         let now = fixture_now();
         let group = Group {
@@ -82,7 +145,7 @@ impl FixtureGateway {
             welcome_message: "欢迎 @「[成员]」加入 DH Fixture 测试群。".into(),
             updated_at: now,
         };
-        let mut members = HashMap::new();
+        let mut members = BTreeMap::new();
         for user_id in 10001..=10016 {
             let role = if user_id == 10001 {
                 "owner"
@@ -128,20 +191,40 @@ impl FixtureGateway {
                 },
             );
         }
+        let contract = Arc::new(ContractReplayEngine::frozen());
+        let metadata = contract.metadata();
+        let capabilities =
+            contract.capabilities_for(&metadata.app_file_version, &metadata.main_script_sha256);
         Self {
             state: Arc::new(RwLock::new(FixtureState {
                 groups: vec![group],
                 members,
-                messages: VecDeque::new(),
+                queue: BTreeMap::new(),
+                seen_message_ids: BTreeMap::new(),
                 actions: Vec::new(),
+                events: Vec::new(),
+                member_mutes: BTreeMap::new(),
+                group_mutes: BTreeSet::new(),
+                recalled_messages: BTreeSet::new(),
                 faults: FixtureFaults {
                     devtools_ready: true,
                     nim_ready: true,
                     ..FixtureFaults::default()
                 },
                 next_sequence: 1,
+                delivered_event_sequence: 0,
             })),
+            contract,
+            capabilities,
         }
+    }
+
+    pub fn new_with_calibration(app_file_version: &str, main_script_sha256: &str) -> Self {
+        let mut fixture = Self::new_default();
+        fixture.capabilities = fixture
+            .contract
+            .capabilities_for(app_file_version, main_script_sha256);
+        fixture
     }
 
     pub async fn set_faults(&self, faults: FixtureFaults) {
@@ -153,8 +236,31 @@ impl FixtureGateway {
         FixtureSnapshot {
             groups: state.groups.clone(),
             members: state.members.values().cloned().collect(),
-            queued_messages: state.messages.len(),
+            queued_messages: state
+                .queue
+                .values()
+                .filter(|record| record.kind == GatewayRecordKind::Message)
+                .count(),
+            queued_events: state
+                .queue
+                .values()
+                .filter(|record| record.kind != GatewayRecordKind::Message)
+                .count(),
             actions: state.actions.clone(),
+            events: state.events.clone(),
+            member_mutes: state
+                .member_mutes
+                .iter()
+                .map(
+                    |(&(group_id, user_id), &duration_seconds)| FixtureMemberMute {
+                        group_id,
+                        user_id,
+                        duration_seconds,
+                    },
+                )
+                .collect(),
+            group_mutes: state.group_mutes.iter().copied().collect(),
+            recalled_messages: state.recalled_messages.iter().cloned().collect(),
             faults: state.faults.clone(),
         }
     }
@@ -171,11 +277,48 @@ impl FixtureGateway {
         sequence: Option<u64>,
         server_message_id: Option<String>,
     ) -> AppResult<u64> {
+        self.emit_message_variant(
+            group_id,
+            user_id,
+            text,
+            sequence,
+            server_message_id,
+            FixtureMessageOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn emit_message_variant(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        text: &str,
+        sequence: Option<u64>,
+        server_message_id: Option<String>,
+        options: FixtureMessageOptions,
+    ) -> AppResult<u64> {
         let mut state = self.state.write().await;
         if !state.groups.iter().any(|group| group.group_id == group_id) {
             return Err(AppError::new("group_not_found", "Fixture 群不存在"));
         }
+        let server_message_id = server_message_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "fixture-message-{}",
+                    sequence.unwrap_or(state.next_sequence)
+                )
+            });
+        if let Some(existing) = state.seen_message_ids.get(&server_message_id) {
+            return Ok(*existing);
+        }
         let sequence = sequence.unwrap_or(state.next_sequence);
+        if sequence == 0 || state.queue.contains_key(&sequence) {
+            return Err(AppError::new(
+                "fixture_sequence",
+                "Fixture 消息序号必须为非零且不重复",
+            ));
+        }
         state.next_sequence = state.next_sequence.max(sequence.saturating_add(1));
         let member_name = state
             .members
@@ -183,18 +326,40 @@ impl FixtureGateway {
             .map(|member| member.card_name.clone())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| format!("Fixture成员{user_id}"));
-        state.messages.push_back(json!({
-            "seq": sequence,
-            "idServer": server_message_id.unwrap_or_else(|| format!("fixture-message-{sequence}")),
-            "fromNick": member_name,
-            "time": fixture_now().timestamp_millis() + sequence as i64,
-            "decoded": {
-                "from": {"id": user_id, "name": member_name},
+        let decoded = options.decoded.then(|| {
+            json!({
+                "from": {"id": user_id, "name": member_name.clone()},
                 "to": {"id": group_id},
                 "content": {"data": text},
-                "msgFormat": 0
-            }
-        }));
+                "msgFormat": options.msg_format,
+                "msgSession": 2
+            })
+        });
+        let payload = json!({
+            "idServer": server_message_id.clone(),
+            "fromNick": member_name,
+            "time": fixture_now().timestamp_millis() + sequence as i64,
+            "from": user_id.to_string(),
+            "to": group_id.to_string(),
+            "flow": options.flow,
+            "scene": options.scene,
+            "type": "custom",
+            "text": text,
+            "content": text,
+            "msgFormat": options.msg_format,
+            "decoded": decoded
+        });
+        state.seen_message_ids.insert(server_message_id, sequence);
+        state.queue.insert(
+            sequence,
+            GatewayRecord {
+                session: FIXTURE_SESSION.into(),
+                sequence,
+                kind: GatewayRecordKind::Message,
+                source: options.source,
+                payload,
+            },
+        );
         Ok(sequence)
     }
 
@@ -251,14 +416,35 @@ impl FixtureGateway {
         if let Some(value) = role.filter(|value| !value.trim().is_empty()) {
             member.role = value;
         }
-        let _ = member;
-        state.actions.push(Self::action(
-            "member_joined",
-            group_id,
-            user_id,
-            &display_name,
-            0,
-        ));
+        member.join_source = "online-joined".into();
+        member.joined_at = Some(fixture_now());
+        member.last_seen_at = fixture_now();
+        let member = member.clone();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        state
+            .events
+            .push(Self::event("member_joined", group_id, user_id, sequence));
+        state.queue.insert(
+            sequence,
+            GatewayRecord {
+                session: FIXTURE_SESSION.into(),
+                sequence,
+                kind: GatewayRecordKind::TeamMemberJoined,
+                source: "onaddteammembers".into(),
+                payload: json!({
+                    "teamId": format!("fixture-cloud-{group_id}"),
+                    "groupId": group_id,
+                    "members": [{
+                        "nimId": member.nim_id,
+                        "userId": member.user_id,
+                        "nickname": member.card_name,
+                        "type": member.role,
+                    }],
+                    "confirmed": true,
+                }),
+            },
+        );
         Ok(())
     }
 
@@ -269,11 +455,86 @@ impl FixtureGateway {
             .get_mut(&(group_id, user_id))
             .ok_or_else(|| AppError::new("member_not_found", "Fixture 成员不存在"))?;
         member.present = false;
+        member.last_seen_at = fixture_now();
         member.updated_at = fixture_now();
+        let member = member.clone();
+        state.member_mutes.remove(&(group_id, user_id));
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
         state
-            .actions
-            .push(Self::action("member_left", group_id, user_id, "", 0));
+            .events
+            .push(Self::event("member_left", group_id, user_id, sequence));
+        state.queue.insert(
+            sequence,
+            GatewayRecord {
+                session: FIXTURE_SESSION.into(),
+                sequence,
+                kind: GatewayRecordKind::TeamMemberLeft,
+                source: "onremoveteammembers".into(),
+                payload: Self::member_event_payload(group_id, &member),
+            },
+        );
         Ok(())
+    }
+
+    pub async fn member_updated(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        name: Option<String>,
+        role: Option<String>,
+        account_state: Option<String>,
+        blacklisted: Option<bool>,
+    ) -> AppResult<()> {
+        let mut state = self.state.write().await;
+        let member = state
+            .members
+            .get_mut(&(group_id, user_id))
+            .ok_or_else(|| AppError::new("member_not_found", "Fixture 成员不存在"))?;
+        if let Some(value) = name.filter(|value| !value.trim().is_empty()) {
+            member.nickname = value.clone();
+            member.card_name = value;
+        }
+        if let Some(value) = role.filter(|value| !value.trim().is_empty()) {
+            member.role = value;
+        }
+        if let Some(value) = account_state.filter(|value| !value.trim().is_empty()) {
+            member.account_state = value;
+        }
+        if let Some(value) = blacklisted {
+            member.blacklisted = value;
+        }
+        member.last_seen_at = fixture_now();
+        member.updated_at = fixture_now();
+        let member = member.clone();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        state
+            .events
+            .push(Self::event("member_updated", group_id, user_id, sequence));
+        state.queue.insert(
+            sequence,
+            GatewayRecord {
+                session: FIXTURE_SESSION.into(),
+                sequence,
+                kind: GatewayRecordKind::TeamMemberUpdated,
+                source: "onupdateteammember".into(),
+                payload: Self::member_event_payload(group_id, &member),
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn wire_batch(&self) -> Value {
+        let state = self.state.read().await;
+        let records = state.queue.values().take(100).cloned().collect::<Vec<_>>();
+        json!({
+            "ok": true,
+            "session": FIXTURE_SESSION,
+            "records": records,
+            "remaining": state.queue.len(),
+            "dropped": 0,
+        })
     }
 
     pub async fn wire_group_list(&self) -> Value {
@@ -339,77 +600,132 @@ impl FixtureGateway {
     pub async fn wire_route(&self, route: &str, payload: Value) -> AppResult<Value> {
         {
             let mut state = self.state.write().await;
-            Self::fault_error(&mut state.faults)?;
+            if state.faults.timeout_next {
+                state.faults.timeout_next = false;
+                return Err(AppError::new("fixture_timeout", "Fixture 注入了超时").retryable());
+            }
+            if state.faults.permission_denied {
+                return Ok(Self::business_error(403, 403, "Fixture 注入了权限不足"));
+            }
         }
-        match route {
-            "/v1/group/get-group-list" => Ok(json!({"code":0,"data":self.wire_group_list().await})),
-            "/v1/group/get-group-members" => Ok(
-                json!({"code":0,"data":self.wire_group_members(payload.get("groupId").and_then(Value::as_i64).unwrap_or(FIXTURE_GROUP)).await}),
-            ),
-            "/v1/group/set-member-mute" => {
-                self.mute(
-                    payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                    payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
-                    payload.get("min").and_then(Value::as_i64).unwrap_or(0) * 60,
-                )
-                .await?;
-                Ok(json!({"code":0,"data":{}}))
-            }
-            "/v1/group/member-mute-cancel" => {
-                self.unmute(
-                    payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                    payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
-                )
-                .await?;
-                Ok(json!({"code":0,"data":{}}))
-            }
-            "/v1/group/set-member-nickname" => {
-                self.rename(
-                    payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                    &MemberRef {
-                        user_id: payload.get("userId").and_then(Value::as_i64),
-                        nim_id: None,
-                    },
-                    payload
-                        .get("nick")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                )
-                .await?;
-                Ok(json!({"code":0,"data":{}}))
-            }
-            "/v1/group/remove-group-member" => {
-                for user_id in payload
-                    .get("groupMemberIds")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_i64)
-                {
-                    self.remove_member(
+        self.contract.validate_request(route, &payload)?;
+        let result: AppResult<Value> = async {
+            match route {
+                "/v1/group/get-group-list" => Ok(self.wire_group_list().await),
+                "/v1/group/get-group-members" => Ok(self
+                    .wire_group_members(
+                        payload
+                            .get("groupId")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(FIXTURE_GROUP),
+                    )
+                    .await),
+                "/v1/group/set-member-mute" => {
+                    self.mute(
                         payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                        user_id,
+                        payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
+                        payload.get("min").and_then(Value::as_i64).unwrap_or(0) * 60,
                     )
                     .await?;
+                    Ok(json!({}))
                 }
-                Ok(json!({"code":0,"data":{}}))
+                "/v1/group/member-mute-cancel" => {
+                    self.unmute(
+                        payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                        payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
+                    )
+                    .await?;
+                    Ok(json!({}))
+                }
+                "/v1/group/set-member-nickname" => {
+                    self.rename(
+                        payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                        &MemberRef {
+                            user_id: payload.get("userId").and_then(Value::as_i64),
+                            nim_id: None,
+                        },
+                        payload
+                            .get("nick")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .await?;
+                    Ok(json!({}))
+                }
+                "/v1/group/message-rollback" => {
+                    self.recall(
+                        payload
+                            .get("groupId")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(FIXTURE_GROUP),
+                        payload.get("userId").and_then(Value::as_i64).unwrap_or(0),
+                        payload
+                            .get("msgId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .await?;
+                    Ok(json!({}))
+                }
+                "/v1/group/remove-group-member" => {
+                    for user_id in payload
+                        .get("groupMemberIds")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_i64)
+                    {
+                        self.remove_member(
+                            payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                            user_id,
+                        )
+                        .await?;
+                    }
+                    Ok(json!({}))
+                }
+                "/v1/group/set-group-mute" => {
+                    self.set_group_mute(
+                        payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                        payload
+                            .get("muteMode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            == "MUTE_MEMBER",
+                    )
+                    .await?;
+                    Ok(json!({}))
+                }
+                _ => Err(AppError::new(
+                    "fixture_route",
+                    format!("Fixture 未实现路由：{route}"),
+                )),
             }
-            "/v1/group/set-group-mute" => {
-                self.set_group_mute(
-                    payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
-                    payload
-                        .get("muteMode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        == "MUTE_MEMBER",
-                )
-                .await?;
-                Ok(json!({"code":0,"data":{}}))
-            }
-            _ => Err(AppError::new(
-                "fixture_route",
-                format!("Fixture 未实现路由：{route}"),
+        }
+        .await;
+        match result {
+            Ok(data) => Ok(Self::business_ok(data)),
+            Err(error) => Ok(Self::business_error(
+                Self::business_status(&error),
+                Self::business_status(&error),
+                &error.message,
             )),
+        }
+    }
+
+    fn business_ok(data: Value) -> Value {
+        json!({"code":0,"errno":0,"msg":"ok","data":data})
+    }
+
+    fn business_error(code: i64, errno: i64, message: &str) -> Value {
+        json!({"code":code,"errno":errno,"msg":message,"data":null})
+    }
+
+    fn business_status(error: &AppError) -> i64 {
+        match error.code.as_str() {
+            "management_required" => 403,
+            "member_not_found" | "group_not_found" | "fixture_route" => 404,
+            "invalid_argument" | "member_identity" => 400,
+            _ => 500,
         }
     }
 
@@ -443,6 +759,32 @@ impl FixtureGateway {
             created_at: fixture_now().to_rfc3339(),
         }
     }
+
+    fn event(kind: &str, group_id: i64, user_id: i64, sequence: u64) -> FixtureEvent {
+        FixtureEvent {
+            kind: kind.into(),
+            group_id,
+            user_id,
+            sequence,
+            created_at: fixture_now().to_rfc3339(),
+        }
+    }
+
+    fn member_event_payload(group_id: i64, member: &Member) -> Value {
+        json!({
+            "teamId": format!("fixture-cloud-{group_id}"),
+            "groupId": group_id,
+            "members": [{
+                "nimId": member.nim_id,
+                "userId": member.user_id,
+                "nickname": member.card_name,
+                "type": member.role,
+                "accountState": member.account_state,
+                "present": member.present,
+            }],
+            "confirmed": true,
+        })
+    }
 }
 
 #[async_trait]
@@ -470,23 +812,71 @@ impl GroupGateway for FixtureGateway {
             resolved_count: members.len(),
             reported_count,
             complete: members.len() == reported_count,
+            completeness: if members.len() == reported_count {
+                RosterCompleteness::Complete
+            } else {
+                RosterCompleteness::Partial
+            },
+            completeness_reason: if members.len() == reported_count {
+                "Fixture 权威完整名单".into()
+            } else {
+                "Fixture 注入了部分成员名单".into()
+            },
+            http_returned_count: members.len(),
+            http_reported_count: reported_count,
+            http_cursor: None,
+            nim_returned_count: members.len(),
+            nim_reported_count: reported_count,
+            nim_cursor: None,
+            authority: if members.len() == reported_count {
+                "authoritative"
+            } else {
+                "partial"
+            }
+            .into(),
             members,
             sources: vec!["fixture-http".into(), "fixture-nim".into()],
         })
     }
 
-    async fn send_text(&self, group_id: i64, text: &str) -> AppResult<String> {
+    async fn send_text(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            return Err(AppError::new("group_not_found", "Fixture 群不存在"));
+        }
+        if text.trim().is_empty() {
+            return Err(AppError::new("invalid_argument", "Fixture 发送内容为空"));
+        }
         state
             .actions
             .push(Self::action("send_text", group_id, 0, text, 0));
-        Ok(format!("fixture-delivery-{}", state.actions.len()))
+        let ordinal = state.actions.len();
+        Ok(self.receipt(
+            "nim.sendCustomMsg",
+            ordinal,
+            format!("fixture-delivery-{ordinal}"),
+        ))
     }
 
-    async fn recall(&self, group_id: i64, sender_user_id: i64, message_id: &str) -> AppResult<()> {
+    async fn recall(
+        &self,
+        group_id: i64,
+        sender_user_id: i64,
+        message_id: &str,
+    ) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            return Err(AppError::new("group_not_found", "Fixture 群不存在"));
+        }
+        if sender_user_id <= 0 || message_id.trim().is_empty() {
+            return Err(AppError::new("invalid_argument", "Fixture 撤回参数无效"));
+        }
+        state.queue.retain(|_, record| {
+            record.payload.get("idServer").and_then(Value::as_str) != Some(message_id)
+        });
+        state.recalled_messages.insert(message_id.into());
         state.actions.push(Self::action(
             "recall",
             group_id,
@@ -494,12 +884,41 @@ impl GroupGateway for FixtureGateway {
             message_id,
             0,
         ));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/message-rollback",
+            state.actions.len(),
+            message_id.into(),
+        ))
     }
 
-    async fn mute(&self, group_id: i64, user_id: i64, duration_seconds: i64) -> AppResult<()> {
+    async fn mute(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        duration_seconds: i64,
+    ) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
+        let member = state
+            .members
+            .get(&(group_id, user_id))
+            .filter(|member| member.present)
+            .ok_or_else(|| AppError::new("member_not_found", "Fixture 成员不存在"))?;
+        if member.role == "owner" {
+            return Err(AppError::new(
+                "management_required",
+                "Fixture 群主不可被禁言",
+            ));
+        }
+        if duration_seconds <= 0 {
+            return Err(AppError::new(
+                "invalid_argument",
+                "Fixture 禁言时长必须大于零",
+            ));
+        }
+        state
+            .member_mutes
+            .insert((group_id, user_id), duration_seconds);
         state.actions.push(Self::action(
             "mute",
             group_id,
@@ -507,19 +926,36 @@ impl GroupGateway for FixtureGateway {
             "",
             duration_seconds,
         ));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/set-member-mute",
+            state.actions.len(),
+            String::new(),
+        ))
     }
 
-    async fn unmute(&self, group_id: i64, user_id: i64) -> AppResult<()> {
+    async fn unmute(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
+        if !state.members.contains_key(&(group_id, user_id)) {
+            return Err(AppError::new("member_not_found", "Fixture 成员不存在"));
+        }
+        state.member_mutes.remove(&(group_id, user_id));
         state
             .actions
             .push(Self::action("unmute", group_id, user_id, "", 0));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/member-mute-cancel",
+            state.actions.len(),
+            String::new(),
+        ))
     }
 
-    async fn rename(&self, group_id: i64, member: &MemberRef, nickname: &str) -> AppResult<()> {
+    async fn rename(
+        &self,
+        group_id: i64,
+        member: &MemberRef,
+        nickname: &str,
+    ) -> AppResult<GatewayReceipt> {
         let user_id = member
             .user_id
             .ok_or_else(|| AppError::new("member_identity", "Fixture 缺少 userId"))?;
@@ -529,14 +965,23 @@ impl GroupGateway for FixtureGateway {
             .members
             .get_mut(&(group_id, user_id))
             .ok_or_else(|| AppError::new("member_not_found", "Fixture 成员不存在"))?;
+        if nickname.trim().is_empty() {
+            return Err(AppError::new("invalid_argument", "Fixture 群名片为空"));
+        }
         target.card_name = nickname.into();
+        target.managed_card_name = nickname.into();
+        target.updated_at = fixture_now();
         state
             .actions
             .push(Self::action("rename", group_id, user_id, nickname, 0));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/set-member-nickname",
+            state.actions.len(),
+            String::new(),
+        ))
     }
 
-    async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<()> {
+    async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
         let target = state
@@ -544,15 +989,30 @@ impl GroupGateway for FixtureGateway {
             .get_mut(&(group_id, user_id))
             .ok_or_else(|| AppError::new("member_not_found", "Fixture 成员不存在"))?;
         target.present = false;
+        target.last_seen_at = fixture_now();
+        target.updated_at = fixture_now();
+        state.member_mutes.remove(&(group_id, user_id));
         state
             .actions
             .push(Self::action("remove_member", group_id, user_id, "", 0));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/remove-group-member",
+            state.actions.len(),
+            String::new(),
+        ))
     }
 
-    async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<()> {
+    async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt> {
         let mut state = self.state.write().await;
         Self::fault_error(&mut state.faults)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            return Err(AppError::new("group_not_found", "Fixture 群不存在"));
+        }
+        if muted {
+            state.group_mutes.insert(group_id);
+        } else {
+            state.group_mutes.remove(&group_id);
+        }
         state.actions.push(Self::action(
             if muted { "group_mute" } else { "group_unmute" },
             group_id,
@@ -560,7 +1020,11 @@ impl GroupGateway for FixtureGateway {
             "",
             0,
         ));
-        Ok(())
+        Ok(self.receipt(
+            "/v1/group/set-group-mute",
+            state.actions.len(),
+            String::new(),
+        ))
     }
 }
 
@@ -568,12 +1032,13 @@ impl GroupGateway for FixtureGateway {
 impl RuntimeGateway for FixtureGateway {
     async fn diagnose(&self) -> DiagnosticSnapshot {
         let state = self.state.read().await;
+        let metadata = self.contract.metadata();
         if !state.faults.devtools_ready {
             return DiagnosticSnapshot {
                 status: crate::gateway::ConnectionStatus::Unavailable,
                 devtools_url: FIXTURE_DEVTOOLS_URL.into(),
-                page_title: "DH Fixture".into(),
-                page_url: "http://127.0.0.1:51300".into(),
+                page_title: metadata.page_title.clone(),
+                page_url: metadata.page_url.clone(),
                 nim_account: String::new(),
                 detail: "Fixture DevTools 已断开".into(),
             };
@@ -585,8 +1050,8 @@ impl RuntimeGateway for FixtureGateway {
                 crate::gateway::ConnectionStatus::NimNotReady
             },
             devtools_url: FIXTURE_DEVTOOLS_URL.into(),
-            page_title: "DH Fixture".into(),
-            page_url: "http://127.0.0.1:51300".into(),
+            page_title: metadata.page_title.clone(),
+            page_url: metadata.page_url.clone(),
             nim_account: if state.faults.nim_ready {
                 FIXTURE_ACCOUNT.into()
             } else {
@@ -609,7 +1074,20 @@ impl RuntimeGateway for FixtureGateway {
     }
 
     async fn install_message_listener(&self) -> AppResult<Value> {
-        Ok(json!({"ok":true,"installed":["fixture"],"queued":0}))
+        let state = self.state.read().await;
+        Ok(json!({
+            "ok": true,
+            "session": FIXTURE_SESSION,
+            "installed": [
+                "onmsg",
+                "onmsgs",
+                "onaddteammembers",
+                "onremoveteammembers",
+                "onupdateteammember"
+            ],
+            "queued": state.queue.len(),
+            "dropped": 0,
+        }))
     }
 
     async fn poll_messages(&self) -> AppResult<Value> {
@@ -619,34 +1097,137 @@ impl RuntimeGateway for FixtureGateway {
                 AppError::new("fixture_disconnected", "Fixture DevTools 已断开").retryable(),
             );
         }
-        Ok(json!({"ok":true,"messages":state.messages,"remaining":state.messages.len()}))
+        let messages = state
+            .queue
+            .values()
+            .filter(|record| record.kind == GatewayRecordKind::Message)
+            .take(100)
+            .map(|record| {
+                let mut payload = record.payload.clone();
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("seq".into(), Value::from(record.sequence));
+                    object.insert("listenerSession".into(), Value::from(FIXTURE_SESSION));
+                }
+                payload
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "ok": true,
+            "session": FIXTURE_SESSION,
+            "messages": messages,
+            "remaining": state.queue.len(),
+            "dropped": 0,
+        }))
     }
 
     async fn acknowledge_messages(&self, sequence: u64) -> AppResult<Value> {
         let mut state = self.state.write().await;
-        let before = state.messages.len();
+        let before = state.queue.len();
         state
-            .messages
-            .retain(|message| message.get("seq").and_then(Value::as_u64).unwrap_or(0) > sequence);
-        Ok(json!({"ok":true,"acked":before-state.messages.len(),"remaining":state.messages.len()}))
+            .queue
+            .retain(|item_sequence, _| *item_sequence > sequence);
+        Ok(json!({
+            "ok": true,
+            "session": FIXTURE_SESSION,
+            "acknowledgedThrough": sequence,
+            "acked": before - state.queue.len(),
+            "remaining": state.queue.len(),
+            "dropped": 0,
+        }))
+    }
+
+    async fn read_batch(&self) -> AppResult<GatewayBatch> {
+        let state = self.state.read().await;
+        if !state.faults.devtools_ready {
+            return Err(
+                AppError::new("fixture_disconnected", "Fixture DevTools 已断开").retryable(),
+            );
+        }
+        Ok(GatewayBatch {
+            session: FIXTURE_SESSION.into(),
+            records: state.queue.values().take(100).cloned().collect(),
+            remaining: state.queue.len(),
+            dropped: 0,
+        })
+    }
+
+    async fn ack(&self, session: &str, sequence: u64) -> AppResult<GatewayReceipt> {
+        if session != FIXTURE_SESSION || sequence == 0 {
+            return Err(AppError::new(
+                "listener_ack_mismatch",
+                "Fixture 监听会话或确认序号无效",
+            ));
+        }
+        let value = self.acknowledge_messages(sequence).await?;
+        Ok(GatewayReceipt {
+            route: "listener.ack".into(),
+            status: "succeeded".into(),
+            transport_code: None,
+            transport_errno: None,
+            business_code: None,
+            business_errno: None,
+            business_message: "OK".into(),
+            request_id: String::new(),
+            message_id: String::new(),
+            session: FIXTURE_SESSION.into(),
+            acknowledged_through: sequence,
+            acknowledged: value.get("acked").and_then(Value::as_u64).unwrap_or(0) as usize,
+            remaining: value.get("remaining").and_then(Value::as_u64).unwrap_or(0) as usize,
+            dropped: 0,
+        })
+    }
+
+    async fn poll_events(&self) -> AppResult<Vec<GatewayEvent>> {
+        let mut state = self.state.write().await;
+        if !state.faults.devtools_ready {
+            return Err(
+                AppError::new("fixture_disconnected", "Fixture DevTools 已断开").retryable(),
+            );
+        }
+        let cursor = state.delivered_event_sequence;
+        let pending = state
+            .events
+            .iter()
+            .filter(|event| event.sequence > cursor)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut delivered = Vec::with_capacity(pending.len());
+        for event in &pending {
+            let Some(member) = state.members.get(&(event.group_id, event.user_id)).cloned() else {
+                continue;
+            };
+            let item = match event.kind.as_str() {
+                "member_joined" => GatewayEvent::MemberJoined {
+                    group_id: event.group_id,
+                    member,
+                },
+                "member_left" => GatewayEvent::MemberLeft {
+                    group_id: event.group_id,
+                    member,
+                },
+                "member_updated" => GatewayEvent::MemberUpdated {
+                    group_id: event.group_id,
+                    member,
+                },
+                _ => continue,
+            };
+            delivered.push(item);
+        }
+        if let Some(sequence) = pending.iter().map(|event| event.sequence).max() {
+            state.delivered_event_sequence = sequence;
+        }
+        Ok(delivered)
     }
 
     fn capabilities(&self) -> GatewayCapabilities {
-        GatewayCapabilities {
-            announcement: false,
-            mute: true,
-            recall: true,
-            rename: true,
-            remove_member: true,
-            group_mute: true,
-            member_events: true,
-        }
+        self.capabilities.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::CapabilityStatus;
 
     #[tokio::test]
     async fn default_fixture_has_sixteen_members_and_records_actions() {
@@ -678,6 +1259,296 @@ mod tests {
         let batch = fixture.poll_messages().await.unwrap();
         assert_eq!(batch["messages"].as_array().unwrap().len(), 1);
         fixture.acknowledge_messages(1).await.unwrap();
+        assert_eq!(fixture.snapshot().await.queued_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn fixture_batches_are_ordered_session_scoped_and_acknowledged() {
+        let fixture = FixtureGateway::new_default();
+        fixture
+            .emit_message(FIXTURE_GROUP, 10006, "later", Some(20), Some("m20".into()))
+            .await
+            .unwrap();
+        fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10007,
+                "earlier",
+                Some(10),
+                Some("m10".into()),
+            )
+            .await
+            .unwrap();
+        let batch = fixture.read_batch().await.unwrap();
+        assert_eq!(batch.session, FIXTURE_SESSION);
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert!(fixture.ack("wrong-session", 10).await.is_err());
+        let receipt = fixture.ack(FIXTURE_SESSION, 10).await.unwrap();
+        assert_eq!(receipt.acknowledged_through, 10);
+        assert_eq!(receipt.acknowledged, 1);
+        assert_eq!(fixture.read_batch().await.unwrap().records[0].sequence, 20);
+    }
+
+    #[tokio::test]
+    async fn one_hundred_and_one_records_are_delivered_as_two_batches() {
+        let fixture = FixtureGateway::new_default();
+        for sequence in 1..=101_u64 {
+            fixture
+                .emit_message(
+                    FIXTURE_GROUP,
+                    10006,
+                    &format!("batch-{sequence}"),
+                    Some(sequence),
+                    Some(format!("batch-message-{sequence}")),
+                )
+                .await
+                .unwrap();
+        }
+        let first = fixture.read_batch().await.unwrap();
+        assert_eq!(first.records.len(), 100);
+        assert_eq!(first.records.last().unwrap().sequence, 100);
+        assert_eq!(first.remaining, 101);
+        fixture.ack(&first.session, 100).await.unwrap();
+        let second = fixture.read_batch().await.unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].sequence, 101);
+        fixture.ack(&second.session, 101).await.unwrap();
+        assert!(fixture.read_batch().await.unwrap().records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_stable_ids_are_ignored_and_business_order_is_preserved() {
+        let fixture = FixtureGateway::new_default();
+        fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10006,
+                "later",
+                Some(30),
+                Some("stable-later".into()),
+            )
+            .await
+            .unwrap();
+        fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10006,
+                "earlier",
+                Some(10),
+                Some("stable-earlier".into()),
+            )
+            .await
+            .unwrap();
+        let duplicate_sequence = fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10006,
+                "duplicate payload is ignored",
+                Some(20),
+                Some("stable-later".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_sequence, 30);
+        let batch = fixture.read_batch().await.unwrap();
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 30]
+        );
+    }
+
+    #[tokio::test]
+    async fn nim_not_ready_and_partial_roster_match_contract_states() {
+        let fixture = FixtureGateway::new_default();
+        fixture
+            .set_faults(FixtureFaults {
+                devtools_ready: true,
+                nim_ready: false,
+                ..FixtureFaults::default()
+            })
+            .await;
+        let error = fixture.session_identity().await.unwrap_err();
+        assert_eq!(error.code, "nim_not_ready");
+        assert!(error.retryable);
+        assert_eq!(fixture.wire_nim_members(FIXTURE_GROUP).await["ok"], false);
+
+        fixture
+            .set_faults(FixtureFaults {
+                devtools_ready: true,
+                nim_ready: true,
+                partial_members: true,
+                ..FixtureFaults::default()
+            })
+            .await;
+        let roster = fixture.list_members(FIXTURE_GROUP).await.unwrap();
+        assert_eq!(roster.reported_count, 16);
+        assert_eq!(roster.resolved_count, 8);
+        assert_eq!(roster.completeness, RosterCompleteness::Partial);
+        assert_eq!(roster.authority, "partial");
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_state_survives_gateway_restart_boundary() {
+        let fixture = FixtureGateway::new_default();
+        fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10006,
+                "persist before ack",
+                Some(1),
+                Some("crash-boundary-1".into()),
+            )
+            .await
+            .unwrap();
+        fixture.mute(FIXTURE_GROUP, 10006, 60).await.unwrap();
+
+        let restarted = fixture.clone();
+        let replay = restarted.read_batch().await.unwrap();
+        assert_eq!(replay.records.len(), 1);
+        assert_eq!(replay.records[0].sequence, 1);
+        assert_eq!(restarted.snapshot().await.member_mutes.len(), 1);
+
+        restarted.ack(&replay.session, 1).await.unwrap();
+        assert!(fixture.read_batch().await.unwrap().records.is_empty());
+        assert_eq!(fixture.snapshot().await.actions.len(), 1);
+    }
+
+    #[test]
+    fn unknown_wangshangliao_build_keeps_write_capabilities_unverified() {
+        let fixture = FixtureGateway::new_with_calibration("unknown", &"f".repeat(64));
+        let capabilities = fixture.capabilities();
+        assert_eq!(capabilities.mute, CapabilityStatus::Unverified);
+        assert_eq!(capabilities.recall, CapabilityStatus::Unverified);
+        assert_eq!(capabilities.rename, CapabilityStatus::Unverified);
+        assert_eq!(capabilities.remove_member, CapabilityStatus::Unverified);
+        assert_eq!(capabilities.group_mute, CapabilityStatus::Unverified);
+    }
+
+    #[tokio::test]
+    async fn member_lifecycle_events_are_delivered_once_in_sequence_order() {
+        let fixture = FixtureGateway::new_default();
+        fixture
+            .member_joined(
+                FIXTURE_GROUP,
+                10017,
+                Some("fixture-nim-10017".into()),
+                Some("新成员17".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        fixture
+            .member_updated(
+                FIXTURE_GROUP,
+                10017,
+                Some("新名称17".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        fixture.member_left(FIXTURE_GROUP, 10017).await.unwrap();
+        let batch = fixture.read_batch().await.unwrap();
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .map(|record| record.kind.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                GatewayRecordKind::TeamMemberJoined,
+                GatewayRecordKind::TeamMemberUpdated,
+                GatewayRecordKind::TeamMemberLeft,
+            ]
+        );
+        let events = fixture.poll_events().await.unwrap();
+        assert!(matches!(events[0], GatewayEvent::MemberJoined { .. }));
+        assert!(matches!(events[1], GatewayEvent::MemberUpdated { .. }));
+        assert!(matches!(events[2], GatewayEvent::MemberLeft { .. }));
+        assert!(fixture.poll_events().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wire_contract_keeps_transport_and_business_failures_separate() {
+        let fixture = FixtureGateway::new_default();
+        let success = fixture
+            .wire_route("/v1/group/get-group-list", json!({"v":"0"}))
+            .await
+            .unwrap();
+        assert_eq!(success["code"], 0);
+        assert_eq!(success["errno"], 0);
+
+        fixture
+            .set_faults(FixtureFaults {
+                devtools_ready: true,
+                nim_ready: true,
+                permission_denied: true,
+                ..FixtureFaults::default()
+            })
+            .await;
+        let permission = fixture
+            .wire_route("/v1/group/get-group-list", json!({"v":"0"}))
+            .await
+            .unwrap();
+        assert_eq!(permission["code"], 403);
+        assert_eq!(permission["errno"], 403);
+
+        fixture
+            .set_faults(FixtureFaults {
+                devtools_ready: true,
+                nim_ready: true,
+                timeout_next: true,
+                ..FixtureFaults::default()
+            })
+            .await;
+        let timeout = fixture
+            .wire_route("/v1/group/get-group-list", json!({"v":"0"}))
+            .await
+            .unwrap_err();
+        assert!(timeout.retryable);
+    }
+
+    #[tokio::test]
+    async fn thousand_message_burst_has_no_drop_and_preserves_sequence() {
+        let fixture = FixtureGateway::new_default();
+        for sequence in 1..=1000_u64 {
+            fixture
+                .emit_message(
+                    FIXTURE_GROUP,
+                    10006,
+                    &format!("burst-{sequence}"),
+                    Some(sequence),
+                    Some(format!("burst-message-{sequence}")),
+                )
+                .await
+                .unwrap();
+        }
+        let mut received = Vec::new();
+        loop {
+            let batch = fixture.read_batch().await.unwrap();
+            assert_eq!(batch.dropped, 0);
+            if batch.records.is_empty() {
+                break;
+            }
+            assert!(batch.records.len() <= 100);
+            received.extend(batch.records.iter().map(|record| record.sequence));
+            let last = batch.records.last().unwrap().sequence;
+            fixture.ack(&batch.session, last).await.unwrap();
+        }
+        assert_eq!(received.len(), 1000);
+        assert_eq!(received, (1..=1000).collect::<Vec<_>>());
         assert_eq!(fixture.snapshot().await.queued_messages, 0);
     }
 }

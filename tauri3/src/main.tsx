@@ -7,6 +7,7 @@ import './styles.css'
 import './brand.css'
 import './runtime.css'
 import './pages.css'
+import './close-dialog.css'
 import GroupMembersPage from './GroupMembersPage'
 import OverviewPage, { statusText } from './pages/OverviewPage'
 import MessagesPage from './pages/MessagesPage'
@@ -16,6 +17,7 @@ import PlansPage from './pages/PlansPage'
 import AuditPage from './pages/AuditPage'
 import SettingsPage from './pages/SettingsPage'
 import DebugPage from './pages/DebugPage'
+import CloseDialog from './components/CloseDialog'
 import type { Diagnostic } from './runtimeTypes'
 import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
 import { api, readableError } from './api/client'
@@ -47,6 +49,8 @@ function App() {
   const [error, setError] = useState('')
   const [automationPaused, setAutomationPaused] = useState(false)
   const [pageEpoch, setPageEpoch] = useState(0)
+  const [closePrompt, setClosePrompt] = useState(false)
+  const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
 
   const loadAccountData = async (nextAccount: string) => {
     if (!nextAccount) { setOverviewAudits([]); setSummaries([]); return }
@@ -87,13 +91,23 @@ function App() {
     for (const eventName of ['sync-progress', 'message-received', 'task-progress', 'schedule-updated', 'gateway-capabilities']) listeners.push(listen(eventName, () => setPageEpoch(value => value + 1)))
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
     listeners.push(listen<{ paused?: boolean } | boolean>('automation-paused', event => setAutomationPaused(typeof event.payload === 'boolean' ? event.payload : Boolean(event.payload.paused))))
+    listeners.push(listen('close-requested', () => setClosePrompt(true)))
     return () => { void Promise.all(listeners).then(values => values.forEach(unlisten => unlisten())) }
   }, [])
+
+  const resolveClose = async (action: 'tray' | 'exit') => {
+    try {
+      await invoke('resolve_close_action', { action, remember: rememberCloseChoice })
+      setClosePrompt(false)
+    } catch (reason) {
+      setError(readableError(reason))
+    }
+  }
 
   const activeGroup = useMemo(() => groups.find(group => group.groupId === selectedGroup), [groups, selectedGroup])
   const connectionLabel = diagnostic ? statusText(diagnostic.status) : '检查中'
 
-  return <main className="shell">
+  return <><main className="shell">
     <aside className="sidebar"><div className="brand"><img className="brand-logo" src="/logo.png" alt="DH BOT" /></div><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)} key={label}><Icon size={16} />{label}</button>)}</nav><div className="sidebar-foot">DH BOT 3.0</div></aside>
     <section className="workspace">
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
@@ -109,7 +123,7 @@ function App() {
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>
-  </main>
+  </main>{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
 }
 
 createRoot(document.getElementById('root')!).render(<AppErrorBoundary><App /></AppErrorBoundary>)

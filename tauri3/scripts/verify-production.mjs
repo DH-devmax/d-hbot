@@ -2,13 +2,34 @@ import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 const root = path.resolve(process.argv[2] || 'dist/production')
-const forbiddenNames = [/dh-fixture/i, /fixture-gateway/i]
+const requireExecutable = !process.argv.includes('--allow-no-executable')
+const forbiddenNames = [
+  /dh-fixture/i,
+  /fixture-gateway/i,
+  /tauri\.fixture\.conf/i,
+  /readme-developer/i,
+]
 const forbiddenText = [
   'DH-Fixture',
+  'DH BOT Dev',
+  'dh-fixture',
   'start_fixture_host',
   'set_runtime_mode',
+  'DH_RUNTIME_MODE',
   'http://127.0.0.1:9233',
+  '127.0.0.1:9233',
+  'http://127.0.0.1:51300',
+  '127.0.0.1:51300',
+  '%APPDATA%\\DH\\fixture',
+  '\\DH\\fixture',
+  '/DH/fixture',
+  'runtimeMode":"fixture',
+  'runtime_mode":"fixture',
   '/fixture/events/',
+  '/fixture/reset',
+  '/fixture/state',
+  '/fixture/actions',
+  '/fixture/faults',
   '开发测试环境',
 ]
 
@@ -35,14 +56,15 @@ for (const file of productionFiles) {
   }
   const content = await readFile(file)
   const ascii = content.toString('latin1')
+  const utf8 = content.toString('utf8')
   const utf16 = content.toString('utf16le')
   for (const token of forbiddenText) {
-    if (ascii.includes(token) || utf16.includes(token)) {
+    if (ascii.includes(token) || utf8.includes(token) || utf16.includes(token)) {
       throw new Error(`生产产物 ${relative} 包含开发标记：${token}`)
     }
   }
 }
 
 const executable = productionFiles.some(file => /DH-BOT(?:\.exe)?$/i.test(path.basename(file)))
-if (!executable) throw new Error('生产目录中没有 DH-BOT 主程序')
+if (requireExecutable && !executable) throw new Error('生产目录中没有 DH-BOT 主程序')
 console.log(`生产产物隔离检查通过：${productionFiles.length} 个文件`)
