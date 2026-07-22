@@ -55,7 +55,7 @@ if ($Channel -eq 'production') {
   Copy-Item $Installer.FullName $InstallerTarget
   Copy-Item (Join-Path $ProjectRoot 'docs\DH使用手册.md') (Join-Path $Dist 'DH-Manual-ZH.md')
   Copy-Item (Join-Path $ProjectRoot 'docs\DH-Manual-ZH.pdf') (Join-Path $Dist 'DH-Manual-ZH.pdf')
-  Copy-Item (Join-Path $ProjectRoot 'package\ZCG-Compatible-Rules.json') (Join-Path $Dist 'ZCG-Compatible-Rules.json')
+  Copy-Item (Join-Path $ProjectRoot 'package\DH-BOT-Default-Rules.json') (Join-Path $Dist 'DH-BOT-Default-Rules.json')
   Get-ChildItem $Dist -Filter '*.exe' | ForEach-Object { Sign-Artifact $_.FullName }
   & (Join-Path $Root 'scripts\verify-windows-production.ps1') -ArtifactDirectory $Dist -RequireSignature:$RequireSignature
   if ($LASTEXITCODE -ne 0) { throw 'Windows 生产产物深度扫描失败' }
@@ -65,7 +65,7 @@ if ($Channel -eq 'production') {
     (Join-Path $Dist 'DH-BOT.exe'),
     (Join-Path $Dist 'DH-Manual-ZH.md'),
     (Join-Path $Dist 'DH-Manual-ZH.pdf'),
-    (Join-Path $Dist 'ZCG-Compatible-Rules.json')
+    (Join-Path $Dist 'DH-BOT-Default-Rules.json')
   )
   Compress-Archive -Path $PortableFiles -DestinationPath $Zip
   $VerifyZip = Join-Path ([System.IO.Path]::GetTempPath()) ("dh-bot-production-" + [guid]::NewGuid().ToString('N'))

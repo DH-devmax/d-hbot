@@ -19,6 +19,7 @@ function fakePe(subsystem) {
   buffer.write('PE\0\0', 0x80, 'ascii')
   buffer.writeUInt16LE(0x20b, 0x98)
   buffer.writeUInt16LE(subsystem, 0x98 + 68)
+  buffer.write('/assets/index-TEST.js', 0x120, 'ascii')
   return buffer
 }
 
@@ -28,7 +29,7 @@ try {
   await writeFile(path.join(clean, 'DH-BOT.exe'), fakePe(2))
   await copyFile(path.join(projectRoot, 'docs', 'DH使用手册.md'), path.join(clean, 'DH-Manual-ZH.md'))
   await copyFile(path.join(projectRoot, 'docs', 'DH-Manual-ZH.pdf'), path.join(clean, 'DH-Manual-ZH.pdf'))
-  await copyFile(path.join(projectRoot, 'package', 'ZCG-Compatible-Rules.json'), path.join(clean, 'ZCG-Compatible-Rules.json'))
+  await copyFile(path.join(projectRoot, 'package', 'DH-BOT-Default-Rules.json'), path.join(clean, 'DH-BOT-Default-Rules.json'))
   const cleanResult = verify(clean)
   if (cleanResult.status !== 0) throw new Error(cleanResult.stderr || cleanResult.stdout)
 
@@ -59,7 +60,14 @@ try {
   await writeFile(path.join(invalidBuild, 'DH-BOT.exe'), 'not a PE executable')
   if (verify(invalidBuild).status === 0) throw new Error('扫描器未拦截无效 PE')
 
-  console.log(`生产隔离扫描自测通过：${cases.length + 3} 个场景`)
+  const devShell = path.join(temporary, 'dev-shell')
+  await mkdir(devShell)
+  const devShellPe = fakePe(2)
+  devShellPe.fill(0, 0x120, 0x120 + '/assets/index-TEST.js'.length)
+  await writeFile(path.join(devShell, 'DH-BOT.exe'), devShellPe)
+  if (verify(devShell).status === 0) throw new Error('扫描器未拦截未内嵌前端的开发壳')
+
+  console.log(`生产隔离扫描自测通过：${cases.length + 4} 个场景`)
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }

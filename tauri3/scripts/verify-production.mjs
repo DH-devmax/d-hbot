@@ -66,12 +66,16 @@ if (!productionFiles.length) throw new Error('生产产物目录为空')
 
 const mainExecutable = productionFiles.find(file => /^DH-BOT\.exe$/i.test(path.basename(file)))
 if (mainExecutable) {
-  const subsystem = peSubsystem(await readFile(mainExecutable))
+  const executableContent = await readFile(mainExecutable)
+  const subsystem = peSubsystem(executableContent)
   if (subsystem === null) {
     throw new Error('DH-BOT.exe 不是有效的 Windows PE 可执行文件')
   }
   if (subsystem !== 2) {
     throw new Error(`DH-BOT.exe 不是 Windows GUI 子系统（Subsystem=${subsystem}），将显示 CMD 窗口`)
+  }
+  if (!executableContent.includes(Buffer.from('/assets/index-'))) {
+    throw new Error('DH-BOT.exe 没有内嵌 Tauri 前端资源，请使用 custom-protocol 生产构建')
   }
 }
 

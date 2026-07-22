@@ -7,4 +7,4 @@
 
 DH BOT 的预测层只把已确认的数据适配器编译进 EXE，并在回复中输出整理后的期号、结果、更新时间、统计趋势、候选方向和参考度。原始接口地址、认证信息、上游响应结构和 ZCG 财务数据不会进入发布包或群消息。
 
-完整校验和见 `ZCG-REFERENCE-SHA256.txt`。发布包只携带 `ZCG-Compatible-Rules.json`，该文件是群管规则模板，不包含下注、余额、账单或结算数据。
+完整校验和见 `ZCG-REFERENCE-SHA256.txt`。发布包只携带 `DH-BOT-Default-Rules.json`，该文件是 DH BOT 群管规则模板，只保留经验上兼容的规则行为。

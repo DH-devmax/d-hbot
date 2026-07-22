@@ -38,7 +38,7 @@ pnpm tauri:build:developer
 - `tauri3/src-tauri/`：Rust 核心、CDP/NIM 网关、SQLite、规则、AI 和 Windows 桌面能力。
 - `tauri3/src/`：React + TypeScript 运营界面。
 - `tauri3/contracts/`：版本化、脱敏后的旺商聊 Contract v2。
-- `package/ZCG-Compatible-Rules.json`：默认兼容规则模板。
+- `package/DH-BOT-Default-Rules.json`：DH BOT 默认群管规则模板（兼容 ZCG 规则行为）。
 - `docs/DH使用手册.md`：中文使用手册。
 - `docs/DH-Manual-ZH.pdf`：当前 Tauri 界面图解手册。
 - `archive/go-2.7-final/`：旧 Go 2.7 只读源码 ZIP、说明和 SHA-256；当前工作树不保留 Go 源码。

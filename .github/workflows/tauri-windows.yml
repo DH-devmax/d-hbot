@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           pnpm clean:production
-          pnpm exec tauri build --no-bundle --ci -- --no-default-features
+          pnpm exec tauri build --no-bundle --ci --features custom-protocol -- --no-default-features
       - name: Sign production PE before NSIS
         shell: pwsh
         run: |
