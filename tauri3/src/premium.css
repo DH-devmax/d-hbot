@@ -1,0 +1,372 @@
+:root {
+  --dh-bg: #ffffff;
+  --dh-sidebar: #f6f6f6;
+  --dh-surface: #f7f7f7;
+  --dh-surface-hover: #eeeeee;
+  --dh-surface-strong: #e8e8e8;
+  --dh-text: #171717;
+  --dh-muted: #737373;
+  --dh-faint: #a1a1a1;
+  --dh-button-border: #d5d5d5;
+  --dh-focus: #a3a3a3;
+  --dh-dark: #171717;
+}
+
+:root,
+body {
+  color: var(--dh-text);
+  background: var(--dh-bg);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif;
+}
+
+.shell {
+  background: var(--dh-bg);
+}
+
+.sidebar {
+  background: var(--dh-sidebar);
+  box-shadow: none;
+}
+
+.workspace {
+  padding: 32px 44px 48px;
+}
+
+.topbar {
+  padding-bottom: 18px;
+}
+
+.topbar h1 {
+  margin-top: 6px;
+  font-size: 26px;
+  font-weight: 650;
+}
+
+.eyebrow {
+  color: var(--dh-faint);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.page-stack {
+  gap: 24px;
+  margin-top: 18px;
+}
+
+.hero-panel,
+.metric,
+.section {
+  border: 0;
+  box-shadow: none;
+}
+
+.section {
+  padding: 20px 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.hero-panel,
+.metric {
+  border-radius: 6px;
+  background: var(--dh-surface);
+}
+
+.metric {
+  min-height: 200px;
+}
+
+.metric-icon,
+.empty-icon,
+.connection,
+.type-pill,
+.state-pill,
+.level,
+.table-row em,
+.role {
+  background: var(--dh-surface-strong);
+}
+
+.connection {
+  color: var(--dh-muted);
+}
+
+.cached-banner,
+.pause-banner,
+.error-banner,
+.capability-grid > div {
+  border: 0;
+  background: var(--dh-surface);
+}
+
+.primary,
+.secondary,
+.icon-button,
+.icon-command,
+button:not(.nav-item) {
+  border-color: var(--dh-button-border);
+  box-shadow: none;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+
+button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid #b8b8b8;
+  outline-offset: 2px;
+}
+
+.primary,
+.nav-item.active,
+.tabs button.active,
+.view-tabs button.active,
+.control-mode-tabs button.active,
+.check-chip.selected,
+.group-item em.enabled,
+.rule-list-item em.enabled,
+.knowledge-item em.enabled,
+.work-item em.enabled,
+.role-owner,
+.role-admin {
+  border-color: var(--dh-dark);
+  background: var(--dh-dark);
+  color: #fff;
+}
+
+.primary:hover,
+.nav-item.active:hover,
+.control-mode-tabs button.active:hover {
+  border-color: #303030;
+  background: #303030;
+}
+
+.secondary,
+.icon-button,
+.icon-command {
+  background: #fff;
+}
+
+.secondary:hover:not(:disabled),
+.icon-button:hover:not(:disabled),
+.icon-command:hover:not(:disabled) {
+  border-color: #bdbdbd;
+  background: var(--dh-surface-hover);
+}
+
+.nav-item:hover:not(.active) {
+  background: var(--dh-surface-strong);
+}
+
+.search-field,
+.settings-grid input,
+.settings-grid textarea,
+.section textarea,
+.filter-grid select,
+.filter-grid input:not(.search-field input),
+.form-grid input,
+.form-grid select,
+.form-grid textarea,
+.knowledge-meta input,
+.document-editor input,
+.document-editor select,
+.document-editor textarea,
+.summary-toolbar select,
+.member-toolbar select,
+.group-welcome input,
+.card-tools input,
+.card-preview input {
+  border-color: transparent;
+  background: var(--dh-surface);
+  box-shadow: none;
+}
+
+.search-field:focus-within,
+.settings-grid input:focus,
+.settings-grid textarea:focus,
+.section textarea:focus,
+.filter-grid input:focus,
+.filter-grid select:focus,
+.form-grid input:focus,
+.form-grid select:focus,
+.form-grid textarea:focus,
+.knowledge-meta input:focus,
+.document-editor input:focus,
+.document-editor select:focus,
+.document-editor textarea:focus,
+.member-toolbar select:focus,
+.group-welcome input:focus,
+.card-tools input:focus,
+.card-preview input:focus {
+  border-color: transparent;
+  box-shadow: 0 0 0 1px var(--dh-focus);
+  outline: 0;
+}
+
+.view-tabs {
+  gap: 6px;
+}
+
+.view-tabs button,
+.control-mode-tabs button,
+.tabs button {
+  border-color: transparent;
+  background: transparent;
+}
+
+.view-tabs button:not(.active),
+.tabs button:not(.active) {
+  background: var(--dh-surface);
+}
+
+.control-mode-tabs {
+  border: 0;
+  border-radius: 6px;
+  background: var(--dh-surface);
+}
+
+.control-mode-tabs button:hover:not(.active) {
+  border-color: transparent;
+  background: var(--dh-surface-strong);
+}
+
+.control-mode-panel {
+  margin-top: 8px;
+  padding: 16px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--dh-surface);
+}
+
+.control-mode-panel .automation-toggle,
+.control-mode-panel .takeover-row button,
+.control-mode-panel .manual-control-bar button,
+.control-mode-panel .automatic-workflow-bar button,
+.control-mode-panel .card-tools button {
+  background: #fff;
+}
+
+.control-mode-panel .automation-toggle.checked,
+.control-mode-panel .takeover-row button.active,
+.control-mode-panel .automatic-workflow-bar button.feature-on,
+.control-mode-panel .card-tools button.feature-on,
+.control-mode-panel .card-tools button.primary {
+  background: var(--dh-dark);
+  color: #fff;
+}
+
+.manual-control-bar,
+.group-welcome,
+.card-tools,
+.card-queue-status,
+.ai-automation-panel,
+.summary-toolbar,
+.schedule-run,
+.summary-item,
+.ai-result {
+  border: 0;
+  box-shadow: none;
+  background: #fff;
+}
+
+.control-mode-panel .manual-control-bar,
+.control-mode-panel .group-welcome,
+.control-mode-panel .card-tools,
+.control-mode-panel .card-queue-status {
+  background: #fff;
+}
+
+.group-item,
+.rule-list-item,
+.knowledge-item,
+.work-item,
+.document-item,
+.new-line,
+.check-chip,
+.action-checks label,
+.card-job {
+  border-color: transparent;
+  background: var(--dh-surface);
+  box-shadow: none;
+}
+
+.group-item:hover,
+.group-item.selected,
+.rule-list-item:hover,
+.rule-list-item.selected,
+.knowledge-item:hover,
+.knowledge-item.selected,
+.work-item:hover,
+.work-item.selected,
+.document-item:hover,
+.document-item.selected {
+  border-color: transparent;
+  background: var(--dh-surface-hover);
+}
+
+.editor-panel,
+.knowledge-editor {
+  padding: 18px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--dh-surface);
+}
+
+.editor-section,
+.knowledge-meta,
+.schedule-runs,
+.summary-settings,
+.runtime-mode-control {
+  border-color: transparent;
+}
+
+.developer-badge {
+  border: 0;
+}
+
+.message-row,
+.audit-row {
+  border-bottom: 0;
+}
+
+.message-row:nth-child(even),
+.audit-row:nth-child(even),
+.table-row:nth-child(even),
+.member-table tbody tr:nth-child(even) {
+  background: var(--dh-surface);
+}
+
+.member-table-wrap {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.member-table th {
+  background: #fff;
+}
+
+.card-preview {
+  border: 0;
+  background: var(--dh-surface);
+  box-shadow: none;
+}
+
+.card-preview-head {
+  background: var(--dh-surface-strong);
+}
+
+.card-job {
+  border-left: 0;
+}
+
+.detail-drawer,
+.close-dialog,
+.button-help {
+  border-color: transparent;
+}
+
+@media (max-width: 1200px) {
+  .workspace { padding: 26px 30px 40px; }
+}
+
+@media (max-width: 1050px) {
+  .workspace { padding: 22px 24px 36px; }
+}
