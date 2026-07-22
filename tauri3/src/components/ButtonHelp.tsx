@@ -103,11 +103,13 @@ export default function ButtonHelp() {
     }
     const onFocusIn = (event: FocusEvent) => { const target = findButton(event.target); if (target) show(target) }
     const onFocusOut = (event: FocusEvent) => { const target = findButton(event.target); if (target) hide(target) }
+    const hideRequested = () => hide()
     const reposition = () => setTooltip(current => current ? { ...current, ...place(current.target) } : null)
     document.addEventListener('pointerover', onPointerOver, true)
     document.addEventListener('pointerout', onPointerOut, true)
     document.addEventListener('focusin', onFocusIn, true)
     document.addEventListener('focusout', onFocusOut, true)
+    document.addEventListener('dh-hide-button-help', hideRequested)
     window.addEventListener('resize', reposition)
     document.addEventListener('scroll', reposition, true)
     return () => {
@@ -115,6 +117,7 @@ export default function ButtonHelp() {
       document.removeEventListener('pointerout', onPointerOut, true)
       document.removeEventListener('focusin', onFocusIn, true)
       document.removeEventListener('focusout', onFocusOut, true)
+      document.removeEventListener('dh-hide-button-help', hideRequested)
       window.removeEventListener('resize', reposition)
       document.removeEventListener('scroll', reposition, true)
     }

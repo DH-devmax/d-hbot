@@ -14,21 +14,71 @@
 
 :root,
 body {
+  height: 100vh;
+  overflow: hidden;
   color: var(--dh-text);
   background: var(--dh-bg);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif;
 }
 
 .shell {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background: var(--dh-bg);
 }
 
 .sidebar {
+  position: sticky;
+  top: 0;
+  flex: 0 0 232px;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background: var(--dh-sidebar);
   box-shadow: none;
 }
 
+.sidebar-foot {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  margin-top: auto;
+  padding: 14px 10px 4px;
+  border: 0;
+  background: transparent;
+  color: #999;
+  text-align: left;
+}
+
+.sidebar-foot span {
+  color: #737373;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sidebar-foot small {
+  color: #a1a1a1;
+  font-size: 10px;
+}
+
+.sidebar-foot:hover span,
+.sidebar-foot:focus-visible span {
+  color: #111;
+}
+
+.sidebar nav {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
 .workspace {
+  min-width: 0;
+  height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 32px 44px 48px;
 }
 
@@ -369,4 +419,72 @@ button:focus-visible,
 
 @media (max-width: 1050px) {
   .workspace { padding: 22px 24px 36px; }
+}
+
+@media (max-width: 780px) {
+  .sidebar {
+    flex-basis: 68px;
+    width: 68px;
+    padding: 20px 8px 12px;
+  }
+
+  .brand { padding: 0 2px 22px; }
+  .brand-logo { width: 48px; height: 48px; }
+  .sidebar nav { gap: 5px; }
+  .nav-item { justify-content: center; padding: 11px 8px; }
+  .nav-item:not(.active) { color: #777; }
+  .nav-item { font-size: 0; }
+  .nav-item svg { width: 17px; height: 17px; }
+  .sidebar-foot { justify-items: center; padding: 12px 0 0; text-align: center; }
+  .sidebar-foot span { font-size: 0; }
+  .sidebar-foot span::after { content: '3.0'; font-size: 10px; }
+  .sidebar-foot small { display: none; }
+  .workspace { padding: 20px 18px 32px; }
+  .topbar { flex-wrap: wrap; gap: 12px; }
+  .topbar h1 { font-size: 23px; }
+  .split-editor,
+  .knowledge-layout,
+  .work-layout,
+  .document-layout,
+  .filter-grid,
+  .audit-filters,
+  .summary-settings {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .editor-panel,
+  .knowledge-editor { padding: 14px; }
+  .message-table,
+  .audit-table {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .summary-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .summary-toolbar > span { align-self: flex-start; }
+}
+
+@media (max-width: 560px) {
+  .workspace { padding-inline: 14px; }
+  .overview-grid,
+  .settings-grid { grid-template-columns: 1fr; }
+  .hero-panel { grid-column: auto; }
+  .topbar { align-items: flex-start; flex-direction: column; }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .form-grid .wide-field { grid-column: auto; }
+  .group-welcome { grid-template-columns: minmax(0, 1fr); }
+  .member-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .member-search { grid-column: auto; }
+  .member-toolbar .icon-command { width: 100%; }
+  .capability-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-height: 700px) {
+  .sidebar { padding-top: 12px; padding-bottom: 10px; }
+  .brand { padding-bottom: 10px; }
+  .brand-logo { width: 56px; height: 56px; }
+  .nav-item { padding-block: 8px; }
+  .sidebar-foot { padding-top: 8px; }
 }

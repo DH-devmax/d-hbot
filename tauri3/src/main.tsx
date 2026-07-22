@@ -10,6 +10,7 @@ import './pages.css'
 import './close-dialog.css'
 import './button-help.css'
 import './premium.css'
+import './about.css'
 import GroupMembersPage from './GroupMembersPage'
 import OverviewPage, { statusText } from './pages/OverviewPage'
 import MessagesPage from './pages/MessagesPage'
@@ -21,6 +22,7 @@ import SettingsPage from './pages/SettingsPage'
 import DebugPage from './pages/DebugPage'
 import CloseDialog from './components/CloseDialog'
 import ButtonHelp from './components/ButtonHelp'
+import AboutDialog from './components/AboutDialog'
 import type { Diagnostic } from './runtimeTypes'
 import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
 import { api, readableError } from './api/client'
@@ -75,6 +77,7 @@ function App() {
   const [pageEpoch, setPageEpoch] = useState(0)
   const [closePrompt, setClosePrompt] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
+  const [showAbout, setShowAbout] = useState(false)
   const activeAccountRef = useRef('')
   const refreshSequenceRef = useRef(0)
   const handledWangStartupRef = useRef(new Set<string>())
@@ -185,7 +188,7 @@ function App() {
   const connectionLabel = diagnostic ? statusText(diagnostic.status) : '检查中'
 
   return <><main className="shell">
-    <aside className="sidebar"><div className="brand"><img className="brand-logo" src="/logo.png" alt="DH BOT" /></div><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)} key={label}><Icon size={16} />{label}</button>)}</nav><div className="sidebar-foot">DH BOT 3.0</div></aside>
+    <aside className="sidebar"><div className="brand"><img className="brand-logo" src="/logo.png" alt="DH BOT" /></div><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
     <section className="workspace">
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}
@@ -200,7 +203,7 @@ function App() {
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>
-  </main><ButtonHelp />{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
+  </main><ButtonHelp />{showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
 }
 
 async function bootstrap() {

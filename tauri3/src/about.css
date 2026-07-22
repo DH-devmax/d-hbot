@@ -1,0 +1,99 @@
+.about-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 24%);
+  backdrop-filter: blur(3px);
+}
+
+.about-dialog {
+  width: min(460px, 100%);
+  max-height: min(640px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 24px;
+  border: 0;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 20%);
+}
+
+.about-header,
+.about-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.about-header h2 {
+  margin: 7px 0 0;
+  font-size: 24px;
+}
+
+.about-version {
+  display: grid;
+  gap: 3px;
+  margin-top: 24px;
+  padding: 14px;
+  border-radius: 6px;
+  background: #f5f5f5;
+}
+
+.about-version strong {
+  font-size: 18px;
+}
+
+.about-version span,
+.about-copy,
+.about-details dt,
+.about-footer > span {
+  color: #737373;
+}
+
+.about-copy {
+  margin: 18px 0;
+  line-height: 1.7;
+}
+
+.about-details {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 12px;
+  margin: 0;
+  padding: 16px 0;
+  border-top: 1px solid #eeeeee;
+  border-bottom: 1px solid #eeeeee;
+  line-height: 1.5;
+}
+
+.about-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.telegram-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #111;
+  text-decoration: none;
+}
+
+.telegram-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.about-footer {
+  align-items: center;
+  margin-top: 18px;
+}
+
+@media (max-width: 560px) {
+  .about-backdrop { padding: 14px; }
+  .about-dialog { padding: 18px; }
+}
