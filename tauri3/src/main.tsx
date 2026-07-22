@@ -8,6 +8,7 @@ import './brand.css'
 import './runtime.css'
 import './pages.css'
 import './close-dialog.css'
+import './button-help.css'
 import GroupMembersPage from './GroupMembersPage'
 import OverviewPage, { statusText } from './pages/OverviewPage'
 import MessagesPage from './pages/MessagesPage'
@@ -18,6 +19,7 @@ import AuditPage from './pages/AuditPage'
 import SettingsPage from './pages/SettingsPage'
 import DebugPage from './pages/DebugPage'
 import CloseDialog from './components/CloseDialog'
+import ButtonHelp from './components/ButtonHelp'
 import type { Diagnostic } from './runtimeTypes'
 import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
 import { api, readableError } from './api/client'
@@ -197,7 +199,7 @@ function App() {
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>
-  </main>{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
+  </main><ButtonHelp />{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
 }
 
 async function bootstrap() {
