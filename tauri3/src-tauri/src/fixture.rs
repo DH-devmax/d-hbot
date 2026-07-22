@@ -19,6 +19,7 @@ use crate::models::{
 
 pub const FIXTURE_ACCOUNT: &str = "fixture-nim-10001";
 pub const FIXTURE_GROUP: i64 = 1_143_980;
+pub const FIXTURE_SECOND_GROUP: i64 = 1_143_981;
 pub const FIXTURE_DEVTOOLS_URL: &str = "http://127.0.0.1:9233";
 const FIXTURE_SESSION: &str = "fixture-session-1";
 
@@ -157,6 +158,18 @@ impl FixtureGateway {
             welcome_message: "欢迎 @「[成员]」加入 DH Fixture 测试群。".into(),
             updated_at: now,
         };
+        let second_group = Group {
+            account_id: FIXTURE_ACCOUNT.into(),
+            group_id: FIXTURE_SECOND_GROUP,
+            name: "DH Fixture 第二测试群".into(),
+            owner_user_id: 10001,
+            enabled: false,
+            ai_enabled: false,
+            moderation_enabled: false,
+            manual_takeover: false,
+            welcome_message: "欢迎 @「[成员]」加入 DH Fixture 第二测试群。".into(),
+            updated_at: now,
+        };
         let mut members = BTreeMap::new();
         for user_id in 10001..=10016 {
             let role = if user_id == 10001 {
@@ -203,13 +216,43 @@ impl FixtureGateway {
                 },
             );
         }
+        for user_id in 10001..=10004 {
+            let role = if user_id == 10001 { "owner" } else if user_id == 10002 { "admin" } else { "member" };
+            let name = format!("第二群成员{}", user_id - 10000);
+            members.insert(
+                (FIXTURE_SECOND_GROUP, user_id),
+                Member {
+                    account_id: FIXTURE_ACCOUNT.into(),
+                    group_id: FIXTURE_SECOND_GROUP,
+                    user_id,
+                    nim_id: format!("fixture-second-nim-{user_id}"),
+                    nickname: name.clone(),
+                    card_name: name.clone(),
+                    original_card_name: name,
+                    managed_card_name: String::new(),
+                    card_suffix: String::new(),
+                    role: role.into(),
+                    account_state: "ACCOUNT_STATE_GOOD".into(),
+                    blacklisted: false,
+                    present: true,
+                    join_source: "baseline".into(),
+                    prompt_read: true,
+                    locked_card_name: String::new(),
+                    violation_count: 0,
+                    discovered_at: now,
+                    joined_at: None,
+                    last_seen_at: now,
+                    updated_at: now,
+                },
+            );
+        }
         let contract = Arc::new(ContractReplayEngine::frozen());
         let metadata = contract.metadata();
         let capabilities =
             contract.capabilities_for(&metadata.app_file_version, &metadata.main_script_sha256);
         Self {
             state: Arc::new(RwLock::new(FixtureState {
-                groups: vec![group],
+                groups: vec![group, second_group],
                 members,
                 queue: BTreeMap::new(),
                 seen_message_ids: BTreeMap::new(),
@@ -1320,6 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn group_announcement_round_trips_through_verified_fixture_gateway() {
         let fixture = FixtureGateway::new_default();
+        assert_eq!(fixture.list_groups().await.unwrap().len(), 2);
         assert_eq!(
             fixture.capabilities().announcement,
             CapabilityStatus::Supported
@@ -1339,6 +1383,33 @@ mod tests {
             fixture.snapshot().await.actions.last().unwrap().kind,
             "group_announcement"
         );
+        fixture
+            .set_group_announcement(FIXTURE_SECOND_GROUP, "第二群公告")
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .get_group_announcement(FIXTURE_SECOND_GROUP)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "第二群公告"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_fixture_groups_track_batch_mute_and_unmute_state_independently() {
+        let fixture = FixtureGateway::new_default();
+        assert_eq!(fixture.capabilities().group_mute, CapabilityStatus::Supported);
+        for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
+            fixture.set_group_mute(group_id, true).await.unwrap();
+        }
+        assert_eq!(fixture.snapshot().await.group_mutes, vec![FIXTURE_GROUP, FIXTURE_SECOND_GROUP]);
+        for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
+            fixture.set_group_mute(group_id, false).await.unwrap();
+        }
+        assert!(fixture.snapshot().await.group_mutes.is_empty());
     }
 
     #[tokio::test]
@@ -1519,7 +1590,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_wangshangliao_build_keeps_reads_and_marks_writes_unverified() {
         let fixture = FixtureGateway::new_with_calibration("unknown", &"f".repeat(64));
-        assert_eq!(fixture.list_groups().await.unwrap().len(), 1);
+        assert_eq!(fixture.list_groups().await.unwrap().len(), 2);
         assert_eq!(
             fixture
                 .list_members(FIXTURE_GROUP)

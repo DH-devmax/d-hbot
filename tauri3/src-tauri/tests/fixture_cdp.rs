@@ -67,7 +67,7 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert_eq!(listener["ok"], true);
     let first_listener_session = listener["session"].as_str().unwrap().to_string();
     let groups = gateway.list_groups().await.unwrap();
-    assert_eq!(groups.len(), 1);
+    assert_eq!(groups.len(), 2);
     let roster = gateway.list_members(FIXTURE_GROUP).await.unwrap();
     assert_eq!(roster.reported_count, 16);
     let rename_receipt = gateway

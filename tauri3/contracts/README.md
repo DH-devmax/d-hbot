@@ -28,6 +28,14 @@ receipt, callbacks and expected normalized state. Capability calibration uses
 the exact `(appFileVersion, mainScriptSha256)` pair. A new or changed build is
 `Unverified` until its sanitized trace is replayed successfully.
 
+`execute_group_batch` is an application-level composition over the same frozen
+single-group operations. It accepts only `announcement`, `mute` and `unmute`,
+validates each group independently, and preserves selection order in its result.
+It does not introduce a generic protocol route. For WangShangLiao 2.7.7,
+announcement read/add/update/broadcast is calibrated. Whole-group mute and
+unmute remain `Unverified` until a sanitized two-managed-group trace verifies
+both the `MUTE_MEMBER` and `MUTE_NO` state transitions and restoration.
+
 Raw traces belong in `contracts/raw/`, whose contents are ignored by Git. A
 developer first records actual IPC/NIM request, response, callback and resulting
 state JSON files from the developer build. The collector reads the running local

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Audit, AuditFilters, DailySummary, Group, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
+import type { Audit, AuditFilters, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {
   if (typeof reason === 'string') return reason
@@ -54,6 +54,7 @@ export const api = {
       }))
     }
   },
+  executeGroupBatch: (action: GroupBatchAction, groupIds: number[], text?: string) => invoke<GroupBatchResult[]>('execute_group_batch', { input: { action, groupIds, text: text ?? null } }),
   recallMessage: (message: Message) => invoke<void>('recall_message', { groupId: message.groupId, senderUserId: message.userId, messageId: message.serverMessageId }),
   listRules: (accountId: string, groupId?: number) => invoke<Rule[]>('list_rules', { accountId, groupId: groupId ?? null }),
   saveRule: (rule: Rule) => invoke<number>('save_rule', { rule }),

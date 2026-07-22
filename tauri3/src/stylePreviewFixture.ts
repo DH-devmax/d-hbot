@@ -76,6 +76,7 @@ export function installStylePreviewFixture() {
       case 'list_daily_summaries': return summaries
       case 'query_messages': return { items: messages, nextCursor: null }
       case 'send_text_batch': return (args.groupIds || []).map((groupId: number) => ({ groupId, success: true, messageId: `SENT-${groupId}`, error: '' }))
+      case 'execute_group_batch': return (args.input?.groupIds || []).map((groupId: number) => ({ groupId, success: true, status: 'succeeded', requestId: `STYLE-REQUEST-${groupId}`, messageId: args.input?.action === 'announcement' ? `STYLE-NOTICE-${groupId}` : '', error: '' }))
       case 'list_members': return { members, reportedCount: 16, resolvedCount: 16, complete: true, completeness: 'complete', completenessReason: '', httpReturnedCount: 16, httpReportedCount: 16, nimReturnedCount: 16, nimReportedCount: 16, authority: 'style-preview', sources: ['style-preview'] }
       case 'get_card_settings': return { prefix: 'DH', autoRename: false, paused: false }
       case 'get_ai_automation_settings': return { enabled: true, reply: true, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false }

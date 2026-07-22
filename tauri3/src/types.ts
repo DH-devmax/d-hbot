@@ -175,6 +175,17 @@ export type PageResult<T> = { items: T[]; nextCursor?: string | null }
 
 export type SendResult = { groupId: number; groupName: string; success: boolean; messageId?: string; error?: string }
 
+export type GroupBatchAction = 'announcement' | 'mute' | 'unmute'
+
+export type GroupBatchResult = {
+  groupId: number
+  success: boolean
+  status: string
+  requestId: string
+  messageId: string
+  error: string
+}
+
 export type MessageFilters = {
   accountId?: string
   groupIds?: number[]

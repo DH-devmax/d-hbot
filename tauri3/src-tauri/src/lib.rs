@@ -134,6 +134,33 @@ struct BatchSendResult {
     error: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum GroupBatchAction {
+    Announcement,
+    Mute,
+    Unmute,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupBatchInput {
+    action: GroupBatchAction,
+    group_ids: Vec<i64>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupBatchResult {
+    group_id: i64,
+    success: bool,
+    status: String,
+    request_id: String,
+    message_id: String,
+    error: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GroupManagementContext {
@@ -813,6 +840,100 @@ async fn send_text_batch(
             }),
         }
     }
+    Ok(results)
+}
+
+fn validate_group_batch_input(
+    input: GroupBatchInput,
+) -> AppResult<(GroupBatchAction, Vec<i64>, String)> {
+    let mut group_ids = Vec::with_capacity(input.group_ids.len());
+    for group_id in input.group_ids {
+        if group_id <= 0 {
+            return Err(AppError::new("invalid_group_id", "群 ID 必须为正数"));
+        }
+        if !group_ids.contains(&group_id) {
+            group_ids.push(group_id);
+        }
+    }
+    if group_ids.is_empty() {
+        return Err(AppError::new("groups_empty", "请至少选择一个群"));
+    }
+
+    let text = input.text.unwrap_or_default().trim().to_string();
+    if matches!(input.action, GroupBatchAction::Announcement) {
+        if text.is_empty() {
+            return Err(AppError::new("announcement_empty", "群公告内容不能为空"));
+        }
+        if text.chars().count() > 1000 {
+            return Err(AppError::new("announcement_too_long", "群公告最多 1000 个字符"));
+        }
+    }
+    Ok((input.action, group_ids, text))
+}
+
+#[tauri::command]
+async fn execute_group_batch(
+    state: State<'_, AppState>,
+    input: GroupBatchInput,
+) -> AppResult<Vec<GroupBatchResult>> {
+    let (action, group_ids, text) = validate_group_batch_input(input)?;
+
+    let account_id = state.gateway.session_identity().await?.1;
+    let (kind, reason) = match action {
+        GroupBatchAction::Announcement => ("announcement", "人工批量更新群公告"),
+        GroupBatchAction::Mute => ("group_mute", "人工批量全员禁言"),
+        GroupBatchAction::Unmute => ("group_mute", "人工批量解除全禁"),
+    };
+    let mut results = Vec::with_capacity(group_ids.len());
+
+    for group_id in group_ids {
+        let gateway_result = async {
+            require_manager(&state, group_id).await?;
+            match action {
+                GroupBatchAction::Announcement => {
+                    state.gateway.set_group_announcement(group_id, &text).await
+                }
+                GroupBatchAction::Mute => state.gateway.set_group_mute(group_id, true).await,
+                GroupBatchAction::Unmute => state.gateway.set_group_mute(group_id, false).await,
+            }
+        }
+        .await;
+
+        match archive_manual_gateway_result(
+            &state,
+            &account_id,
+            group_id,
+            0,
+            kind,
+            0,
+            reason,
+            gateway_result,
+        )
+        .await
+        {
+            Ok(receipt) => results.push(GroupBatchResult {
+                group_id,
+                success: true,
+                status: receipt.status,
+                request_id: receipt.request_id,
+                message_id: receipt.message_id,
+                error: String::new(),
+            }),
+            Err(error) => results.push(GroupBatchResult {
+                group_id,
+                success: false,
+                status: if error.delivery_outcome_unknown() {
+                    "unknown".into()
+                } else {
+                    "failed".into()
+                },
+                request_id: String::new(),
+                message_id: String::new(),
+                error: error.message,
+            }),
+        }
+    }
+
     Ok(results)
 }
 
@@ -2137,6 +2258,7 @@ macro_rules! dh_handlers {
             save_ai_settings,
             send_text,
             send_text_batch,
+            execute_group_batch,
             query_messages,
             recent_messages,
             set_group_features,
@@ -2603,7 +2725,7 @@ pub fn run() {
 mod close_behavior_tests {
     use super::{
         manual_event_name, normalize_close_behavior, redact_archived_receipt,
-        wang_auto_start_enabled,
+        validate_group_batch_input, wang_auto_start_enabled, GroupBatchAction, GroupBatchInput,
     };
     use crate::gateway::GatewayReceipt;
 
@@ -2646,5 +2768,31 @@ mod close_behavior_tests {
         let archived = serde_json::to_string(&receipt).unwrap();
         assert!(!archived.contains(&secret));
         assert!(archived.contains("***"));
+    }
+
+    #[test]
+    fn group_batch_validation_deduplicates_in_order_and_limits_announcements() {
+        let (action, group_ids, text) = validate_group_batch_input(GroupBatchInput {
+            action: GroupBatchAction::Announcement,
+            group_ids: vec![20, 10, 20],
+            text: Some("  群公告  ".into()),
+        })
+        .unwrap();
+        assert_eq!(action, GroupBatchAction::Announcement);
+        assert_eq!(group_ids, vec![20, 10]);
+        assert_eq!(text, "群公告");
+
+        assert!(validate_group_batch_input(GroupBatchInput {
+            action: GroupBatchAction::Announcement,
+            group_ids: vec![1],
+            text: Some("超".repeat(1001)),
+        })
+        .is_err());
+        assert!(validate_group_batch_input(GroupBatchInput {
+            action: GroupBatchAction::Mute,
+            group_ids: vec![0],
+            text: None,
+        })
+        .is_err());
     }
 }

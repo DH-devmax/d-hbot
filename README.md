@@ -41,6 +41,10 @@ pnpm tauri:build:developer
 - `package/DH-BOT-Default-Rules.json`：DH BOT 默认群管规则模板（兼容 ZCG 规则行为）。
 - `docs/DH使用手册.md`：中文使用手册。
 - `docs/DH-Manual-ZH.pdf`：当前 Tauri 界面图解手册。
+- `docs/ARCHITECTURE.md`：React、Tauri、Rust、SQLite 与 CDP/NIM 数据流。
+- `docs/FEATURE-CATALOG.md`：功能入口、命令、默认开关、权限和能力状态。
+- `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互和测试规范。
+- `docs/ISOLATION.md`：生产/开发、端口、数据、凭据和发布仓库隔离。
 - `archive/go-2.7-final/`：旧 Go 2.7 只读源码 ZIP、说明和 SHA-256；当前工作树不保留 Go 源码。
 
 ## 数据与发布

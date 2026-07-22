@@ -79,6 +79,22 @@ type GroupAnnouncement = {
   authorUserId: number
 }
 
+type GroupBatchMode = 'announcement' | 'mute' | 'unmute' | null
+
+type GroupBatchResult = {
+  groupId: number
+  success: boolean
+  status: string
+  requestId: string
+  messageId: string
+  error: string
+}
+
+type GatewayCapabilities = {
+  announcement?: string
+  groupMute?: string
+}
+
 type Props = {
   groups: GroupSummary[]
   selectedGroup: number | null
@@ -136,6 +152,12 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
   const [welcomeMessage, setWelcomeMessage] = useState('欢迎 @「[成员]」加入群聊，请先查看群规。')
   const [announcementText, setAnnouncementText] = useState('')
   const [announcementStatus, setAnnouncementStatus] = useState('正在检测')
+  const [groupBatchMode, setGroupBatchMode] = useState<GroupBatchMode>(null)
+  const [selectedGroupIds, setSelectedGroupIds] = useState<Set<number>>(new Set())
+  const [batchAnnouncementText, setBatchAnnouncementText] = useState('')
+  const [groupBatchResults, setGroupBatchResults] = useState<GroupBatchResult[] | null>(null)
+  const [groupBatchDialogOpen, setGroupBatchDialogOpen] = useState(false)
+  const [gatewayCapabilities, setGatewayCapabilities] = useState<GatewayCapabilities | null>(null)
 
   const filteredGroups = useMemo(() => {
     const query = groupSearch.trim().toLowerCase()
@@ -157,6 +179,9 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
 
   useEffect(() => { setMemberPage(0) }, [memberSearch, roleFilter, roster])
   useEffect(() => { if (memberPage > memberPageCount - 1) setMemberPage(memberPageCount - 1) }, [memberPage, memberPageCount])
+  useEffect(() => {
+    void invoke<GatewayCapabilities>('get_gateway_capabilities').then(setGatewayCapabilities).catch(() => setGatewayCapabilities(null))
+  }, [])
 
   const pagedMembers = useMemo(
     () => visibleMembers.slice(memberPage * memberPageSize, memberPage * memberPageSize + memberPageSize),
@@ -314,6 +339,99 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
       if (!optimized) throw new Error('AI 没有返回可用的公告内容')
       setAnnouncementText(optimized)
       onError('AI 已优化公告，请确认内容后再发布')
+    } catch (reason) {
+      onError(actionError(reason))
+    } finally {
+      setActiveAction('')
+    }
+  }
+
+  const groupBatchCapability = groupBatchMode === 'announcement'
+    ? gatewayCapabilities?.announcement
+    : groupBatchMode
+      ? gatewayCapabilities?.groupMute
+      : undefined
+  const groupBatchBlocked = Boolean(groupBatchMode && groupBatchCapability && groupBatchCapability !== 'supported')
+  const groupBatchCapabilityLabel = groupBatchCapability === 'unverified' ? '当前旺商聊版本尚未完成能力校准' : groupBatchCapability === 'unsupported' ? '当前旺商聊版本不支持此功能' : ''
+  const enterGroupBatch = (mode: Exclude<GroupBatchMode, null>) => {
+    setGroupBatchMode(mode)
+    setSelectedGroupIds(new Set())
+    setGroupBatchResults(null)
+    setGroupBatchDialogOpen(false)
+    if (mode === 'announcement') setBatchAnnouncementText(announcementText)
+  }
+  const toggleGroupSelection = (groupId: number) => {
+    setSelectedGroupIds(previous => {
+      const next = new Set(previous)
+      if (next.has(groupId)) next.delete(groupId)
+      else next.add(groupId)
+      return next
+    })
+  }
+  const allFilteredGroupsSelected = filteredGroups.length > 0 && filteredGroups.every(group => selectedGroupIds.has(group.groupId))
+  const toggleAllFilteredGroups = () => {
+    setSelectedGroupIds(previous => {
+      const next = new Set(previous)
+      if (allFilteredGroupsSelected) filteredGroups.forEach(group => next.delete(group.groupId))
+      else filteredGroups.forEach(group => next.add(group.groupId))
+      return next
+    })
+  }
+  const closeGroupBatch = () => {
+    setGroupBatchMode(null)
+    setSelectedGroupIds(new Set())
+    setGroupBatchResults(null)
+    setGroupBatchDialogOpen(false)
+  }
+  const runGroupBatch = async (retryIds?: number[]) => {
+    if (!groupBatchMode) return
+    const ids = retryIds?.length ? retryIds : Array.from(selectedGroupIds)
+    if (!ids.length) {
+      onError('请先选择至少一个群')
+      return
+    }
+    const text = batchAnnouncementText.trim()
+    if (groupBatchMode === 'announcement' && !text) {
+      onError('请先填写公告内容')
+      return
+    }
+    if (groupBatchBlocked) {
+      onError(groupBatchCapabilityLabel || '当前能力尚未校准')
+      return
+    }
+    const names = ids.map(id => groups.find(group => group.groupId === id)?.name || `群 ${id}`).join('、')
+    const label = groupBatchMode === 'announcement' ? '发布公告' : groupBatchMode === 'mute' ? '开启全员禁言' : '解除全禁'
+    if (!window.confirm(`确认对以下 ${ids.length} 个群${label}？\n${names}`)) return
+    setActiveAction('group-batch')
+    onError('')
+    try {
+      const results = await invoke<GroupBatchResult[]>('execute_group_batch', { input: { action: groupBatchMode, groupIds: ids, text: groupBatchMode === 'announcement' ? text : null } })
+      setGroupBatchResults(results)
+      const succeeded = results.filter(result => result.success).length
+      const failed = results.length - succeeded
+      const failedIds = new Set(results.filter(result => !result.success && result.status !== 'unknown').map(result => result.groupId))
+      setSelectedGroupIds(failedIds)
+      onError(failed ? `${label}完成：成功 ${succeeded} 个，失败 ${failed} 个。失败群已保留，可检查后重试。` : `${label}完成：${succeeded} 个群全部成功`)
+    } catch (reason) {
+      onError(actionError(reason))
+    } finally {
+      setActiveAction('')
+    }
+  }
+  const optimizeBatchAnnouncement = async () => {
+    const source = batchAnnouncementText.trim()
+    if (!source) return
+    setActiveAction('group-batch:ai')
+    onError('')
+    try {
+      const result = await invoke<{ decision: { reply?: string } }>('test_ai', {
+        message: `请优化下面这段群公告。保留原有事实、日期、金额、规则和链接，不补充未经提供的信息；语气自然、清楚、简洁，适合同时发布到多个群。只把优化后的完整公告写入 reply。\n\n原公告：\n${source}`,
+        recentContext: [],
+      })
+      const optimized = result.decision.reply?.trim()
+      if (!optimized) throw new Error('AI 没有返回可用的公告内容')
+      setBatchAnnouncementText(optimized)
+      onError('AI 已优化公告草稿，请确认内容后再发布')
     } catch (reason) {
       onError(actionError(reason))
     } finally {
@@ -516,9 +634,19 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
   return <div className="page-stack group-member-workspace">
     <div className="view-tabs" role="tablist"><button className={viewMode === 'groups' ? 'active' : ''} onClick={() => setViewMode('groups')} role="tab">群组</button><button className={viewMode === 'members' ? 'active' : ''} onClick={() => setViewMode('members')} role="tab" disabled={!activeGroup}>成员</button><span>{activeGroup ? `当前群：${activeGroup.name}` : '请选择群'}</span></div>
     <section className={`group-pane section ${viewMode !== 'groups' ? 'pane-hidden' : ''}`}>
-      <div className="section-head"><div><span className="eyebrow">选择管理群</span><h2>群组</h2></div><span className="muted">{filteredGroups.length} / {groups.length}</span></div>
-      <label className="search-field"><Search size={15} /><input value={groupSearch} onChange={event => setGroupSearch(event.target.value)} placeholder="搜索群名称" /></label>
-      {filteredGroups.length ? <div className="group-stack">{filteredGroups.map(group => <button className={`group-item ${selectedGroup === group.groupId ? 'selected' : ''}`} key={group.groupId} onClick={() => { setSelectedGroup(group.groupId); setViewMode('members') }}><span><strong>{group.name || '未命名群'}</strong><small>{group.enabled ? 'AI 自动化已开启' : 'AI 自动化未开启'}</small></span><em className={group.enabled ? 'enabled' : ''}>{group.enabled ? 'AI 开启' : 'AI 关闭'}</em></button>)}</div> : <div className="compact-empty">没有匹配的群</div>}
+      <div className="section-head"><div><span className="eyebrow">选择管理群</span><h2>群组</h2></div><span className="muted">共 {groups.length} 个群{groupSearch.trim() ? ` · 当前显示 ${filteredGroups.length} 个` : ''}</span></div>
+      <label className="search-field"><Search size={15} aria-hidden="true" /><input value={groupSearch} onChange={event => setGroupSearch(event.target.value)} placeholder="搜索群名称" /></label>
+      <div className="group-batch-actions" aria-label="批量群控">
+        <button className="secondary" data-help={gatewayCapabilities?.announcement === 'unverified' ? '当前旺商聊版本尚未完成群公告协议校准。' : '选择多个群，使用同一份公告内容逐群发布；失败群会单独列出。'} onClick={() => enterGroupBatch('announcement')} disabled={Boolean(activeAction) || gatewayCapabilities?.announcement !== 'supported'}><Megaphone size={14} />批量公告</button>
+        <button className="secondary" data-help={gatewayCapabilities?.groupMute === 'unverified' ? '当前旺商聊版本尚未完成全员禁言协议校准。' : '选择多个群，按顺序开启全员禁言；每个群都会单独记录结果。'} onClick={() => enterGroupBatch('mute')} disabled={Boolean(activeAction) || gatewayCapabilities?.groupMute !== 'supported'}><VolumeX size={14} />批量全员禁言</button>
+        <button className="secondary" data-help={gatewayCapabilities?.groupMute === 'unverified' ? '当前旺商聊版本尚未完成解除全禁协议校准。' : '选择多个群，按顺序解除全员禁言；每个群都会单独记录结果。'} onClick={() => enterGroupBatch('unmute')} disabled={Boolean(activeAction) || gatewayCapabilities?.groupMute !== 'supported'}><Volume2 size={14} />批量解除全禁</button>
+      </div>
+      {groupBatchMode && <div className="group-batch-selection">
+        <div><strong>{groupBatchMode === 'announcement' ? '批量公告' : groupBatchMode === 'mute' ? '批量全员禁言' : '批量解除全禁'}</strong><span>只会处理当前选中的群，搜索后“全选”只作用于当前结果。</span></div>
+        <div className="group-batch-selection-actions"><button className="secondary" data-help="选中当前搜索结果中的全部群，不会选中被搜索条件隐藏的群。" onClick={toggleAllFilteredGroups} disabled={!filteredGroups.length}>{allFilteredGroupsSelected ? '取消全选当前结果' : '全选当前搜索结果'}</button><button className="secondary" data-help="清空当前批量操作的群选择，避免误操作。" onClick={() => setSelectedGroupIds(new Set())}>清空选择</button><span>已选 {selectedGroupIds.size} 个群</span><button className="primary" data-help="打开确认窗口，查看群名称和操作内容；确认前不会执行。" onClick={() => { setGroupBatchResults(null); setGroupBatchDialogOpen(true) }} disabled={!selectedGroupIds.size || groupBatchBlocked}>{groupBatchMode === 'announcement' ? '编辑公告' : '核对并执行'}</button><button className="secondary" data-help="退出批量模式并清空本次选择。" onClick={closeGroupBatch}>取消批量</button></div>
+        {groupBatchBlocked && <small className="group-batch-warning">{groupBatchCapabilityLabel}</small>}
+      </div>}
+      {filteredGroups.length ? <div className="group-stack">{filteredGroups.map(group => groupBatchMode ? <label className={`group-item group-item-selectable ${selectedGroupIds.has(group.groupId) ? 'selected' : ''}`} key={group.groupId}><input type="checkbox" checked={selectedGroupIds.has(group.groupId)} onChange={() => toggleGroupSelection(group.groupId)} aria-label={`选择群 ${group.name || group.groupId}`} /><span><strong>{group.name || '未命名群'}</strong><small>{group.enabled ? 'AI 自动化已开启' : 'AI 自动化未开启'}</small></span><em className={group.enabled ? 'enabled' : ''}>{group.enabled ? 'AI 开启' : 'AI 关闭'}</em></label> : <button className={`group-item ${selectedGroup === group.groupId ? 'selected' : ''}`} key={group.groupId} onClick={() => { setSelectedGroup(group.groupId); setViewMode('members') }}><span><strong>{group.name || '未命名群'}</strong><small>{group.enabled ? 'AI 自动化已开启' : 'AI 自动化未开启'}</small></span><em className={group.enabled ? 'enabled' : ''}>{group.enabled ? 'AI 开启' : 'AI 关闭'}</em></button>)}</div> : <div className="compact-empty">没有匹配的群</div>}
     </section>
 
     <section className={`member-pane section ${viewMode !== 'members' ? 'pane-hidden' : ''}`}>
@@ -554,5 +682,20 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
         </div>
       </>}
     </section>
+    {groupBatchMode && groupBatchDialogOpen && <div className="dialog-backdrop group-batch-dialog-backdrop" role="presentation" onMouseDown={event => { if (event.currentTarget === event.target && !activeAction) setGroupBatchDialogOpen(false) }}>
+      <section className="group-batch-dialog" role="dialog" aria-modal="true" aria-labelledby="group-batch-title">
+        <header><div><span className="eyebrow">批量群控</span><h2 id="group-batch-title">{groupBatchMode === 'announcement' ? '批量公告' : groupBatchMode === 'mute' ? '批量全员禁言' : '批量解除全禁'}</h2></div><button className="icon-command" data-help="关闭确认窗口，保留当前选中的群。" title="关闭" onClick={() => setGroupBatchDialogOpen(false)} disabled={Boolean(activeAction)}><X size={16} /></button></header>
+        <div className="group-batch-targets"><strong>所选群（{selectedGroupIds.size}）</strong><div>{Array.from(selectedGroupIds).map(groupId => <span key={groupId}>{groups.find(group => group.groupId === groupId)?.name || `群 ${groupId}`}</span>)}</div></div>
+        {groupBatchMode === 'announcement' ? <label className="group-batch-copy">公告内容 <span>{batchAnnouncementText.length} / 1000</span><textarea value={batchAnnouncementText} onChange={event => setBatchAnnouncementText(event.target.value)} maxLength={1000} placeholder="输入要同时发布到所选群的公告内容" disabled={Boolean(activeAction)} /></label> : <p className="group-batch-confirm-copy">{groupBatchMode === 'mute' ? '执行后，所选群的普通成员会停止发言。请核对群名称，操作结果将逐群记录。' : '执行后，所选群会恢复普通成员发言。请核对群名称，操作结果将逐群记录。'}</p>}
+        {groupBatchResults && <div className="group-batch-results" aria-live="polite"><strong>执行结果</strong>{groupBatchResults.map(result => <div key={result.groupId} className={result.success ? 'succeeded' : result.status === 'unknown' ? 'unknown' : 'failed'}><span>{groups.find(group => group.groupId === result.groupId)?.name || `群 ${result.groupId}`}</span><b>{result.success ? '成功' : result.status === 'unknown' ? '请到旺商聊确认' : '失败'}</b><small>{result.error || result.requestId || result.messageId}</small></div>)}</div>}
+        <footer>
+          {groupBatchMode === 'announcement' && <button className="secondary" data-help="调用当前 AI 配置优化公告草稿，只更新输入框，不会直接发布。" onClick={() => void optimizeBatchAnnouncement()} disabled={!batchAnnouncementText.trim() || Boolean(activeAction)}><Sparkles size={14} />{activeAction === 'group-batch:ai' ? '优化中' : 'AI 优化'}</button>}
+          <span />
+          <button className="secondary" data-help="关闭窗口并保留当前选择，稍后还可继续操作。" onClick={() => setGroupBatchDialogOpen(false)} disabled={Boolean(activeAction)}>取消</button>
+          {groupBatchResults?.some(result => !result.success && result.status !== 'unknown') && <button className="secondary" data-help="只重新执行明确失败的群；回执状态未知的群需要先到旺商聊核对。" onClick={() => void runGroupBatch(groupBatchResults.filter(result => !result.success && result.status !== 'unknown').map(result => result.groupId))} disabled={Boolean(activeAction)}>重试失败群</button>}
+          {!groupBatchResults && <button className="primary" data-help="执行前还会显示系统确认；每个群独立处理并保存回执和审计。" onClick={() => void runGroupBatch()} disabled={!selectedGroupIds.size || groupBatchBlocked || Boolean(activeAction) || (groupBatchMode === 'announcement' && !batchAnnouncementText.trim())}>{activeAction === 'group-batch' ? '处理中' : groupBatchMode === 'announcement' ? `发布到 ${selectedGroupIds.size} 个群` : groupBatchMode === 'mute' ? `禁言 ${selectedGroupIds.size} 个群` : `解除 ${selectedGroupIds.size} 个群`}</button>}
+        </footer>
+      </section>
+    </div>}
   </div>
 }
