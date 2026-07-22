@@ -200,4 +200,12 @@ function App() {
   </main>{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>
 }
 
-createRoot(document.getElementById('root')!).render(<AppErrorBoundary><App /></AppErrorBoundary>)
+async function bootstrap() {
+  if (import.meta.env.MODE === 'style') {
+    const { installStylePreviewFixture } = await import('./stylePreviewFixture')
+    installStylePreviewFixture()
+  }
+  createRoot(document.getElementById('root')!).render(<AppErrorBoundary><App /></AppErrorBoundary>)
+}
+
+void bootstrap()

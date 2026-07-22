@@ -14,6 +14,7 @@
     "test:production": "cargo test --manifest-path src-tauri/Cargo.toml --no-default-features",
     "dev": "vite --mode production --host 127.0.0.1",
     "dev:developer": "vite --mode developer --host 127.0.0.1",
+    "dev:style": "vite --mode style --host 127.0.0.1",
     "dev:fixture": "node scripts/dev-fixture.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "pnpm tauri:build:production",
