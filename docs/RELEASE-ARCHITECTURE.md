@@ -2,8 +2,9 @@
 
 ## 仓库职责
 
-- `sh492773746/d-hbot`：私有源码仓库，保存 Rust/Tauri 源码、脱敏协议契约、内部 Fixture、测试与签名流程。
-- `sh492773746/d-hbot-releases`：公开发行仓库，只保存 README、发布校验 workflow、签名后的 Windows 产物、手册和 SHA-256。
+- `DH-devmax/d-hbot`：当前私有源码仓库，保存 Rust/Tauri 源码、脱敏协议契约、内部 Fixture、测试与签名流程。
+- `DH-devmax/d-hbot-releases`：当前公开发行仓库，只保存 README、发布校验 workflow、签名后的 Windows 产物、手册和 SHA-256。
+- `sh492773746/d-hbot` 与 `sh492773746/d-hbot-releases`：旧账号归档，当前 workflow 不写入。
 
 公开发行仓库不接收 Rust、TypeScript、Go、PDB、Source Map、Fixture、旺商聊原始协议采集、账号数据或构建凭据。
 
@@ -23,6 +24,29 @@
 - `DH_SIGN_PASSWORD`：PFX 密码。
 
 Secrets 只配置在私有源码仓库。公开发行仓库不保存私有源码访问令牌和签名证书。
+
+## 新账号配置状态
+
+当前活动线路：
+
+| 项目 | 状态 |
+| --- | --- |
+| 私有源码 | `DH-devmax/d-hbot` |
+| 公开发行 | `DH-devmax/d-hbot-releases` |
+| `DH_RELEASE_DEPLOY_KEY` | 已配置到新私有仓库；公钥只挂在新公开发行仓库 |
+| `DH_SIGN_PFX_B64` | 待配置真实 Authenticode PFX |
+| `DH_SIGN_PASSWORD` | 与 PFX 同时配置 |
+| 旧账号仓库 | 仅归档，不参与新 Actions |
+
+配置签名 Secrets 时，在本地受控终端执行，不把 PFX、密码或解码文件放入仓库：
+
+```sh
+base64 < signing-certificate.pfx | tr -d '\\n' | gh secret set DH_SIGN_PFX_B64 --repo DH-devmax/d-hbot
+printf '%s' "$PFX_PASSWORD" | gh secret set DH_SIGN_PASSWORD --repo DH-devmax/d-hbot
+gh secret list --repo DH-devmax/d-hbot
+```
+
+正式 `v3.*` 标签会强制要求这两个 Secrets；未配置时，手动分支构建仍可运行测试和生成内部未签名产物，标签发布会在签名准备阶段停止。
 
 ## 发布命令
 

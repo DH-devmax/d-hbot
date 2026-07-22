@@ -22,6 +22,12 @@ jobs:
         working-directory: tauri3
     steps:
       - uses: actions/checkout@v4
+      - name: Verify active source repository
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne 'DH-devmax/d-hbot') {
+            throw "当前 workflow 只允许在 DH-devmax/d-hbot 执行，实际仓库：$env:GITHUB_REPOSITORY"
+          }
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:
@@ -98,7 +104,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v3.')
         shell: pwsh
         env:
-          DH_RELEASE_REPOSITORY: sh492773746/d-hbot-releases
+          DH_RELEASE_REPOSITORY: DH-devmax/d-hbot-releases
         run: |
           $ErrorActionPreference = 'Stop'
           if (-not $env:SSH_AUTH_SOCK) { throw 'DH_RELEASE_DEPLOY_KEY 未加载' }
@@ -119,7 +125,7 @@ jobs:
           $manifest = [ordered]@{
             schema = 1
             tag = $tag
-            sourceRepository = 'sh492773746/d-hbot'
+            sourceRepository = 'DH-devmax/d-hbot'
             sourceCommit = $env:GITHUB_SHA
             createdAt = [DateTime]::UtcNow.ToString('o')
             files = $files
