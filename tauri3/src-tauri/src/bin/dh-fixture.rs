@@ -682,7 +682,7 @@ async function json(url,options){const response=await fetch(url,options);return 
 async function post(url,body){return json(url,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body||{})})}
 const fixtureState={nimReady:true};
 const ipcListeners=new Map();
-window.__dhFixtureIpc={
+window.__dhIpc={
   once(channel,callback){ipcListeners.set(channel,callback)},
   async send(name,payload){
     const value=await post('/fixture/ipc',payload);

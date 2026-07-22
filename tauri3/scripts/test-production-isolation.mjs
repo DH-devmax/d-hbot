@@ -35,8 +35,8 @@ try {
   const cases = [
     ['fixture binary', 'DH-Fixture.exe', 'placeholder'],
     ['fixture command', 'DH-BOT.exe', 'start_fixture_host'],
-    ['fixture devtools', 'DH-BOT.exe', '9233'],
-    ['fixture server', 'DH-BOT.exe', '51300'],
+    ['fixture devtools', 'DH-BOT.exe', 'http://127.0.0.1:9233'],
+    ['fixture server', 'DH-BOT.exe', 'http://127.0.0.1:51300'],
     ['fixture data path', 'DH-BOT.exe', '%APPDATA%\\DH\\fixture'],
     ['fixture environment', 'DH-BOT.exe', 'DH_RUNTIME_MODE'],
   ]
