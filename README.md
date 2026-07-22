@@ -47,7 +47,10 @@ pnpm tauri:build:developer
 
 - 生产数据：`%APPDATA%\DH\3.0`
 - 开发 Fixture 数据：`%APPDATA%\DH\fixture`
+- 核心源码仓库保持私有；公开下载统一发布到 [`d-hbot-releases`](https://github.com/sh492773746/d-hbot-releases)。
 - 正式标签发布必须配置 Authenticode 证书。
 - 未签名的 CI 产物只作内部 beta，同时生成 SHA-256 校验文件。
+
+发布仓库边界、Deploy Key 和 Actions 投递流程见 [`docs/RELEASE-ARCHITECTURE.md`](docs/RELEASE-ARCHITECTURE.md)。
 
 详细进度和验收边界见 [`tauri3/STATUS.md`](tauri3/STATUS.md)。

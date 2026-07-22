@@ -89,10 +89,45 @@ jobs:
           path: |
             tauri3/dist/production/*
             tauri3/dist/DH-BOT-*-windows-x64-portable.zip
-      - name: Publish production release
+      - name: Prepare release repository SSH key
         if: startsWith(github.ref, 'refs/tags/v3.')
-        uses: softprops/action-gh-release@v2
+        uses: webfactory/ssh-agent@v0.9.0
         with:
-          files: |
-            tauri3/dist/production/*
-            tauri3/dist/DH-BOT-*-windows-x64-portable.zip
+          ssh-private-key: ${{ secrets.DH_RELEASE_DEPLOY_KEY }}
+      - name: Stage signed production release in public repository
+        if: startsWith(github.ref, 'refs/tags/v3.')
+        shell: pwsh
+        env:
+          DH_RELEASE_REPOSITORY: sh492773746/d-hbot-releases
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SSH_AUTH_SOCK) { throw 'DH_RELEASE_DEPLOY_KEY 未加载' }
+          $tag = $env:GITHUB_REF_NAME
+          $source = Join-Path $env:GITHUB_WORKSPACE 'tauri3\dist\production'
+          $portable = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'tauri3\dist') -Filter 'DH-BOT-*-windows-x64-portable.zip' | Select-Object -First 1
+          if (-not $portable) { throw '缺少便携版 ZIP' }
+          $checkout = Join-Path $env:RUNNER_TEMP 'd-hbot-releases'
+          Remove-Item $checkout -Recurse -Force -ErrorAction SilentlyContinue
+          git clone --depth 1 "git@github.com:$env:DH_RELEASE_REPOSITORY.git" $checkout
+          if ($LASTEXITCODE -ne 0) { throw '公开发行仓库检出失败' }
+          $incoming = Join-Path $checkout "incoming\$tag"
+          if (Test-Path $incoming) { throw "公开发行仓库已存在待发布版本：$tag" }
+          New-Item -ItemType Directory -Force -Path $incoming | Out-Null
+          Get-ChildItem $source -File | ForEach-Object { Copy-Item $_.FullName (Join-Path $incoming $_.Name) }
+          Copy-Item $portable.FullName (Join-Path $incoming $portable.Name)
+          $files = @(Get-ChildItem $incoming -File | Sort-Object Name | Select-Object -ExpandProperty Name)
+          $manifest = [ordered]@{
+            schema = 1
+            tag = $tag
+            sourceRepository = 'sh492773746/d-hbot'
+            sourceCommit = $env:GITHUB_SHA
+            createdAt = [DateTime]::UtcNow.ToString('o')
+            files = $files
+          } | ConvertTo-Json -Depth 3
+          $manifest | Set-Content (Join-Path $incoming 'release.json') -Encoding utf8
+          git -C $checkout config user.name 'dh-bot-release-bot'
+          git -C $checkout config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C $checkout add "incoming/$tag"
+          git -C $checkout commit -m "stage: DH BOT $tag"
+          git -C $checkout push origin main
+          if ($LASTEXITCODE -ne 0) { throw '公开发行仓库推送失败' }
