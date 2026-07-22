@@ -20,6 +20,9 @@ describe('GroupMembersPage control tabs', () => {
       if (command === 'list_members') return Promise.resolve({ members: [], reportedCount: 0, resolvedCount: 0, complete: true, sources: [] })
       if (command === 'get_card_settings') return Promise.resolve({ prefix: 'DH', autoRename: false, paused: false })
       if (command === 'get_ai_automation_settings') return Promise.resolve({ enabled: true, reply: true, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false })
+      if (command === 'get_group_management_context') return Promise.resolve({ groupId: 100, isManager: true, announcementStatus: '可用' })
+      if (command === 'get_group_announcement') return Promise.resolve({ groupId: 100, noticeId: 'NOTICE', content: '群公告内容', mode: 'COMMON_NOTICE', authorUserId: 1 })
+      if (command === 'test_ai') return Promise.resolve({ decision: { reply: '优化后的群公告' }, elapsedMs: 10, model: 'test' })
       if (command === 'list_card_rename_jobs') return Promise.resolve([])
       return Promise.resolve(null)
     })
@@ -31,6 +34,10 @@ describe('GroupMembersPage control tabs', () => {
 
     expect(screen.getByRole('tab', { name: /人工群控/ })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('button', { name: '全员禁言' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '发布公告' })).toBeDisabled()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'AI 优化' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: 'AI 优化' }))
+    await waitFor(() => expect(screen.getByDisplayValue('优化后的群公告')).toBeInTheDocument())
 
     await user.click(screen.getByRole('tab', { name: /AI 自动化/ }))
     await waitFor(() => expect(screen.getByRole('switch', { name: /AI 总开关/ })).toBeInTheDocument())

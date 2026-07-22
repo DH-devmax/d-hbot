@@ -68,7 +68,7 @@ export default function MessagesPage({ groups, accountId, onError }: { groups: G
     <section className="section">
       <SectionHeading eyebrow="实时流水线" title="消息台" meta={`${messages.length} 条`} actions={<button className="secondary" onClick={() => void reload()}><RefreshCw size={15} />刷新</button>} />
       <div className="filter-grid">
-        <label className="search-field wide"><Search size={15} /><input value={keyword} onChange={event => setKeyword(event.target.value)} onKeyDown={event => event.key === 'Enter' && void reload()} placeholder="搜索成员、内容或消息 ID" /></label>
+        <label className="search-field wide"><Search size={15} aria-hidden="true" /><input aria-label="搜索消息" value={keyword} onChange={event => setKeyword(event.target.value)} onKeyDown={event => event.key === 'Enter' && void reload()} placeholder="搜索成员、内容或消息 ID" /></label>
         <label><span>消息类型</span><select value={kind} onChange={event => { const value = event.target.value; setKind(value); void reload({ kind: value }) }}><option value="all">全部类型</option>{Object.entries(kindLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
         <label><span>处理状态</span><select value={processingState} onChange={event => { const value = event.target.value; setProcessingState(value); void reload({ processingState: value }) }}><option value="all">全部状态</option>{Object.entries(stateLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
       </div>

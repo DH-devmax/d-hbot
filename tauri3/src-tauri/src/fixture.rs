@@ -13,7 +13,9 @@ use crate::gateway::{
     DiagnosticSnapshot, GatewayBatch, GatewayCapabilities, GatewayEvent, GatewayReceipt,
     GatewayRecord, GatewayRecordKind, GroupGateway, RuntimeGateway,
 };
-use crate::models::{Group, Member, MemberRef, MemberRoster, RosterCompleteness};
+use crate::models::{
+    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, RosterCompleteness,
+};
 
 pub const FIXTURE_ACCOUNT: &str = "fixture-nim-10001";
 pub const FIXTURE_GROUP: i64 = 1_143_980;
@@ -65,6 +67,14 @@ pub struct FixtureMemberMute {
     pub duration_seconds: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixtureAnnouncement {
+    pub group_id: i64,
+    pub notice_id: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FixtureMessageOptions {
     pub msg_format: i64,
@@ -97,6 +107,7 @@ pub struct FixtureSnapshot {
     pub events: Vec<FixtureEvent>,
     pub member_mutes: Vec<FixtureMemberMute>,
     pub group_mutes: Vec<i64>,
+    pub announcements: Vec<FixtureAnnouncement>,
     pub recalled_messages: Vec<String>,
     pub faults: FixtureFaults,
 }
@@ -111,6 +122,7 @@ struct FixtureState {
     events: Vec<FixtureEvent>,
     member_mutes: BTreeMap<(i64, i64), i64>,
     group_mutes: BTreeSet<i64>,
+    announcements: BTreeMap<i64, FixtureAnnouncement>,
     recalled_messages: BTreeSet<String>,
     faults: FixtureFaults,
     next_sequence: u64,
@@ -205,6 +217,7 @@ impl FixtureGateway {
                 events: Vec::new(),
                 member_mutes: BTreeMap::new(),
                 group_mutes: BTreeSet::new(),
+                announcements: BTreeMap::new(),
                 recalled_messages: BTreeSet::new(),
                 faults: FixtureFaults {
                     devtools_ready: true,
@@ -260,6 +273,7 @@ impl FixtureGateway {
                 )
                 .collect(),
             group_mutes: state.group_mutes.iter().copied().collect(),
+            announcements: state.announcements.values().cloned().collect(),
             recalled_messages: state.recalled_messages.iter().cloned().collect(),
             faults: state.faults.clone(),
         }
@@ -695,6 +709,16 @@ impl FixtureGateway {
                     )
                     .await?,
                 ),
+                "/v1/group/add-notice" => Self::receipt_value(
+                    self.set_group_announcement(
+                        payload.get("groupId").and_then(Value::as_i64).unwrap_or(0),
+                        payload
+                            .get("noticeContent")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .await?,
+                ),
                 _ => Err(AppError::new(
                     "fixture_route",
                     format!("Fixture 未实现路由：{route}"),
@@ -1031,6 +1055,45 @@ impl GroupGateway for FixtureGateway {
             String::new(),
         ))
     }
+
+    async fn get_group_announcement(&self, group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
+        let state = self.state.read().await;
+        Ok(state
+            .announcements
+            .get(&group_id)
+            .map(|value| GroupAnnouncement {
+                group_id,
+                notice_id: value.notice_id.clone(),
+                content: value.content.clone(),
+                mode: "COMMON_NOTICE".into(),
+                author_user_id: 10001,
+            }))
+    }
+
+    async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
+        let mut state = self.state.write().await;
+        Self::fault_error(&mut state.faults)?;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            return Err(AppError::new("group_not_found", "Fixture 群不存在"));
+        }
+        if text.trim().is_empty() {
+            return Err(AppError::new("invalid_argument", "Fixture 群公告为空"));
+        }
+        let ordinal = state.actions.len() + 1;
+        let notice_id = format!("fixture-notice-{ordinal}");
+        state.announcements.insert(
+            group_id,
+            FixtureAnnouncement {
+                group_id,
+                notice_id,
+                content: text.into(),
+            },
+        );
+        state
+            .actions
+            .push(Self::action("group_announcement", group_id, 0, text, 0));
+        Ok(self.receipt("/v1/group/add-notice", ordinal, String::new()))
+    }
 }
 
 #[async_trait]
@@ -1252,6 +1315,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fixture.snapshot().await.actions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn group_announcement_round_trips_through_verified_fixture_gateway() {
+        let fixture = FixtureGateway::new_default();
+        assert_eq!(
+            fixture.capabilities().announcement,
+            CapabilityStatus::Supported
+        );
+        let receipt = fixture
+            .set_group_announcement(FIXTURE_GROUP, "Fixture 群公告")
+            .await
+            .unwrap();
+        assert_eq!(receipt.route, "/v1/group/add-notice");
+        let announcement = fixture
+            .get_group_announcement(FIXTURE_GROUP)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(announcement.content, "Fixture 群公告");
+        assert_eq!(
+            fixture.snapshot().await.actions.last().unwrap().kind,
+            "group_announcement"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, type ReactNode } from 'rea
 import { createRoot } from 'react-dom/client'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Activity, BookOpen, Bug, CalendarClock, CircleAlert, MessagesSquare, Settings2, ShieldCheck } from 'lucide-react'
+import { Activity, BookOpen, Bug, CalendarClock, CircleAlert, MessagesSquare, Settings2, ShieldCheck, Users } from 'lucide-react'
 import './styles.css'
 import './brand.css'
 import './runtime.css'
@@ -34,7 +34,7 @@ class AppErrorBoundary extends React.Component<{ children: ReactNode }, { messag
 }
 
 const nav: [PageName, typeof Activity][] = [
-  ['总览', Activity], ['群组与成员', MessagesSquare], ['消息台', MessagesSquare], ['规则', ShieldCheck],
+  ['总览', Activity], ['群组与成员', Users], ['消息台', MessagesSquare], ['规则', ShieldCheck],
   ['知识与 AI', BookOpen], ['任务与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
 ]
 

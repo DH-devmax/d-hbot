@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "metadata": {
+    "product": "旺商聊",
+    "appFileVersion": "2.7.7",
+    "pageTitle": "旺商聊",
+    "mainScriptSha256": "17af5c0697c9a091f3112a26d21a7815dd1d635a7e424c392986dc53ce5fd149",
+    "patchedMainScriptSha256": "52da37f6d0ea6419d58caee55f4ae1aac083e4d8fa641f46529e2e4b91e627e2",
+    "rendererScriptSha256": "8c5d5c0d670808ac5daa69a65aa429b5034cd82ad8609ee3049f22b813a5d533",
+    "capture": "real-page-script-and-live-edit",
+    "sanitized": true
+  },
+  "operations": [
+    {
+      "name": "listNotices",
+      "route": "/v1/group/notice-list",
+      "request": {"groupId": "GROUP", "v": "0"}
+    },
+    {
+      "name": "addNotice",
+      "route": "/v1/group/add-notice",
+      "request": {"groupId": "GROUP", "noticeContent": "NOTICE_TEXT", "noticeMode": "COMMON_NOTICE"}
+    },
+    {
+      "name": "updateNotice",
+      "route": "/v1/group/notice-opt",
+      "request": {"groupId": "GROUP", "noticeId": "NOTICE", "noticeContent": "NOTICE_TEXT", "noticeMode": "COMMON_NOTICE"}
+    },
+    {
+      "name": "deleteNotice",
+      "route": "/v1/group/notice-del",
+      "request": {"groupId": "GROUP", "noticeId": "NOTICE"}
+    }
+  ],
+  "nimBroadcast": {
+    "scene": "team",
+    "msgFormat": 8,
+    "msgSession": 2,
+    "to": "GROUP_CLOUD",
+    "groupNotice": {"content": "NOTICE_TEXT", "noticeId": "NOTICE"}
+  },
+  "verified": {
+    "list": true,
+    "update": true,
+    "restoreOriginalContent": true,
+    "nimBroadcast": true,
+    "testMessageRecalled": true
+  }
+}

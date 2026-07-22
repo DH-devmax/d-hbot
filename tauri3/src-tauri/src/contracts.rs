@@ -87,7 +87,7 @@ fn capabilities_from_registry(
 
 pub(crate) fn unverified_production_capabilities() -> GatewayCapabilities {
     GatewayCapabilities {
-        announcement: CapabilityStatus::Unsupported,
+        announcement: CapabilityStatus::Unverified,
         send_text: CapabilityStatus::Unverified,
         mute: CapabilityStatus::Unverified,
         recall: CapabilityStatus::Unverified,
@@ -440,7 +440,7 @@ mod gateway_v2 {
 
     fn unverified_capabilities() -> GatewayCapabilities {
         GatewayCapabilities {
-            announcement: CapabilityStatus::Unsupported,
+            announcement: CapabilityStatus::Unverified,
             send_text: CapabilityStatus::Unverified,
             mute: CapabilityStatus::Unverified,
             recall: CapabilityStatus::Unverified,
@@ -584,19 +584,19 @@ mod tests {
             engine.capabilities_for(&metadata.app_file_version, &metadata.main_script_sha256);
         assert_eq!(known.rename, CapabilityStatus::Supported);
         assert_eq!(known.send_text, CapabilityStatus::Supported);
-        assert_eq!(known.announcement, CapabilityStatus::Unsupported);
+        assert_eq!(known.announcement, CapabilityStatus::Supported);
 
         let unknown_hash = engine.capabilities_for(&metadata.app_file_version, &"f".repeat(64));
         assert_eq!(unknown_hash.rename, CapabilityStatus::Unverified);
         assert_eq!(unknown_hash.send_text, CapabilityStatus::Unverified);
         assert_eq!(unknown_hash.mute, CapabilityStatus::Unverified);
-        assert_eq!(unknown_hash.announcement, CapabilityStatus::Unsupported);
+        assert_eq!(unknown_hash.announcement, CapabilityStatus::Unverified);
     }
 
     #[test]
     fn production_registry_defaults_unknown_versions_to_read_only() {
         let unknown = production_capabilities("unknown", &"f".repeat(64));
-        assert_eq!(unknown.announcement, CapabilityStatus::Unsupported);
+        assert_eq!(unknown.announcement, CapabilityStatus::Unverified);
         assert_eq!(unknown.send_text, CapabilityStatus::Unverified);
         assert_eq!(unknown.rename, CapabilityStatus::Unverified);
 
@@ -624,6 +624,19 @@ mod tests {
             capabilities_from_registry(&raw, "2.6.3", &"a".repeat(64)),
             expected
         );
+    }
+
+    #[test]
+    fn verified_277_build_enables_only_captured_announcement_write() {
+        for hash in [
+            "17af5c0697c9a091f3112a26d21a7815dd1d635a7e424c392986dc53ce5fd149",
+            "52da37f6d0ea6419d58caee55f4ae1aac083e4d8fa641f46529e2e4b91e627e2",
+        ] {
+            let capabilities = production_capabilities("2.7.7", hash);
+            assert_eq!(capabilities.announcement, CapabilityStatus::Supported);
+            assert_eq!(capabilities.send_text, CapabilityStatus::Unverified);
+            assert_eq!(capabilities.rename, CapabilityStatus::Unverified);
+        }
     }
 
     #[test]

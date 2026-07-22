@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Ban, Bot, Check, ChevronLeft, ChevronRight, Hand, Pencil, RefreshCw, Search, Shield, Sparkles, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
+import { Ban, Bot, Check, ChevronLeft, ChevronRight, Hand, Megaphone, Pencil, RefreshCw, Search, Shield, Sparkles, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
 import './members.css'
 
 type GroupSummary = {
@@ -65,6 +65,20 @@ type MemberBatchResult = {
   error: string
 }
 
+type GroupManagementContext = {
+  groupId: number
+  isManager: boolean
+  announcementStatus: string
+}
+
+type GroupAnnouncement = {
+  groupId: number
+  noticeId: string
+  content: string
+  mode: string
+  authorUserId: number
+}
+
 type Props = {
   groups: GroupSummary[]
   selectedGroup: number | null
@@ -120,6 +134,8 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
   const [controlTab, setControlTab] = useState<'manual' | 'ai' | 'rules'>('manual')
   const [aiAutomation, setAiAutomation] = useState<AiAutomationSettings>({ enabled: false, reply: false, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false })
   const [welcomeMessage, setWelcomeMessage] = useState('欢迎 @「[成员]」加入群聊，请先查看群规。')
+  const [announcementText, setAnnouncementText] = useState('')
+  const [announcementStatus, setAnnouncementStatus] = useState('正在检测')
 
   const filteredGroups = useMemo(() => {
     const query = groupSearch.trim().toLowerCase()
@@ -177,6 +193,8 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
     setMemberSearch('')
     setRoleFilter('all')
     setSelected(new Set())
+    setAnnouncementStatus('正在检测')
+    setAnnouncementText('')
     if (selectedGroup) {
       void loadMembers(selectedGroup)
       void (async () => {
@@ -189,6 +207,18 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
           setAutoRename(cardSettings.autoRename)
           setCardsPaused(cardSettings.paused)
           setAiAutomation(aiSettings)
+          try {
+            const management = await invoke<GroupManagementContext>('get_group_management_context', { groupId: selectedGroup })
+            setAnnouncementStatus(management.announcementStatus)
+          } catch {
+            setAnnouncementStatus('当前版本待校准')
+          }
+          try {
+            const announcement = await invoke<GroupAnnouncement | null>('get_group_announcement', { groupId: selectedGroup })
+            setAnnouncementText(announcement?.content || '')
+          } catch {
+            setAnnouncementText('')
+          }
         } catch (reason) {
           onError(actionError(reason))
         }
@@ -246,6 +276,44 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
     onError('')
     try {
       await invoke('set_group_mute', { groupId: activeGroup.groupId, muted })
+    } catch (reason) {
+      onError(actionError(reason))
+    } finally {
+      setActiveAction('')
+    }
+  }
+
+  const saveAnnouncement = async () => {
+    if (!activeGroup || !announcementText.trim()) return
+    if (!window.confirm('确认发布或更新当前群公告？保存后群内会出现一条新的公告消息。')) return
+    setActiveAction('announcement')
+    onError('')
+    try {
+      await invoke('set_group_announcement', { groupId: activeGroup.groupId, text: announcementText.trim() })
+      onError('群公告已保存并发送到当前群')
+      const latest = await invoke<GroupAnnouncement | null>('get_group_announcement', { groupId: activeGroup.groupId })
+      setAnnouncementText(latest?.content || announcementText.trim())
+    } catch (reason) {
+      onError(actionError(reason))
+    } finally {
+      setActiveAction('')
+    }
+  }
+
+  const optimizeAnnouncement = async () => {
+    const source = announcementText.trim()
+    if (!source) return
+    setActiveAction('announcement:ai')
+    onError('')
+    try {
+      const result = await invoke<{ decision: { reply?: string } }>('test_ai', {
+        message: `请优化下面这段群公告。保留原有事实、日期、金额、规则和链接，不补充未经提供的信息；语气自然、清楚、简洁，适合直接发布到群里。只把优化后的完整公告写入 reply。\n\n原公告：\n${source}`,
+        recentContext: [],
+      })
+      const optimized = result.decision.reply?.trim()
+      if (!optimized) throw new Error('AI 没有返回可用的公告内容')
+      setAnnouncementText(optimized)
+      onError('AI 已优化公告，请确认内容后再发布')
     } catch (reason) {
       onError(actionError(reason))
     } finally {
@@ -462,7 +530,7 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
           <button className={controlTab === 'rules' ? 'active' : ''} role="tab" aria-selected={controlTab === 'rules'} data-help="打开规则处理设置。欢迎语、群名片和确定性规则都在这里配置，不依赖 AI。" onClick={() => setControlTab('rules')}><Shield size={16} /><span><strong>规则处理</strong><small>{activeGroup.moderationEnabled ? '已开启' : '已关闭'}</small></span></button>
         </div>
         <div className="control-mode-panel" role="tabpanel">
-          {controlTab === 'manual' && <div className="manual-control-bar"><div><Hand size={16} /><span><strong>人工群控</strong><small>仅在点击并确认后执行，不受 AI 自动化开关影响</small></span></div><div><button data-help="立即禁止当前群所有普通成员发言；执行前会再次向你确认。" onClick={() => void toggleGroupMute(true)} disabled={Boolean(activeAction)}><VolumeX size={14} />全员禁言</button><button data-help="解除当前群的全员禁言，让普通成员恢复发言。" onClick={() => void toggleGroupMute(false)} disabled={Boolean(activeAction)}><Volume2 size={14} />解除全禁</button><button data-help="找出已注销或已封禁的普通成员，确认后逐个移出当前群。" onClick={cleanupInactive} disabled={Boolean(activeAction)}><UserMinus size={14} />清理封禁成员</button><button data-help={selected.size ? `把已选择的 ${selected.size} 位群员恢复为 DH 记录的原名称。` : '把当前群内由 DH 修改过的普通成员恢复为原名称。'} onClick={restoreNames} disabled={Boolean(activeAction)}><RefreshCw size={14} />{selected.size ? `恢复名称（${selected.size}）` : '恢复所有名称'}</button></div></div>}
+          {controlTab === 'manual' && <><div className="manual-control-bar"><div><Hand size={16} /><span><strong>人工群控</strong><small>仅在点击并确认后执行，不受 AI 自动化开关影响</small></span></div><div><button data-help="立即禁止当前群所有普通成员发言；执行前会再次向你确认。" onClick={() => void toggleGroupMute(true)} disabled={Boolean(activeAction)}><VolumeX size={14} />全员禁言</button><button data-help="解除当前群的全员禁言，让普通成员恢复发言。" onClick={() => void toggleGroupMute(false)} disabled={Boolean(activeAction)}><Volume2 size={14} />解除全禁</button><button data-help="找出已注销或已封禁的普通成员，确认后逐个移出当前群。" onClick={cleanupInactive} disabled={Boolean(activeAction)}><UserMinus size={14} />清理封禁成员</button><button data-help={selected.size ? `把已选择的 ${selected.size} 位群员恢复为 DH 记录的原名称。` : '把当前群内由 DH 修改过的普通成员恢复为原名称。'} onClick={restoreNames} disabled={Boolean(activeAction)}><RefreshCw size={14} />{selected.size ? `恢复名称（${selected.size}）` : '恢复所有名称'}</button></div></div><div className="manual-announcement"><div><Megaphone size={16} /><span><strong>群公告</strong><small>{announcementStatus === '可用' ? '已通过当前旺商聊版本的真实协议校准' : announcementStatus}</small></span></div><textarea value={announcementText} onChange={event => setAnnouncementText(event.target.value)} maxLength={1000} placeholder="输入要发布的群公告；保存后会同步为群内公告消息。" disabled={announcementStatus !== '可用' || Boolean(activeAction)} /><div className="announcement-actions"><button className="secondary" data-help="调用设置页中的 AI，把当前公告改得更清楚、自然、简洁；只更新输入框，确认前不会发布。" onClick={() => void optimizeAnnouncement()} disabled={!announcementText.trim() || Boolean(activeAction)}><Sparkles size={14} />{activeAction === 'announcement:ai' ? '优化中' : 'AI 优化'}</button><button className="primary" data-help={announcementStatus === '可用' ? '保存公告内容，并按照旺商聊原生协议向当前群发送公告消息。' : `当前群公告状态：${announcementStatus}。完成版本协议校准后按钮会自动开放。`} onClick={() => void saveAnnouncement()} disabled={announcementStatus !== '可用' || !announcementText.trim() || Boolean(activeAction)}><Megaphone size={14} />发布公告</button></div></div></>}
           {controlTab === 'ai' && <div className="ai-automation-panel"><div className="ai-panel-intro"><span><Bot size={18} /></span><div><strong>AI 自动化权限</strong><p>只有群里明确 @DH 才会调用 AI。高影响动作默认关闭，可以逐项授权。</p></div></div><div className="automation-toggle-grid"><AutomationToggle title="AI 总开关" detail="控制该群全部 AI 处理" checked={aiAutomation.enabled} disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ enabled: !aiAutomation.enabled })} /><AutomationToggle title="自动回复" detail="回答 @DH 的业务问题" checked={aiAutomation.reply} disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ reply: !aiAutomation.reply })} /><AutomationToggle title="生成任务" detail="将明确事项写入任务列表" checked={aiAutomation.tasks} disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ tasks: !aiAutomation.tasks })} /><AutomationToggle title="允许撤回" detail="AI 可撤回当前触发消息" checked={aiAutomation.recall} disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ recall: !aiAutomation.recall })} /><AutomationToggle title="允许禁言" detail="AI 可禁言或解除禁言" checked={aiAutomation.mute} disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ mute: !aiAutomation.mute })} /><AutomationToggle title="允许移出" detail="AI 可将普通成员移出群" checked={aiAutomation.remove} danger disabled={Boolean(activeAction)} onChange={() => void saveAiAutomation({ remove: !aiAutomation.remove })} /></div><div className="takeover-row"><div><Hand size={15} /><span><strong>人工接管</strong><small>临时暂停 AI 回复和 AI 动作，固定规则继续运行</small></span></div><button data-help="临时暂停或恢复本群的 AI 回复和 AI 动作；确定性群管规则仍会继续执行。" className={aiAutomation.manualTakeover ? 'active' : ''} onClick={() => void saveAiAutomation({ manualTakeover: !aiAutomation.manualTakeover })} disabled={Boolean(activeAction)}>{aiAutomation.manualTakeover ? '人工接管中' : '由 AI 处理'}</button></div></div>}
           {controlTab === 'rules' && <div className="rule-control-panel"><div className="automatic-workflow-bar"><div><Sparkles size={16} /><span><strong>固定自动处理</strong><small>不依赖 AI，按照确定规则执行</small></span></div><button data-help="开启后，当前群会执行规则页中已启用的确定性规则；关闭后只记录消息，不自动处理。" className={activeGroup.moderationEnabled ? 'feature-on' : ''} onClick={() => void toggleModeration()} disabled={Boolean(activeAction)}><Shield size={14} />群管规则 {activeGroup.moderationEnabled ? '已开启' : '已关闭'}</button></div>
             <div className="group-welcome"><label>欢迎语 <span>[成员] 会替换为新群名片</span><input value={welcomeMessage} onChange={event => setWelcomeMessage(event.target.value)} placeholder="欢迎 @「[成员]」加入群聊，请先查看群规。" /></label><button className="secondary" data-help="保存当前群的欢迎语；新成员完成入群识别和改名后才会发送。" onClick={() => void saveWelcome()} disabled={Boolean(activeAction)}>保存群设置</button></div>

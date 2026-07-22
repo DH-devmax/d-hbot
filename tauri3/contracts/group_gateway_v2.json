@@ -14,7 +14,7 @@
       "mainScriptSha256": "20fd7fecb2ec4573a7c225ecc45a14185ee3400b1097d166aa3a42984d8613ec",
       "verified": true,
       "capabilities": {
-        "announcement": "unsupported",
+        "announcement": "supported",
         "sendText": "supported",
         "mute": "supported",
         "recall": "supported",
@@ -106,6 +106,15 @@
       "business": {"code":0,"errno":0,"msg":"ok","data":{}},
       "normalizedReceipt": {"route":"/v1/group/set-group-mute","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
       "expectedNormalizedState": {"action":"group_mute","groupId":"GROUP_001","muted":true}
+    },
+    {
+      "name": "setGroupAnnouncement",
+      "route": "/v1/group/add-notice",
+      "request": {"kind":"request","params":{"groupId":10001,"noticeContent":"NOTICE_TEXT","noticeMode":"COMMON_NOTICE"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_010"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{"noticeId":"NOTICE_001"}},
+      "normalizedReceipt": {"route":"/v1/group/add-notice","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"group_announcement","groupId":"GROUP_001","noticeId":"NOTICE_001"}
     }
   ],
   "transportFailures": [

@@ -16,7 +16,9 @@ use crate::contracts::{runtime_capabilities, unverified_production_capabilities}
 use crate::error::{
     AppError, AppResult, GatewayErrorKind, GatewayErrorLayer, GatewayErrorMetadata,
 };
-use crate::models::{Group, Member, MemberRef, MemberRoster, Message, RosterCompleteness};
+use crate::models::{
+    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, Message, RosterCompleteness,
+};
 
 const GROUP_LIST_ROUTE: &str = "/v1/group/get-group-list";
 const GROUP_MEMBERS_ROUTE: &str = "/v1/group/get-group-members";
@@ -26,6 +28,9 @@ const MEMBER_UNMUTE_ROUTE: &str = "/v1/group/member-mute-cancel";
 const MEMBER_RENAME_ROUTE: &str = "/v1/group/set-member-nickname";
 const MEMBER_REMOVE_ROUTE: &str = "/v1/group/remove-group-member";
 const MESSAGE_RECALL_ROUTE: &str = "/v1/group/message-rollback";
+const GROUP_NOTICE_LIST_ROUTE: &str = "/v1/group/notice-list";
+const GROUP_NOTICE_ADD_ROUTE: &str = "/v1/group/add-notice";
+const GROUP_NOTICE_UPDATE_ROUTE: &str = "/v1/group/notice-opt";
 const MAX_GATEWAY_BATCH: usize = 100;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,6 +403,9 @@ pub trait GroupGateway: Send + Sync {
     ) -> AppResult<GatewayReceipt>;
     async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt>;
     async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt>;
+    async fn get_group_announcement(&self, _group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
+        Ok(None)
+    }
     async fn set_group_announcement(
         &self,
         _group_id: i64,
@@ -1238,6 +1246,134 @@ impl GroupGateway for CdpGateway {
         )
         .await
     }
+
+    async fn get_group_announcement(&self, group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
+        require_positive("groupId", group_id)?;
+        let data = self
+            .xclient(
+                GROUP_NOTICE_LIST_ROUTE,
+                json!({"groupId": group_id, "v": "0"}),
+            )
+            .await?;
+        Ok(data
+            .get("noticeInfoList")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .map(|value| GroupAnnouncement {
+                group_id,
+                notice_id: text_field(value, &["noticeId", "id"]),
+                content: human_name_field(value, &["noticeContent", "content"]),
+                mode: text_field(value, &["noticeMode", "mode"]),
+                author_user_id: int_field(value, &["userId", "authorUserId"]),
+            }))
+    }
+
+    async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
+        self.require_capability(self.capabilities().announcement, "群公告")?;
+        require_positive("groupId", group_id)?;
+        require_non_empty("noticeContent", text)?;
+        let sender = if *self.sender_id.read().await > 0 {
+            *self.sender_id.read().await
+        } else {
+            self.session_identity().await?.0
+        };
+
+        // 旺商聊只允许公告作者走 notice-opt；其他情况下页面会创建一条新公告。
+        let current = self
+            .xclient(
+                GROUP_NOTICE_LIST_ROUTE,
+                json!({"groupId": group_id, "v": "0"}),
+            )
+            .await?;
+        let notice = current
+            .get("noticeInfoList")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first());
+        let own_notice_id = notice
+            .filter(|value| int_field(value, &["userId"]) == sender)
+            .map(|value| text_field(value, &["noticeId", "id"]));
+        let (route, payload, notice_id) =
+            if let Some(notice_id) = own_notice_id.filter(|value| !value.is_empty()) {
+                (
+                    GROUP_NOTICE_UPDATE_ROUTE,
+                    json!({
+                        "groupId": group_id,
+                        "noticeId": notice_id,
+                        "noticeContent": text,
+                        "noticeMode": "COMMON_NOTICE"
+                    }),
+                    notice_id,
+                )
+            } else {
+                (
+                    GROUP_NOTICE_ADD_ROUTE,
+                    json!({
+                        "groupId": group_id,
+                        "noticeContent": text,
+                        "noticeMode": "COMMON_NOTICE"
+                    }),
+                    String::new(),
+                )
+            };
+        let data = self.xclient(route, payload).await?;
+        let notice_id = if notice_id.is_empty() {
+            text_field(&data, &["noticeId", "id"])
+        } else {
+            notice_id
+        };
+        if notice_id.is_empty() {
+            return Err(AppError::new(
+                "notice_receipt_missing",
+                "群公告保存成功但未返回公告 ID",
+            ));
+        }
+
+        let cloud = self.resolve_cloud_id(group_id).await?;
+        let group_name = self
+            .group_infos()
+            .await?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .map(|group| group.name)
+            .unwrap_or_default();
+        let notice_payload = json!({
+            "msgFormat": 8,
+            "msgSession": 2,
+            "from": {"id": sender, "name": "", "avatar": ""},
+            "to": {"id": group_id, "groupCloudId": cloud, "groupName": group_name},
+            "groupNotice": {"content": text, "noticeId": notice_id}
+        });
+        let encoded = self
+            .cdp
+            .evaluate(&ipc_expression(
+                "encode",
+                "/v1/plugins/encode-msg",
+                notice_payload,
+            ))
+            .await?;
+        let content = decode_transport_response("/v1/plugins/encode-msg", &encoded)?;
+        if content.is_empty() {
+            return Err(AppError::new("encode_failed", "群公告消息编码失败"));
+        }
+        let delivery = self
+            .cdp
+            .evaluate(&nim_send_expression(&cloud, content))
+            .await?;
+        if delivery.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(AppError::new(
+                "send_failed",
+                delivery
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("群公告消息投递失败"),
+            )
+            .retryable());
+        }
+        let mut receipt = GatewayReceipt::succeeded(route);
+        receipt.message_id = delivery_message_id(&delivery)?;
+        receipt.request_id = receipt_identifier(&delivery, &["requestId", "idClient", "traceId"]);
+        Ok(receipt)
+    }
 }
 
 fn delivery_message_id(delivery: &Value) -> AppResult<String> {
@@ -1465,11 +1601,9 @@ fn decode_business_response(route: &str, response: &str) -> AppResult<Value> {
     let Some(code) = business_code else {
         return Err(AppError::new("gateway_response", "业务响应缺少 code").with_gateway(metadata()));
     };
-    let Some(errno) = business_errno else {
-        return Err(
-            AppError::new("gateway_response", "业务响应缺少 errno").with_gateway(metadata())
-        );
-    };
+    // 旺商聊 2.7.7 的成功业务 envelope 只有 code/data/msg；旧版本还会返回 errno。
+    // errno 出现时继续严格校验，缺省时仅在 code=0 的情况下按 0 处理。
+    let errno = business_errno.unwrap_or(0);
     if code != 0 || errno != 0 {
         let message = envelope
             .get("msg")
@@ -1910,6 +2044,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(success["id"], 1);
+
+        let current_success =
+            decode_business_response("/fixture", r#"{"code":0,"msg":"OK","data":{"id":2}}"#)
+                .unwrap();
+        assert_eq!(current_success["id"], 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Group } from '../types'
@@ -76,6 +76,25 @@ describe('production pages retain scoped cached data', () => {
     await userEvent.selectOptions(screen.getByLabelText('事件'), 'daily_summary')
     await userEvent.click(screen.getByRole('button', { name: '刷新' }))
     await waitFor(() => expect(mocks.queryAudit).toHaveBeenLastCalledWith('ACCOUNT', expect.objectContaining({ userId: 10001, event: 'daily_summary' })))
+  })
+
+  it('defaults audit filtering to today and reloads a selected date', async () => {
+    render(<AuditPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
+    const yearInput = await screen.findByLabelText('年份')
+    const monthInput = screen.getByLabelText('月份')
+    const dayInput = screen.getByLabelText('日期')
+    const now = new Date()
+    expect(yearInput).toHaveValue(String(now.getFullYear()))
+    expect(monthInput).toHaveValue(String(now.getMonth() + 1))
+    expect(dayInput).toHaveValue(String(now.getDate()))
+
+    fireEvent.change(yearInput, { target: { value: '2026' } })
+    fireEvent.change(monthInput, { target: { value: '7' } })
+    fireEvent.change(dayInput, { target: { value: '20' } })
+    await waitFor(() => expect(mocks.queryAudit).toHaveBeenLastCalledWith('ACCOUNT', expect.objectContaining({
+      from: new Date('2026-07-20T00:00:00').toISOString(),
+      to: new Date('2026-07-20T23:59:59.999').toISOString(),
+    })))
   })
 
   it('keeps tasks visible when one combined refresh fails', async () => {

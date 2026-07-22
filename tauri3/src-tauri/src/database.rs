@@ -6,7 +6,9 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use crate::defaults;
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
     Account, ActionRecord, AuditEvent, BatchIngestResult, CardPlan, CardRenameJob, DailySummary,
@@ -687,6 +689,11 @@ impl DatabaseExecutor {
 
     pub async fn upsert_account(&self, account: Account) -> AppResult<()> {
         self.execute(move |database| database.upsert_account(&account))
+            .await
+    }
+
+    pub async fn ensure_account_defaults(&self, account_id: String) -> AppResult<()> {
+        self.execute(move |database| database.ensure_account_defaults(&account_id))
             .await
     }
 
@@ -1424,6 +1431,108 @@ impl Database {
             connection.execute("INSERT OR IGNORE INTO app_settings(key,value,sensitive,updated_at) VALUES('automation.mode','observe',0,?)", params![now])?;
             Ok(())
         }).map_err(|error| AppError::new("database_defaults", error.to_string()))
+    }
+
+    /// Adds the reviewed starter rules and knowledge base once per account.
+    /// Existing rows are intentionally left untouched so an administrator's
+    /// edits survive upgrades and repeated logins.
+    pub fn ensure_account_defaults(&self, account_id: &str) -> AppResult<()> {
+        let marker_key = format!("defaults.content.version.2.{account_id}");
+        let result = self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            if transaction
+                .query_row(
+                    "SELECT value FROM app_settings WHERE key=?",
+                    params![marker_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .as_deref()
+                == Some("ready")
+            {
+                return Ok(());
+            }
+
+            let now = Utc::now().to_rfc3339();
+            for rule in defaults::default_rules(account_id) {
+                let exists: Option<i64> = transaction
+                    .query_row(
+                        "SELECT id FROM rules WHERE account_id=? AND group_id=0 AND name=?",
+                        params![account_id, rule.name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if exists.is_some() {
+                    continue;
+                }
+                let roles = serde_json::to_string(&rule.exempt_roles).unwrap_or_else(|_| "[]".into());
+                let users = serde_json::to_string(&rule.exempt_user_ids).unwrap_or_else(|_| "[]".into());
+                transaction.execute(
+                    "INSERT INTO rules(account_id,group_id,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![account_id,rule.group_id,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,rule.cooldown_seconds,rule.priority,rule.mode,0_i64,rule.semantic_threshold,roles,users,now,now],
+                )?;
+                let rule_id = transaction.last_insert_rowid();
+                for (position, action) in rule.actions.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO rule_actions(rule_id,kind,duration_seconds,message,position) VALUES(?,?,?,?,?)",
+                        params![rule_id, action.kind, action.duration_seconds, action.message, position as i64],
+                    )?;
+                }
+            }
+
+            let built_in_base: Option<(i64, i64)> = transaction
+                .query_row(
+                    "SELECT id,built_in FROM knowledge_bases WHERE account_id=? AND name=?",
+                    params![account_id, defaults::DEFAULT_KNOWLEDGE_BASE_NAME],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let base_id = if let Some((id, _)) = built_in_base {
+                id
+            } else {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO knowledge_bases(account_id,name,description,enabled,built_in,read_only,created_at,updated_at) VALUES(?,?,?,1,1,1,?,?)",
+                    params![account_id, defaults::DEFAULT_KNOWLEDGE_BASE_NAME, defaults::DEFAULT_KNOWLEDGE_BASE_DESCRIPTION, now, now],
+                )?;
+                transaction.query_row(
+                    "SELECT id FROM knowledge_bases WHERE account_id=? AND name=?",
+                    params![account_id, defaults::DEFAULT_KNOWLEDGE_BASE_NAME],
+                    |row| row.get(0),
+                )?
+            };
+
+            let is_built_in: i64 = transaction.query_row(
+                "SELECT built_in FROM knowledge_bases WHERE id=? AND account_id=?",
+                params![base_id, account_id],
+                |row| row.get(0),
+            )?;
+            if is_built_in != 0 {
+                for document in defaults::DEFAULT_KNOWLEDGE_DOCUMENTS {
+                    let digest = Sha256::digest(document.content.as_bytes());
+                    let content_hash = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO knowledge_documents(base_id,title,kind,content,source,content_hash,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)",
+                        params![base_id, document.title, "markdown", document.content, "built-in", content_hash, now, now],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "INSERT INTO app_settings(key,value,sensitive,updated_at) VALUES(?,?,0,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![marker_key, "ready", now],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        });
+        if let Err(error) = &result {
+            let _ = self.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO audit_events(account_id,group_id,user_id,actor,event,level,details,created_at) VALUES(?,0,0,'DH BOT','default_content_init_failed','error',?,?)",
+                    params![account_id, format!("默认规则与知识库初始化失败：{error}"), Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            });
+        }
+        result.map_err(|error| AppError::new("database_account_defaults", error.to_string()))
     }
 
     pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
@@ -2450,6 +2559,7 @@ fn card_job_from_row(row: &Row<'_>) -> rusqlite::Result<CardRenameJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RuleAction;
     use tempfile::tempdir;
 
     fn populated_database() -> Database {
@@ -2511,6 +2621,160 @@ mod tests {
             database.get_setting("ai.model").unwrap().as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn account_defaults_are_complete_disabled_and_idempotent() {
+        let database = populated_database();
+        database.ensure_account_defaults("a").unwrap();
+        database.ensure_account_defaults("a").unwrap();
+        database.with_connection(|connection| {
+            let rule_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rules WHERE account_id='a'",
+                [],
+                |row| row.get(0),
+            )?;
+            let enabled_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rules WHERE account_id='a' AND enabled=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let action_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rule_actions WHERE kind='recall'",
+                [],
+                |row| row.get(0),
+            )?;
+            let semantic_observe: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM rules WHERE account_id='a' AND matcher='semantic' AND mode='observe'",
+                [],
+                |row| row.get(0),
+            )?;
+            let (built_in, read_only, enabled): (i64, i64, i64) = connection.query_row(
+                "SELECT built_in,read_only,enabled FROM knowledge_bases WHERE account_id='a' AND name=?",
+                params![defaults::DEFAULT_KNOWLEDGE_BASE_NAME],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let document_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM knowledge_documents WHERE base_id=(SELECT id FROM knowledge_bases WHERE account_id='a' AND name=?)",
+                params![defaults::DEFAULT_KNOWLEDGE_BASE_NAME],
+                |row| row.get(0),
+            )?;
+            let binding_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM knowledge_base_groups WHERE account_id='a'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rule_count, defaults::default_rules("a").len() as i64);
+            assert_eq!(enabled_count, 0);
+            assert_eq!(action_count, defaults::default_rules("a").len() as i64);
+            assert_eq!(semantic_observe, 3);
+            assert_eq!((built_in, read_only, enabled), (1, 1, 1));
+            assert_eq!(document_count, defaults::DEFAULT_KNOWLEDGE_DOCUMENTS.len() as i64);
+            assert_eq!(binding_count, 0);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn account_defaults_preserve_same_name_custom_rule() {
+        let database = populated_database();
+        let mut custom_rule = defaults::default_rules("a").remove(0);
+        custom_rule.matcher = "contains".into();
+        custom_rule.pattern = "管理员自定义内容".into();
+        custom_rule.enabled = true;
+        custom_rule.actions = vec![RuleAction {
+            kind: "reply".into(),
+            duration_seconds: 0,
+            message: "管理员自定义回复".into(),
+        }];
+        database.save_rule(&custom_rule).unwrap();
+
+        database.ensure_account_defaults("a").unwrap();
+
+        database
+            .with_connection(|connection| {
+                let (count, matcher, pattern, enabled): (i64, String, String, i64) = connection
+                    .query_row(
+                        "SELECT COUNT(*),matcher,pattern,enabled FROM rules WHERE account_id='a' AND group_id=0 AND name='加权字符超过 100'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                let actions: Vec<String> = connection
+                    .prepare("SELECT a.kind FROM rule_actions a JOIN rules r ON r.id=a.rule_id WHERE r.account_id='a' AND r.name='加权字符超过 100' ORDER BY a.position")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?;
+                assert_eq!(count, 1);
+                assert_eq!(matcher, "contains");
+                assert_eq!(pattern, "管理员自定义内容");
+                assert_eq!(enabled, 1);
+                assert_eq!(actions, vec!["reply"]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn account_defaults_are_isolated_and_builtin_clone_is_editable() {
+        let database = populated_database();
+        let now = Utc::now();
+        database
+            .upsert_account(&Account {
+                id: "b".into(),
+                display_name: "B".into(),
+                role: "admin".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        database.ensure_account_defaults("a").unwrap();
+        database.ensure_account_defaults("b").unwrap();
+
+        let base_id = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT id FROM knowledge_bases WHERE account_id='a' AND name=?",
+                    params![defaults::DEFAULT_KNOWLEDGE_BASE_NAME],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        let clone_id = database
+            .clone_knowledge_base("a", base_id, "DH 默认群规与 FAQ（副本）")
+            .unwrap();
+
+        database
+            .with_connection(|connection| {
+                let account_a_rules: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM rules WHERE account_id='a'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let account_b_rules: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM rules WHERE account_id='b'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let (clone_account, built_in, read_only): (String, i64, i64) = connection
+                    .query_row(
+                        "SELECT account_id,built_in,read_only FROM knowledge_bases WHERE id=?",
+                        params![clone_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                let clone_documents: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM knowledge_documents WHERE base_id=?",
+                    params![clone_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(account_a_rules, defaults::default_rules("a").len() as i64);
+                assert_eq!(account_b_rules, defaults::default_rules("b").len() as i64);
+                assert_eq!((clone_account.as_str(), built_in, read_only), ("a", 0, 0));
+                assert_eq!(
+                    clone_documents,
+                    defaults::DEFAULT_KNOWLEDGE_DOCUMENTS.len() as i64
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

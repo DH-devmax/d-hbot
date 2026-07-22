@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::defaults;
 use crate::error::{AppError, AppResult};
 use crate::models::{AiDecision, AiTask, Message, RuleAction};
 
@@ -55,6 +56,14 @@ pub struct AiRequest {
 
 impl AiRequest {
     pub fn testing(message: impl Into<String>, recent_context: Vec<AiContextMessage>) -> Self {
+        Self::testing_with_knowledge(message, recent_context, false)
+    }
+
+    pub fn testing_with_knowledge(
+        message: impl Into<String>,
+        recent_context: Vec<AiContextMessage>,
+        include_built_in_knowledge: bool,
+    ) -> Self {
         Self {
             version: "1",
             event_id: Uuid::new_v4().to_string(),
@@ -67,9 +76,25 @@ impl AiRequest {
             message_id: Uuid::new_v4().to_string(),
             message: message.into(),
             recent_context,
-            knowledge: Vec::new(),
+            knowledge: if include_built_in_knowledge {
+                default_knowledge_chunks()
+            } else {
+                Vec::new()
+            },
         }
     }
+}
+
+pub fn default_knowledge_chunks() -> Vec<AiKnowledgeChunk> {
+    defaults::DEFAULT_KNOWLEDGE_DOCUMENTS
+        .iter()
+        .map(|document| AiKnowledgeChunk {
+            base: defaults::DEFAULT_KNOWLEDGE_BASE_NAME.into(),
+            title: document.title.into(),
+            source: "built-in".into(),
+            text: document.content.into(),
+        })
+        .collect()
 }
 
 pub fn mention_metadata(text: &str) -> Option<MentionMetadata> {
@@ -137,6 +162,7 @@ pub struct AiTestResult {
     pub decision: AiDecision,
     pub model: String,
     pub elapsed_ms: u128,
+    pub knowledge_source: String,
 }
 
 #[async_trait]
@@ -176,6 +202,11 @@ impl ConfiguredProvider {
             decision,
             model: self.config.model.clone(),
             elapsed_ms: started.elapsed().as_millis(),
+            knowledge_source: if request.knowledge.is_empty() {
+                "空上下文".into()
+            } else {
+                "DH 默认群规与 FAQ".into()
+            },
         })
     }
 
@@ -463,6 +494,21 @@ mod tests {
     fn remote_http_is_rejected() {
         assert!(completion_url("http://example.com/v1").is_err());
         assert!(completion_url("http://127.0.0.1:8000/v1").is_ok());
+    }
+
+    #[test]
+    fn testing_request_only_includes_builtin_knowledge_when_selected() {
+        let empty = AiRequest::testing("@DH 群规是什么", Vec::new());
+        assert!(empty.knowledge.is_empty());
+        let with_defaults = AiRequest::testing_with_knowledge("@DH 群规是什么", Vec::new(), true);
+        assert_eq!(
+            with_defaults.knowledge.len(),
+            defaults::DEFAULT_KNOWLEDGE_DOCUMENTS.len()
+        );
+        assert!(with_defaults
+            .knowledge
+            .iter()
+            .all(|chunk| chunk.base == defaults::DEFAULT_KNOWLEDGE_BASE_NAME));
     }
     #[test]
     fn unknown_response_fields_are_rejected() {

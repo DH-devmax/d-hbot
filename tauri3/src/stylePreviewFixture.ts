@@ -3,12 +3,22 @@ type PreviewRecord = Record<string, unknown>
 export function installStylePreviewFixture() {
   const actions: Array<{ command: string; args: PreviewRecord }> = []
   let callbackId = 1
-  let rules: PreviewRecord[] = [{
-    id: 1, accountId: 'ACCOUNT', groupId: 0, name: '广告关键词撤回', matcher: 'contains', pattern: '广告',
-    threshold: 0, count: 0, windowSeconds: 0, cooldownSeconds: 30, priority: 100, mode: 'observe',
-    enabled: false, semanticThreshold: 0.8, exemptRoles: ['owner', 'admin'], exemptUserIds: [],
+  const defaultRule = (id: number, name: string, matcher: string, pattern = '', threshold = 0, count = 0, windowSeconds = 0, priority = 100, mode = 'automatic', semanticThreshold = 0.8): PreviewRecord => ({
+    id, accountId: 'ACCOUNT', groupId: 0, name, matcher, pattern, threshold, count, windowSeconds, cooldownSeconds: 600,
+    priority, mode, enabled: false, semanticThreshold, exemptRoles: ['owner', 'admin'], exemptUserIds: [],
     actions: [{ kind: 'recall', durationSeconds: 0, message: '' }],
-  }]
+  })
+  let rules: PreviewRecord[] = [
+    defaultRule(1, '加权字符超过 100', 'length', '', 100), defaultRule(2, '加权字符超过 200', 'length', '', 200, 0, 0, 200),
+    defaultRule(3, '超过 4 行', 'lines', '', 4, 0, 0, 110), defaultRule(4, '图片消息', 'image_count', '', 0, 1),
+    defaultRule(5, '10 分钟内图片达到 3 次', 'image_count', '', 0, 3, 600, 200), defaultRule(6, '群名片被修改后恢复', 'rename_count', '', 0, 1),
+    defaultRule(7, '群名片累计修改 5 次', 'rename_count', '', 0, 5, 0, 200), defaultRule(8, '黑名单成员发言', 'blacklist', '', 0, 0, 0, 300),
+    defaultRule(9, '广告、推广与引流关键词', 'regex', '(?i)(广告|推广|引流|加微|加v|加微信|兼职链接|返利)', 0, 0, 0, 120),
+    defaultRule(10, '诈骗、验证码与资金风险关键词', 'regex', '(?i)(诈骗|验证码|转账|先交费|保证金|刷单)', 0, 0, 0, 220),
+    defaultRule(11, 'AI 广告识别', 'semantic', 'advertisement', 0, 0, 0, 50, 'observe', 0.85),
+    defaultRule(12, 'AI 辱骂识别', 'semantic', 'abuse', 0, 0, 0, 50, 'observe', 0.85),
+    defaultRule(13, 'AI 诈骗识别', 'semantic', 'scam', 0, 0, 0, 60, 'observe', 0.9),
+  ]
   let tasks: PreviewRecord[] = [{
     id: 1, accountId: 'ACCOUNT', groupId: 101, title: '确认本周群规', description: '管理员确认后更新知识库。',
     status: 'pending', assigneeId: 10002, createdBy: 10001, dueAt: '2026-07-24T10:00:00Z', reminderAt: null,
@@ -33,8 +43,16 @@ export function installStylePreviewFixture() {
     { id: 2, accountId: 'ACCOUNT', groupId: 101, serverMessageId: 'MESSAGE-2', sequence: 2, userId: 10005, senderName: 'DH群员0001', kind: 'image', text: '', sentAt: '2026-07-22T08:12:00Z', receivedAt: '2026-07-22T08:12:00Z', processedAt: null, acknowledgedAt: '2026-07-22T08:12:01Z', processingState: 'queued' },
     { id: 1, accountId: 'ACCOUNT', groupId: 102, serverMessageId: 'MESSAGE-1', sequence: 1, userId: 10006, senderName: 'DH群员0002', kind: 'text', text: '项目进度已更新', sentAt: '2026-07-22T08:00:00Z', receivedAt: '2026-07-22T08:00:00Z', processedAt: '2026-07-22T08:00:01Z', acknowledgedAt: '2026-07-22T08:00:01Z', processingState: 'processed' },
   ]
-  const bases = [{ id: 1, accountId: 'ACCOUNT', name: 'DH 群规与 FAQ', description: '当前群使用的业务资料', enabled: true, builtIn: false, readOnly: false }]
-  const documents = [{ id: 1, baseId: 1, baseName: 'DH 群规与 FAQ', title: '文明交流', kind: 'markdown', content: '文明交流，不发布骚扰、欺诈和恶意链接。', source: 'manual', contentHash: 'STYLE-HASH', enabled: true }]
+  const bases = [{ id: 1, accountId: 'ACCOUNT', name: 'DH 默认群规与 FAQ', description: '保守版群规、AI 使用边界和常见问题', enabled: true, builtIn: true, readOnly: true }]
+  const documents = [
+    { id: 1, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '文明交流', kind: 'markdown', content: '保持正常交流，不发布骚扰、恶意刷屏、欺诈和恶意链接。尊重其他成员，不进行人身攻击。', source: 'built-in', contentHash: 'STYLE-HASH-1', enabled: true },
+    { id: 2, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '资金、账号与验证码', kind: 'markdown', content: '涉及转账、保证金、账号、密码、验证码和身份信息时，请先联系管理员人工核实。', source: 'built-in', contentHash: 'STYLE-HASH-2', enabled: true },
+    { id: 3, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: 'DH 能做什么', kind: 'markdown', content: 'DH 可回答当前群绑定资料中的群规、FAQ、任务、公告和业务流程。', source: 'built-in', contentHash: 'STYLE-HASH-3', enabled: true },
+    { id: 4, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '资料不足时如何处理', kind: 'markdown', content: '当前资料没有说明的问题，要明确告诉用户资料不足，并建议联系群管理员确认。', source: 'built-in', contentHash: 'STYLE-HASH-4', enabled: true },
+    { id: 5, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: 'AI 回复边界', kind: 'markdown', content: '只有明确 @DH 或旺商聊提及元数据才触发。普通聊天、单独出现 DH、无关问句保持静默。', source: 'built-in', contentHash: 'STYLE-HASH-5', enabled: true },
+    { id: 6, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '公告、任务与人工确认', kind: 'markdown', content: 'AI 可以协助拟定公告、整理任务和总结消息，发布和处罚继续受权限控制。', source: 'built-in', contentHash: 'STYLE-HASH-6', enabled: true },
+    { id: 7, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '预测说明', kind: 'markdown', content: '预测只展示整理后的彩种、期号、结果、更新时间、趋势和参考度。', source: 'built-in', contentHash: 'STYLE-HASH-7', enabled: true },
+  ]
   const audits = [
     { id: 2, accountId: 'ACCOUNT', groupId: 101, userId: 10002, actor: 'DH BOT', event: 'message_processed', level: 'info', details: '消息已处理并写入本地审计', createdAt: '2026-07-22T08:16:01Z' },
     { id: 1, accountId: 'ACCOUNT', groupId: 101, userId: 10005, actor: 'rule', event: 'rule_matched', level: 'warning', details: '观察模式命中图片规则，未执行动作', createdAt: '2026-07-22T08:12:01Z' },
@@ -61,6 +79,8 @@ export function installStylePreviewFixture() {
       case 'list_members': return { members, reportedCount: 16, resolvedCount: 16, complete: true, completeness: 'complete', completenessReason: '', httpReturnedCount: 16, httpReportedCount: 16, nimReturnedCount: 16, nimReportedCount: 16, authority: 'style-preview', sources: ['style-preview'] }
       case 'get_card_settings': return { prefix: 'DH', autoRename: false, paused: false }
       case 'get_ai_automation_settings': return { enabled: true, reply: true, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false }
+      case 'get_group_management_context': return { groupId: args.groupId, senderId: 10001, isManager: true, capabilities: { announcement: 'supported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }, memberCount: 16, announcementStatus: '可用' }
+      case 'get_group_announcement': return { groupId: args.groupId, noticeId: 'STYLE-NOTICE-1', content: '文明交流，涉及资金、账号和验证码时请先联系管理员核实。', mode: 'COMMON_NOTICE', authorUserId: 10001 }
       case 'list_card_rename_jobs': return []
       case 'list_rules': return rules
       case 'save_rule': { const next = { ...args.rule, id: args.rule.id || rules.length + 1 }; rules = rules.filter(rule => rule.id !== next.id).concat(next); return next.id }
@@ -69,7 +89,7 @@ export function installStylePreviewFixture() {
       case 'import_rules': return 0
       case 'list_knowledge_bases': return bases
       case 'list_knowledge_documents': return documents
-      case 'list_knowledge_bindings': return [{ baseId: 1, accountId: 'ACCOUNT', groupId: 101, enabled: true }]
+      case 'list_knowledge_bindings': return []
       case 'update_knowledge_base': case 'bind_knowledge_base': case 'save_knowledge_document': return 1
       case 'list_tasks': return tasks
       case 'save_task': { const next = { ...args.task, id: args.task.id || tasks.length + 1 }; tasks = tasks.filter(task => task.id !== next.id).concat(next); return next.id }
@@ -77,9 +97,9 @@ export function installStylePreviewFixture() {
       case 'save_schedule': { const next = { ...args.schedule, id: args.schedule.id || schedules.length + 1 }; schedules = schedules.filter(schedule => schedule.id !== next.id).concat(next); return next.id }
       case 'list_schedule_runs': return [{ id: 1, scheduleId: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-22', action: 'open', success: true, error: '', attempts: 1, createdAt: '2026-07-22T00:00:00Z' }]
       case 'get_summary_settings': return { accountId: 'ACCOUNT', enabled: true, time: '23:00', groupIds: [101], timezone: 'Asia/Shanghai' }
-      case 'test_ai': return { decision: { reply: '你好，我可以协助处理群规、FAQ 和群内任务。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 18, model: 'deepseek-v4-pro' }
+      case 'test_ai': return { decision: { reply: String(args.message || '').includes('群公告') ? '请文明交流。涉及资金、账号或验证码时，请先联系管理员核实。' : '你好，我可以协助处理群规、FAQ 和群内任务。当前资料不足时，我会建议联系管理员确认。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 18, model: 'deepseek-v4-pro', knowledgeSource: args.includeBuiltInKnowledge ? 'DH 默认群规与 FAQ' : '空上下文' }
       case 'get_wang_profile_status': return { state: '样式预览', scriptHash: 'STYLE-PREVIEW-HASH', backupPath: null, requiresElevation: false, detail: '当前只用于页面样式调整。' }
-      case 'get_gateway_capabilities': return { announcement: 'unsupported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }
+      case 'get_gateway_capabilities': return { announcement: 'supported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }
       case 'get_runtime_mode': return { mode: 'fixture', dataDir: '样式预览内存数据', restartRequired: false }
       case 'take_wang_startup_status': return null
       default:

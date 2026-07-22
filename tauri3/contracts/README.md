@@ -2,8 +2,8 @@
 
 The first frozen contracts are:
 
-- `GroupGateway`: group/member reads, text, recall, mute, rename, remove and
-  whole-group mute.
+- `GroupGateway`: group/member reads, text, recall, mute, rename, remove,
+  whole-group mute and calibrated group announcements.
 - `AIProvider`: request version `1`, decision fields `reply`, `actions`,
   `tasks`, `confidence`, `reason`.
 - `PredictionSnapshot`: game, period, normalized result, update time and
@@ -12,13 +12,15 @@ The first frozen contracts are:
   run key.
 
 The fixture files are `group_gateway_v1.json`, `group_gateway_v2.json`,
-`ai_provider_v1.json`, `prediction_v1.json` and `schedule_v1.json`.
+`group_announcement_v2.json`, `ai_provider_v1.json`, `prediction_v1.json` and
+`schedule_v1.json`.
 
 `wangshangliao_capabilities.json` is the production-only calibration registry.
-It starts empty and may only receive a version/hash pair after a sanitized real
-trace has passed replay. Fixture versions, URLs and ports never belong in that
-file. With no exact match, reads remain available while every write capability
-is `Unverified`; group announcements stay `Unsupported`.
+It may only receive a version/hash pair after a sanitized real trace has passed
+replay. Fixture versions, URLs and ports never belong in that file. With no
+exact match, reads remain available while every write capability is
+`Unverified`. Group announcements are enabled only for a verified app version
+and script hash.
 
 `group_gateway_v2.json` freezes the application file version, page title/URL,
 main-script SHA-256, request, transport envelope, business envelope, normalized

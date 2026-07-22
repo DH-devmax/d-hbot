@@ -35,6 +35,16 @@ pub struct Group {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupAnnouncement {
+    pub group_id: i64,
+    pub notice_id: String,
+    pub content: String,
+    pub mode: String,
+    pub author_user_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Member {
     pub account_id: String,
     pub group_id: i64,

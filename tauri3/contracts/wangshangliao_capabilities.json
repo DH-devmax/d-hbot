@@ -1,4 +1,35 @@
 {
   "version": 1,
-  "calibrations": []
+  "calibrations": [
+    {
+      "appFileVersion": "2.7.7",
+      "mainScriptSha256": "17af5c0697c9a091f3112a26d21a7815dd1d635a7e424c392986dc53ce5fd149",
+      "verified": true,
+      "capabilities": {
+        "announcement": "supported",
+        "sendText": "unverified",
+        "mute": "unverified",
+        "recall": "unverified",
+        "rename": "unverified",
+        "removeMember": "unverified",
+        "groupMute": "unverified",
+        "memberEvents": "unverified"
+      }
+    },
+    {
+      "appFileVersion": "2.7.7",
+      "mainScriptSha256": "52da37f6d0ea6419d58caee55f4ae1aac083e4d8fa641f46529e2e4b91e627e2",
+      "verified": true,
+      "capabilities": {
+        "announcement": "supported",
+        "sendText": "unverified",
+        "mute": "unverified",
+        "recall": "unverified",
+        "rename": "unverified",
+        "removeMember": "unverified",
+        "groupMute": "unverified",
+        "memberEvents": "unverified"
+      }
+    }
+  ]
 }

@@ -1311,6 +1311,10 @@ impl BackendRuntime {
                     updated_at: now,
                 })
                 .await;
+            let _ = self
+                .database
+                .ensure_account_defaults(account_id.clone())
+                .await;
             if let Ok(groups) = self.gateway.list_groups().await {
                 for group in groups {
                     let _ = self.database.upsert_group(group).await;

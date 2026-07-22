@@ -52,4 +52,33 @@ describe('RulesPage validation', () => {
       exemptUserIds: [10001, 10002],
     }))
   })
+
+  it('opens rule editing in a modal and closes it with Escape', async () => {
+    mocks.listRules.mockResolvedValueOnce([{
+      id: 7,
+      accountId: 'ACCOUNT',
+      groupId: 0,
+      name: '测试规则',
+      matcher: 'contains',
+      pattern: '测试',
+      threshold: 0,
+      count: 0,
+      windowSeconds: 0,
+      cooldownSeconds: 0,
+      priority: 100,
+      mode: 'observe',
+      enabled: false,
+      semanticThreshold: 0.8,
+      exemptRoles: ['owner', 'admin'],
+      exemptUserIds: [],
+      actions: [{ kind: 'recall', durationSeconds: 0, message: '' }],
+    }])
+    render(<RulesPage accountId="ACCOUNT" groups={[]} onError={vi.fn()} />)
+    const listItem = (await screen.findByText('测试规则')).closest('button')
+    expect(screen.queryByRole('dialog', { name: '测试规则' })).not.toBeInTheDocument()
+    await userEvent.click(listItem!)
+    expect(screen.getByRole('dialog', { name: '测试规则' })).toBeInTheDocument()
+    await userEvent.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: '测试规则' })).not.toBeInTheDocument()
+  })
 })

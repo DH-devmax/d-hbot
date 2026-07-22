@@ -1,4 +1,3 @@
-#[cfg(any(test, windows))]
 use sha2::{Digest, Sha256};
 #[cfg(any(test, windows))]
 use std::path::Path;
@@ -11,7 +10,6 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(test, windows))]
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::gateway::{CdpClient, ConnectionStatus};
@@ -96,12 +94,61 @@ pub async fn inspect(devtools_url: &str) -> AppResult<String> {
 
 #[cfg(not(windows))]
 pub async fn locate() -> AppResult<Vec<InstallCandidate>> {
-    Ok(Vec::new())
+    let candidates = [
+        std::path::PathBuf::from("/Applications/旺商聊.app"),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Applications/旺商聊.app"),
+    ];
+    Ok(candidates
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .map(|path| InstallCandidate {
+            path: path.display().to_string(),
+            source: "macOS 常见安装目录".into(),
+        })
+        .collect())
 }
 
 #[cfg(not(windows))]
-pub async fn running_process_identity_for(_path: Option<String>) -> AppResult<Option<ProcessRef>> {
-    Ok(None)
+pub async fn running_process_identity_for(path: Option<String>) -> AppResult<Option<ProcessRef>> {
+    let app = macos_app_root(path.as_deref());
+    let executable = app.join("Contents").join("MacOS").join("旺商聊");
+    let script = app
+        .join("Contents")
+        .join("Resources")
+        .join("app")
+        .join("dist-electron")
+        .join("main")
+        .join("index.js");
+    if !executable.is_file() || !script.is_file() {
+        return Ok(None);
+    }
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", executable.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|error| AppError::new("process_inspect", error.to_string()))?;
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if pid == 0 {
+        return Ok(None);
+    }
+    let file_version = macos_bundle_version(&app);
+    let script_hash = sha256_hex(
+        &std::fs::read(&script)
+            .map_err(|error| AppError::new("process_hash", error.to_string()))?,
+    );
+    Ok(Some(ProcessRef {
+        pid,
+        image_path: executable.display().to_string(),
+        started_at: String::new(),
+        creation_time: String::new(),
+        file_version,
+        sha256: script_hash,
+    }))
 }
 
 #[cfg(not(windows))]
@@ -122,7 +169,27 @@ pub async fn start(
 }
 
 #[cfg(not(windows))]
-pub async fn profile_status(_path: Option<String>) -> AppResult<WangMaintenanceStatus> {
+pub async fn profile_status(path: Option<String>) -> AppResult<WangMaintenanceStatus> {
+    let app = macos_app_root(path.as_deref());
+    let script = app
+        .join("Contents")
+        .join("Resources")
+        .join("app")
+        .join("dist-electron")
+        .join("main")
+        .join("index.js");
+    if script.is_file() {
+        let content = std::fs::read(&script)
+            .map_err(|error| AppError::new("profile_read", error.to_string()))?;
+        return Ok(WangMaintenanceStatus {
+            state: "manual-platform".into(),
+            script_hash: sha256_hex(&content),
+            backup_path: None,
+            requires_elevation: false,
+            request_id: None,
+            detail: "macOS 仅读取旺商聊脚本指纹，不执行进程维护。".into(),
+        });
+    }
     Ok(WangMaintenanceStatus {
         state: "unsupported".into(),
         script_hash: String::new(),
@@ -131,6 +198,41 @@ pub async fn profile_status(_path: Option<String>) -> AppResult<WangMaintenanceS
         request_id: None,
         detail: "旺商聊启动脚本维护仅在 Windows 可用。".into(),
     })
+}
+
+#[cfg(not(windows))]
+fn macos_app_root(path: Option<&str>) -> std::path::PathBuf {
+    let value = path
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/Applications/旺商聊.app"));
+    if value.extension().and_then(|ext| ext.to_str()) == Some("app") {
+        value
+    } else {
+        value
+            .ancestors()
+            .find(|candidate| candidate.extension().and_then(|ext| ext.to_str()) == Some("app"))
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(value)
+    }
+}
+
+#[cfg(not(windows))]
+fn macos_bundle_version(app: &std::path::Path) -> String {
+    std::process::Command::new("plutil")
+        .args([
+            "-extract",
+            "CFBundleShortVersionString",
+            "raw",
+            "-o",
+            "-",
+            app.join("Contents/Info.plist").to_string_lossy().as_ref(),
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(not(windows))]
@@ -311,14 +413,29 @@ pub async fn start(
         status.as_str(),
         "ready" | "devtools-ready" | "nim-not-ready"
     ) {
+        let profile_detail = match prepare_persistent_profile(&image_path) {
+            Ok(detail) => detail,
+            Err(error) if error.code == "profile_permission" => {
+                let request_id =
+                    request_profile_elevation("apply", Some(image_path.to_string_lossy().into()))?;
+                return Ok(WangStartResult {
+                    status: "maintenance-required".into(),
+                    detail: "旺商聊已连接；DH BOT 正在请求管理员权限启用账号登录复用，完成后会继续显示旺商聊。".into(),
+                    needs_confirmation: false,
+                    maintenance_request_id: Some(request_id),
+                    process: None,
+                });
+            }
+            Err(error) => format!("账号登录复用待处理：{}。", error.message),
+        };
         let processes = list_processes(&image_path)?;
         if let Some(process) = processes.first() {
             activate(process.pid)?;
             return Ok(WangStartResult {
                 status,
-                detail:
-                    "旺商聊已打开，并已恢复到前台；如果 NIM 尚未就绪，请在旺商聊完成登录后稍候。"
-                        .into(),
+                detail: format!(
+                    "旺商聊已打开并恢复到前台。{profile_detail}如果 NIM 尚未就绪，请在旺商聊完成登录后稍候。"
+                ),
                 needs_confirmation: false,
                 maintenance_request_id: None,
                 process: Some(process.clone()),
@@ -1058,7 +1175,6 @@ fn patch_profile_content(original: &[u8]) -> AppResult<Vec<u8>> {
     Ok(patched)
 }
 
-#[cfg(any(test, windows))]
 fn sha256_hex(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);

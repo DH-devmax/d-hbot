@@ -13,6 +13,9 @@ describe('production WangShangLiao startup settings', () => {
       if (command === 'get_wang_startup_settings') {
         return Promise.resolve({ path: 'C:\\Apps\\wangshangliao.exe', autoStart: true })
       }
+      if (command === 'get_wang_profile_status') {
+        return Promise.resolve({ state: 'patched', detail: '固定登录分区已启用', scriptHash: 'HASH', backupPath: 'backup', requiresElevation: false })
+      }
       if (command === 'locate_wangshangliao') return Promise.resolve([])
       return Promise.resolve(null)
     })
@@ -25,6 +28,7 @@ describe('production WangShangLiao startup settings', () => {
     expect(await screen.findByDisplayValue('C:\\Apps\\wangshangliao.exe')).toBeVisible()
     const checkbox = screen.getByRole('checkbox', { name: '打开 DH BOT 时自动启动或显示旺商聊' })
     expect(checkbox).toBeChecked()
+    expect(await screen.findByText('账号登录复用：已启用')).toBeVisible()
     await user.click(checkbox)
     await user.click(screen.getByRole('button', { name: '保存启动设置' }))
 
@@ -41,6 +45,9 @@ describe('production WangShangLiao startup settings', () => {
         return Promise.resolve({ path: 'C:\\Apps\\wangshangliao.exe', autoStart: true })
       }
       if (command === 'locate_wangshangliao') return Promise.resolve([])
+      if (command === 'get_wang_profile_status') {
+        return Promise.resolve({ state: 'patched', detail: '固定登录分区已启用', scriptHash: 'HASH', backupPath: 'backup', requiresElevation: false })
+      }
       if (command === 'save_wang_startup_settings') return Promise.resolve(null)
       if (command === 'get_wang_maintenance_result') {
         return Promise.resolve({ success: true, errorCode: '', message: '维护完成' })
@@ -66,5 +73,25 @@ describe('production WangShangLiao startup settings', () => {
     await waitFor(() => expect(confirmedStarts).toBe(2), { timeout: 2_000 })
     expect(invoke).toHaveBeenCalledWith('get_wang_maintenance_result', { requestId: 'maintenance-1' })
     expect(refresh).toHaveBeenCalled()
+  })
+
+  it('applies and reports the persistent login profile from settings', async () => {
+    const user = userEvent.setup()
+    invoke.mockImplementation((command: string) => {
+      if (command === 'get_wang_startup_settings') return Promise.resolve({ path: 'C:\\Apps\\wangshangliao.exe', autoStart: true })
+      if (command === 'locate_wangshangliao') return Promise.resolve([])
+      if (command === 'save_wang_startup_settings') return Promise.resolve(null)
+      if (command === 'get_wang_profile_status') return Promise.resolve({ state: 'maintenance-required', detail: '等待启用', scriptHash: 'OLD', requiresElevation: false })
+      if (command === 'apply_wang_profile_patch') return Promise.resolve({ state: 'patched', detail: '固定登录分区已启用', scriptHash: 'NEW', backupPath: 'backup', requiresElevation: false })
+      return Promise.resolve(null)
+    })
+    const setError = vi.fn()
+    render(<RuntimeControls diagnostic={null} loading={false} refresh={vi.fn()} setError={setError} />)
+
+    await screen.findByDisplayValue('C:\\Apps\\wangshangliao.exe')
+    await user.click(screen.getByRole('button', { name: '启用账号复用' }))
+
+    await waitFor(() => expect(setError).toHaveBeenCalledWith(expect.stringContaining('账号记录复用已启用')))
+    expect(invoke).toHaveBeenCalledWith('apply_wang_profile_patch', { path: 'C:\\Apps\\wangshangliao.exe' })
   })
 })

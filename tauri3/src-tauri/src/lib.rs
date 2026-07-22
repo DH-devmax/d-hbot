@@ -6,6 +6,7 @@ mod build_channel;
 mod cardnames;
 mod contracts;
 mod database;
+mod defaults;
 mod diagnostics;
 pub mod error;
 #[cfg(any(feature = "fixture", test))]
@@ -41,7 +42,7 @@ use error::{AppError, AppResult};
 use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
     ActionRecord, AuditEvent, CardPlan, CardPreview, CardRenameJob, DailySummary, Group,
-    GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding,
+    GroupAiPermissions, GroupAnnouncement, GroupSchedule, KnowledgeBase, KnowledgeBinding,
     KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument, Member, MemberRef, MemberRoster,
     Message, ModerationRule, Page, ScheduleRun, TaskItem,
 };
@@ -424,6 +425,10 @@ async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
             updated_at: now,
         })
         .await?;
+    let _ = state
+        .database_executor
+        .ensure_account_defaults(account_id.clone())
+        .await;
     for group in state.gateway.list_groups().await? {
         state.database_executor.upsert_group(group).await?;
     }
@@ -1431,6 +1436,7 @@ async fn test_ai(
     state: State<'_, AppState>,
     message: String,
     recent_context: Vec<ai::AiContextMessage>,
+    include_built_in_knowledge: Option<bool>,
 ) -> AppResult<ai::AiTestResult> {
     let base_url = state
         .database_executor
@@ -1461,7 +1467,11 @@ async fn test_ai(
         timeout: Duration::from_secs(30),
     })?;
     provider
-        .test(&ai::AiRequest::testing(message, recent_context))
+        .test(&ai::AiRequest::testing_with_knowledge(
+            message,
+            recent_context,
+            include_built_in_knowledge.unwrap_or(false),
+        ))
         .await
 }
 
@@ -1751,6 +1761,43 @@ async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) 
 }
 
 #[tauri::command]
+async fn set_group_announcement(
+    state: State<'_, AppState>,
+    group_id: i64,
+    text: String,
+) -> AppResult<()> {
+    require_manager(&state, group_id).await?;
+    if text.trim().is_empty() {
+        return Err(AppError::new("announcement_empty", "群公告内容不能为空"));
+    }
+    let account_id = state.gateway.session_identity().await?.1;
+    let result = state
+        .gateway
+        .set_group_announcement(group_id, text.trim())
+        .await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        0,
+        "announcement",
+        0,
+        "人工发布或更新群公告",
+        result,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tauri::command]
+async fn get_group_announcement(
+    state: State<'_, AppState>,
+    group_id: i64,
+) -> AppResult<Option<GroupAnnouncement>> {
+    state.gateway.get_group_announcement(group_id).await
+}
+
+#[tauri::command]
 async fn get_group_management_context(
     state: State<'_, AppState>,
     group_id: i64,
@@ -1951,6 +1998,7 @@ fn manual_event_name(kind: &str) -> &'static str {
         "blacklist" => "人工加入黑名单",
         "unblacklist" => "人工移出黑名单",
         "group_mute" => "人工设置全群发言",
+        "announcement" => "人工更新群公告",
         _ => "人工群管操作",
     }
 }
@@ -2140,6 +2188,8 @@ macro_rules! dh_handlers {
             rename_member,
             remove_member,
             set_group_mute,
+            set_group_announcement,
+            get_group_announcement,
             get_group_management_context,
             execute_member_batch,
             preview_card_names,
