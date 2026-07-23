@@ -65,7 +65,7 @@ export function installStylePreviewFixture() {
       case 'plugin:event|listen': return callbackId++
       case 'plugin:event|unlisten': return null
       case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Style Preview', pageUrl: 'http://127.0.0.1:5173', nimAccount: 'ACCOUNT', detail: '样式预览数据已加载，修改 CSS 后会自动刷新。' }
-      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 5, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
+      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 6, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
       case 'get_ai_settings': return { base_url: '', webhook_url: '', model: 'deepseek-v4-pro', api_key_configured: false }
       case 'get_wang_startup_settings': return { path: '', autoStart: true }
       case 'get_close_behavior': return 'ask'
@@ -91,6 +91,10 @@ export function installStylePreviewFixture() {
       case 'list_knowledge_bases': return bases
       case 'list_knowledge_documents': return documents
       case 'list_knowledge_bindings': return []
+      case 'list_business_apps': return [{ accountId: 'ACCOUNT', appId: 'prediction', name: '预测', description: '读取已校准结果并生成统计参考', version: '1.0.0', enabled: true, status: 'ready', statusDetail: '1 个彩种数据可用', lastCheckedAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
+      case 'list_business_app_runs': return [{ id: 1, accountId: 'ACCOUNT', appId: 'prediction', groupId: 101, messageId: 3, runKey: 'message:3', status: 'succeeded', freshness: 'fresh', aiUsed: true, reply: 'PC28 第20260722001期\n最新结果：1 + 2 + 3\n趋势摘要：近期样本稳定。', error: '', elapsedMs: 420, createdAt: '2026-07-22T08:16:02Z', completedAt: '2026-07-22T08:16:02Z' }]
+      case 'get_business_app_health': return { appId: 'prediction', status: 'ready', detail: '1 个彩种数据可用', checkedAt: '2026-07-22T08:00:00Z', games: [{ id: 'pc28', name: 'PC28', status: 'ready', detail: '结果与历史数据可用' }, { id: 'jnd28', name: '加拿大28', status: 'unavailable', detail: '暂未发现可用结果' }] }
+      case 'test_business_app': return { appId: 'prediction', status: 'succeeded', freshness: 'fresh', reply: 'PC28 第20260722001期\n最新结果：1 + 2 + 3\n候选方向：4、7、9\n参考度：低，仅作信息参考。', aiUsed: true, error: '', elapsedMs: 420 }
       case 'update_knowledge_base': case 'bind_knowledge_base': case 'save_knowledge_document': return 1
       case 'list_tasks': return tasks
       case 'save_task': { const next = { ...args.task, id: args.task.id || tasks.length + 1 }; tasks = tasks.filter(task => task.id !== next.id).concat(next); return next.id }

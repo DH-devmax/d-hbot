@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Audit, AuditFilters, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
+import type { Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {
   if (typeof reason === 'string') return reason
@@ -79,6 +79,11 @@ export const api = {
   deleteKnowledgeDocument: (baseId: number, documentId: number) => invoke<void>('delete_knowledge_document', { baseId, documentId }),
   bindKnowledgeBase: (baseId: number, accountId: string, groupIds: number[]) => invoke<void>('bind_knowledge_base', { baseId, accountId, groupIds }),
   listKnowledgeBindings: (accountId: string, baseId?: number) => invoke<Array<{ baseId: number; accountId: string; groupId: number; enabled: boolean }>>('list_knowledge_bindings', { accountId, baseId: baseId ?? null }),
+  listBusinessApps: (accountId: string) => invoke<BusinessAppRecord[]>('list_business_apps', { accountId }),
+  setBusinessAppEnabled: (accountId: string, appId: string, enabled: boolean) => invoke<void>('set_business_app_enabled', { accountId, appId, enabled }),
+  getBusinessAppHealth: (accountId: string, appId: string) => invoke<BusinessAppHealth>('get_business_app_health', { accountId, appId }),
+  listBusinessAppRuns: (accountId: string, appId: string, limit = 50) => invoke<BusinessAppRun[]>('list_business_app_runs', { accountId, appId, limit }),
+  testBusinessApp: (accountId: string, appId: string, message: string) => invoke<BusinessAppTestResult>('test_business_app', { input: { accountId, appId, message } }),
   listTasks: (accountId: string, groupId?: number) => invoke<TaskItem[]>('list_tasks', { accountId, groupId: groupId ?? null }),
   saveTask: (task: TaskItem) => invoke<number>('save_task', { task }),
   deleteTask: (accountId: string, taskId: number) => invoke<void>('delete_task', { accountId, taskId }),

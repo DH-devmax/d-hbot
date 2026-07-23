@@ -502,6 +502,40 @@ pub struct PredictionResult {
     pub freshness: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessAppRecord {
+    pub account_id: String,
+    pub app_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub enabled: bool,
+    pub status: String,
+    pub status_detail: String,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessAppRun {
+    pub id: i64,
+    pub account_id: String,
+    pub app_id: String,
+    pub group_id: i64,
+    pub message_id: i64,
+    pub run_key: String,
+    pub status: String,
+    pub freshness: String,
+    pub ai_used: bool,
+    pub reply: String,
+    pub error: String,
+    pub elapsed_ms: i64,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 fn default_json_array() -> String {
     "[]".into()
 }

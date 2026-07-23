@@ -171,6 +171,56 @@ export type AuditFilters = {
 
 export type AiSettings = { base_url: string; webhook_url: string; model: string; api_key_configured: boolean }
 
+export type BusinessAppRecord = {
+  accountId: string
+  appId: string
+  name: string
+  description: string
+  version: string
+  enabled: boolean
+  status: string
+  statusDetail: string
+  lastCheckedAt?: string | null
+  updatedAt: string
+}
+
+export type BusinessAppGameHealth = { id: string; name: string; status: string; detail: string }
+
+export type BusinessAppHealth = {
+  appId: string
+  status: string
+  detail: string
+  checkedAt: string
+  games: BusinessAppGameHealth[]
+}
+
+export type BusinessAppRun = {
+  id: number
+  accountId: string
+  appId: string
+  groupId: number
+  messageId: number
+  runKey: string
+  status: string
+  freshness: string
+  aiUsed: boolean
+  reply: string
+  error: string
+  elapsedMs: number
+  createdAt: string
+  completedAt?: string | null
+}
+
+export type BusinessAppTestResult = {
+  appId: string
+  status: string
+  freshness: string
+  reply: string
+  aiUsed: boolean
+  error: string
+  elapsedMs: number
+}
+
 export type PageResult<T> = { items: T[]; nextCursor?: string | null }
 
 export type SendResult = { groupId: number; groupName: string; success: boolean; messageId?: string; error?: string }

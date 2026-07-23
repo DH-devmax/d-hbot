@@ -8,6 +8,8 @@
 - `DatabaseExecutor` 独占 SQLite 连接。Tokio、CDP、AI 和网络请求不占用数据库线程。
 - 入站消息、outbox、任务提醒和计划执行均使用稳定去重键。
 - API Key、Cookie、Token、Authorization、登录数据和原始账号信息不得写入日志或契约。
+- 业务应用必须通过 `BusinessAppRegistry` 注册和路由，不得在消息 worker 中增加应用专用文本分支。
+- 应用数据先强类型解析和确定性校验，AI 只处理规范化数据并只输出文字；上游地址、认证和原始响应不进入 AI 请求。
 
 ## React 与交互
 
@@ -22,14 +24,23 @@
 ## 测试门禁
 
 ```text
-pnpm test:ui
-pnpm test:e2e:fixture
+pnpm install --frozen-lockfile
+pnpm test:contract-sanitizer
+pnpm test:production-isolation
 cargo test --no-default-features
 cargo test --features fixture
-pnpm test:production-isolation
+pnpm test:ui
+pnpm test:e2e:fixture
+cargo clippy --no-default-features --all-targets -- -D warnings
 ```
 
-生产发布还需 Windows MSVC、NSIS、portable、Authenticode 和生产包深度扫描。真实写协议更新必须先采集、脱敏、回放 Contract v2，再更新能力注册表。
+所有测试和开发构建在开发机执行，私有源码仓库不运行 GitHub Actions。真实写协议更新必须先采集、脱敏、回放 Contract v2，再更新能力注册表。
+
+生产发布由 `DH-devmax/d-hbot-releases` 唯一执行：管理员手动输入经过本地验收的完整源码 commit SHA 与版本标签，Windows Runner 复跑生产安全门禁、MSVC/NSIS/portable 构建、Authenticode 和生产包深度扫描。发行 workflow 不运行 Fixture，也不接受可变源码引用。
+
+Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针只存在于私有源码仓库，不复制到 NSIS、portable 或公开发行仓库。
+
+触发生产发布前还必须确认：源码工作树干净、commit 已推送到 `DH-devmax/d-hbot`、当前 `gh` 账号为 `DH-devmax`、发行仓库三个 Secrets 已配置、公开标签与应用版本一致。生产 Release 已存在时使用新版本号，不覆盖旧资产。
 
 ## 代码评审清单
 

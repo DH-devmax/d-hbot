@@ -14,21 +14,35 @@ $Version = [string]$Package.version
 if ([string]::IsNullOrWhiteSpace($Version)) {
   throw 'package.json 缺少版本号'
 }
-$RequireSignature = $env:GITHUB_REF -like 'refs/tags/v3.*'
+$RequireSignature = ($env:DH_RELEASE_REQUIRE_SIGNATURE -eq '1') -or ($env:GITHUB_REF -like 'refs/tags/v3.*')
+$PreSigned = $env:DH_RELEASE_PRE_SIGNED -eq '1'
 
 if ($RequireSignature) {
-  $TagVersion = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
+  $ReleaseTag = $env:DH_RELEASE_TAG
+  if ([string]::IsNullOrWhiteSpace($ReleaseTag) -and $env:GITHUB_REF -like 'refs/tags/v3.*') {
+    $ReleaseTag = $env:GITHUB_REF.Substring('refs/tags/'.Length)
+  }
+  if ($ReleaseTag -notmatch '^v3\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+    throw "正式发布标签格式不正确：$ReleaseTag"
+  }
+  $TagVersion = $ReleaseTag.Substring(1)
   if ($TagVersion -ne $Version) {
     throw "正式标签版本 $TagVersion 与应用版本 $Version 不一致"
   }
 }
 
-if ($RequireSignature -and -not $env:DH_SIGN_PFX) {
+if ($RequireSignature -and -not $env:DH_SIGN_PFX -and -not $PreSigned) {
   throw '正式标签发布必须配置 Authenticode 证书 DH_SIGN_PFX'
 }
 
 function Sign-Artifact([string]$Path) {
   if (-not $env:DH_SIGN_PFX) { return }
+  $ExistingSignature = Get-AuthenticodeSignature -FilePath $Path
+  if ($ExistingSignature.Status -eq 'Valid') {
+    & signtool verify /pa /all $Path
+    if ($LASTEXITCODE -ne 0) { throw "现有 Authenticode 签名校验失败：$Path" }
+    return
+  }
   $Arguments = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', $env:DH_SIGN_PFX)
   if ($env:DH_SIGN_PASSWORD) { $Arguments += @('/p', $env:DH_SIGN_PASSWORD) }
   $Arguments += $Path

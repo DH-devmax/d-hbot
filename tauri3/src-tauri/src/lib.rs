@@ -3,6 +3,7 @@
 mod ai;
 mod bridge;
 mod build_channel;
+mod business_apps;
 mod cardnames;
 mod contracts;
 mod database;
@@ -36,15 +37,18 @@ use tauri::{Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
 use build_channel::BuildChannel;
+use business_apps::{
+    BusinessAppContext, BusinessAppHealth, BusinessAppRegistry, PREDICTION_APP_ID,
+};
 use database::{Database, DatabaseExecutor, DatabaseStatus};
 use diagnostics::redact;
 use error::{AppError, AppResult};
 use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
-    ActionRecord, AuditEvent, CardPlan, CardPreview, CardRenameJob, DailySummary, Group,
-    GroupAiPermissions, GroupAnnouncement, GroupSchedule, KnowledgeBase, KnowledgeBinding,
-    KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument, Member, MemberRef, MemberRoster,
-    Message, ModerationRule, Page, ScheduleRun, TaskItem,
+    ActionRecord, AuditEvent, BusinessAppRecord, BusinessAppRun, CardPlan, CardPreview,
+    CardRenameJob, DailySummary, Group, GroupAiPermissions, GroupAnnouncement, GroupSchedule,
+    KnowledgeBase, KnowledgeBinding, KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument,
+    Member, MemberRef, MemberRoster, Message, ModerationRule, Page, ScheduleRun, TaskItem,
 };
 use paths::AppPaths;
 use secrets::SecretStore;
@@ -215,6 +219,26 @@ struct WangStartupEvent {
     status: String,
     detail: String,
     needs_confirmation: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BusinessAppTestInput {
+    account_id: String,
+    app_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BusinessAppTestResult {
+    app_id: String,
+    status: String,
+    freshness: String,
+    reply: String,
+    ai_used: bool,
+    error: String,
+    elapsed_ms: u128,
 }
 
 pub struct AppState {
@@ -865,7 +889,10 @@ fn validate_group_batch_input(
             return Err(AppError::new("announcement_empty", "群公告内容不能为空"));
         }
         if text.chars().count() > 1000 {
-            return Err(AppError::new("announcement_too_long", "群公告最多 1000 个字符"));
+            return Err(AppError::new(
+                "announcement_too_long",
+                "群公告最多 1000 个字符",
+            ));
         }
     }
     Ok((input.action, group_ids, text))
@@ -1597,13 +1624,238 @@ async fn test_ai(
 }
 
 #[tauri::command]
-async fn test_prediction(message: String) -> AppResult<serde_json::Value> {
-    match prediction::fetch(&message).await? {
-        Ok(result) => {
-            Ok(serde_json::json!({ "result": result, "reply": prediction::format_reply(&result) }))
-        }
-        Err(prompt) => Ok(serde_json::json!({ "prompt": prompt })),
+async fn list_business_apps(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<Vec<BusinessAppRecord>> {
+    state
+        .database_executor
+        .ensure_business_apps(account_id.clone())
+        .await?;
+    state.database_executor.list_business_apps(account_id).await
+}
+
+#[tauri::command]
+async fn set_business_app_enabled(
+    state: State<'_, AppState>,
+    account_id: String,
+    app_id: String,
+    enabled: bool,
+) -> AppResult<()> {
+    require_account(&state, &account_id).await?;
+    if app_id != PREDICTION_APP_ID {
+        return Err(business_apps::app_not_available(&app_id));
     }
+    state
+        .database_executor
+        .set_business_app_enabled(account_id, app_id, enabled)
+        .await
+}
+
+#[tauri::command]
+async fn get_business_app_health(
+    state: State<'_, AppState>,
+    account_id: String,
+    app_id: String,
+) -> AppResult<BusinessAppHealth> {
+    require_account(&state, &account_id).await?;
+    if app_id != PREDICTION_APP_ID {
+        return Err(business_apps::app_not_available(&app_id));
+    }
+    let source = Arc::new(prediction::HttpPredictionSource::new(Duration::from_secs(
+        8,
+    ))?);
+    let registry = BusinessAppRegistry::new(source);
+    let app = registry
+        .by_id(&app_id)
+        .ok_or_else(|| business_apps::app_not_available(&app_id))?;
+    let health = app.health(Utc::now()).await?;
+    state
+        .database_executor
+        .update_business_app_health(
+            account_id,
+            app_id,
+            health.status.clone(),
+            health.detail.clone(),
+            health.checked_at,
+        )
+        .await?;
+    Ok(health)
+}
+
+#[tauri::command]
+async fn list_business_app_runs(
+    state: State<'_, AppState>,
+    account_id: String,
+    app_id: String,
+    limit: Option<usize>,
+) -> AppResult<Vec<BusinessAppRun>> {
+    state
+        .database_executor
+        .list_business_app_runs(account_id, app_id, limit.unwrap_or(50))
+        .await
+}
+
+#[tauri::command]
+async fn test_business_app(
+    state: State<'_, AppState>,
+    input: BusinessAppTestInput,
+) -> AppResult<BusinessAppTestResult> {
+    if input.app_id != PREDICTION_APP_ID {
+        return Err(business_apps::app_not_available(&input.app_id));
+    }
+    if input.message.trim().is_empty() {
+        return Err(AppError::new(
+            "business_app_input",
+            "请输入一条预测测试内容",
+        ));
+    }
+    let started = std::time::Instant::now();
+    let source = Arc::new(prediction::HttpPredictionSource::new(Duration::from_secs(
+        8,
+    ))?);
+    let registry = BusinessAppRegistry::new(source);
+    let app = registry
+        .by_id(&input.app_id)
+        .ok_or_else(|| business_apps::app_not_available(&input.app_id))?;
+    let now = Utc::now();
+    let group = Group {
+        account_id: input.account_id.clone(),
+        group_id: 0,
+        name: "本地业务应用测试".into(),
+        owner_user_id: 1,
+        enabled: true,
+        ai_enabled: true,
+        moderation_enabled: false,
+        manual_takeover: false,
+        welcome_message: String::new(),
+        updated_at: now,
+    };
+    let member = Member {
+        account_id: input.account_id.clone(),
+        group_id: 0,
+        user_id: 1,
+        nim_id: String::new(),
+        nickname: "本地测试用户".into(),
+        card_name: "本地测试用户".into(),
+        original_card_name: "本地测试用户".into(),
+        managed_card_name: String::new(),
+        card_suffix: String::new(),
+        role: "admin".into(),
+        account_state: "".into(),
+        blacklisted: false,
+        present: true,
+        join_source: "local-test".into(),
+        prompt_read: true,
+        locked_card_name: String::new(),
+        violation_count: 0,
+        discovered_at: now,
+        joined_at: Some(now),
+        last_seen_at: now,
+        updated_at: now,
+    };
+    let message = Message {
+        id: 0,
+        account_id: input.account_id.clone(),
+        group_id: 0,
+        server_message_id: "LOCAL-BUSINESS-APP-TEST".into(),
+        sequence: 0,
+        user_id: 1,
+        sender_name: "本地测试用户".into(),
+        kind: "text".into(),
+        text: input.message,
+        sent_at: now,
+        received_at: now,
+        processed_at: None,
+        acknowledged_at: None,
+        processing_state: "pending".into(),
+        attempts: 0,
+        next_attempt_at: None,
+        last_error: String::new(),
+        mentions_json: "[]".into(),
+        source_kind: Some("local-test".into()),
+        flow: Some("inbound".into()),
+    };
+    let outcome = app
+        .run(&BusinessAppContext {
+            account_id: &input.account_id,
+            group: &group,
+            member: &member,
+            message: &message,
+            now,
+        })
+        .await?;
+    if outcome.app_id != input.app_id {
+        return Err(AppError::new(
+            "business_app_result",
+            "业务应用返回了错误的应用标识",
+        ));
+    }
+    let mut reply = outcome.fallback_reply.clone();
+    let mut ai_used = false;
+    let mut error = String::new();
+    if let Some(data) = outcome.narration.as_ref() {
+        let provider = ai::ConfiguredProvider::new(ai::AiConfig {
+            base_url: state
+                .database_executor
+                .get_setting("ai.base_url".into())
+                .await?
+                .unwrap_or_default(),
+            webhook_url: state
+                .database_executor
+                .get_setting("ai.webhook_url".into())
+                .await?
+                .unwrap_or_default(),
+            model: state
+                .database_executor
+                .get_setting("ai.model".into())
+                .await?
+                .unwrap_or_else(|| "deepseek-v4-pro".into()),
+            api_key: state
+                .secrets
+                .load()?
+                .get("ai.api_key")
+                .cloned()
+                .unwrap_or_default(),
+            timeout: Duration::from_secs(20),
+        })?;
+        let request = ai::AiRequest {
+            version: "1",
+            event_id: uuid::Uuid::new_v4().to_string(),
+            persona: ai::PERSONA,
+            group_id: 0,
+            group_name: group.name.clone(),
+            member_id: 1,
+            member_name: member.card_name.clone(),
+            member_role: member.role.clone(),
+            message_id: "LOCAL-BUSINESS-APP-TEST".into(),
+            message: business_apps::prediction_narration_prompt(data),
+            recent_context: Vec::new(),
+            knowledge: Vec::new(),
+        };
+        match ai::AiProvider::decide(&provider, &request).await {
+            Ok(decision) if !decision.reply.trim().is_empty() => {
+                reply = decision.reply.trim().into();
+                ai_used = true;
+            }
+            Ok(_) => error = "AI 没有返回文字，已使用应用模板".into(),
+            Err(reason) => error = format!("{}；已使用应用模板", reason.message),
+        }
+    }
+    Ok(BusinessAppTestResult {
+        app_id: outcome.app_id,
+        status: if ai_used {
+            "succeeded"
+        } else {
+            outcome.status.as_str()
+        }
+        .into(),
+        freshness: outcome.freshness,
+        reply,
+        ai_used,
+        error,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
 }
 
 #[tauri::command]
@@ -2292,7 +2544,11 @@ macro_rules! dh_handlers {
             save_summary_settings,
             generate_daily_summary,
             test_ai,
-            test_prediction,
+            list_business_apps,
+            set_business_app_enabled,
+            get_business_app_health,
+            list_business_app_runs,
+            test_business_app,
             locate_wangshangliao,
             get_wang_startup_settings,
             save_wang_startup_settings,
@@ -2372,6 +2628,9 @@ fn request_graceful_exit(app: tauri::AppHandle) {
     if state.exit_started.swap(true, Ordering::AcqRel) {
         return;
     }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
     state.shutdown.cancel();
     let database = state.database_executor.clone();
     let tasks = state.runtime_tasks.clone();
@@ -2406,6 +2665,11 @@ fn request_graceful_exit(app: tauri::AppHandle) {
             .await;
         }
         let _ = tokio::time::timeout_at(deadline, database.shutdown()).await;
+        #[cfg(windows)]
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(2));
+            std::process::exit(0);
+        });
         app.exit(0);
     });
 }
@@ -2470,7 +2734,7 @@ async fn auto_start_wangshangliao(
     if !enabled || shutdown.is_cancelled() {
         return;
     }
-    let _start_guard = start_lock.lock().await;
+    let start_guard = start_lock.lock().await;
     let path = database
         .get_setting("wangshangliao.path".into())
         .await
@@ -2532,7 +2796,90 @@ async fn auto_start_wangshangliao(
     if let Ok(mut pending) = startup_status.lock() {
         *pending = Some(payload.clone());
     }
-    let _ = app.emit("wangshangliao-status", payload);
+    let _ = app.emit("wangshangliao-status", payload.clone());
+    let mut last_problem = if matches!(
+        payload.status.as_str(),
+        "ready" | "devtools-ready" | "nim-not-ready"
+    ) {
+        None
+    } else {
+        Some((payload.status, payload.detail, payload.needs_confirmation))
+    };
+    drop(start_guard);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = shutdown.cancelled() => return,
+        }
+        let enabled = wang_auto_start_enabled(
+            database
+                .get_setting("wangshangliao.auto_start".into())
+                .await
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        if !enabled {
+            last_problem = None;
+            continue;
+        }
+        let status = platform::inspect("http://127.0.0.1:9222")
+            .await
+            .unwrap_or_else(|_| "unavailable".into());
+        if matches!(
+            status.as_str(),
+            "ready" | "devtools-ready" | "nim-not-ready"
+        ) {
+            last_problem = None;
+            continue;
+        }
+
+        let _start_guard = start_lock.lock().await;
+        let status = platform::inspect("http://127.0.0.1:9222")
+            .await
+            .unwrap_or_else(|_| "unavailable".into());
+        if matches!(
+            status.as_str(),
+            "ready" | "devtools-ready" | "nim-not-ready"
+        ) {
+            last_problem = None;
+            continue;
+        }
+        let path = database
+            .get_setting("wangshangliao.path".into())
+            .await
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        let payload = match platform::start(path, "http://127.0.0.1:9222".into(), false).await {
+            Ok(result) => WangStartupEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                status: result.status,
+                detail: result.detail,
+                needs_confirmation: result.needs_confirmation,
+            },
+            Err(error) => WangStartupEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                status: error.code,
+                detail: error.message,
+                needs_confirmation: false,
+            },
+        };
+        let signature = (
+            payload.status.clone(),
+            payload.detail.clone(),
+            payload.needs_confirmation,
+        );
+        if last_problem.as_ref() == Some(&signature) {
+            continue;
+        }
+        last_problem = Some(signature);
+        if let Ok(mut pending) = startup_status.lock() {
+            *pending = Some(payload.clone());
+        }
+        let _ = app.emit("wangshangliao-status", payload);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2578,7 +2925,6 @@ pub fn run() {
         .setup(move |app| {
             let state = AppState::initialize()
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-            let shutdown = state.shutdown.clone();
             app.manage(state);
             let app_handle = app.handle().clone();
             set_tray_menu(app.handle(), false)?;
@@ -2674,18 +3020,15 @@ pub fn run() {
             if let Ok(mut tasks) = app.state::<AppState>().runtime_tasks.lock() {
                 *tasks = runtime_tasks;
             }
-            tauri::async_runtime::spawn(async move {
-                shutdown.cancelled().await;
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.close();
-                }
-            });
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle().clone();
+                if app.state::<AppState>().exit_started.load(Ordering::Acquire) {
+                    return;
+                }
+                api.prevent_close();
                 let behavior = cached_close_behavior(&app.state::<AppState>());
                 app.state::<AppState>()
                     .logger
@@ -2709,11 +3052,6 @@ pub fn run() {
                     }
                 }
             }
-            WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
-                let _ = window.hide();
-                show_tray_notification(window.app_handle());
-            }
-            _ => {}
         })
         .run(tauri::generate_context!())
     {

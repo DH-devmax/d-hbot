@@ -29,7 +29,8 @@
     "package:windows:production": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel production",
     "package:windows:developer": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel developer",
     "verify:production": "node scripts/verify-production.mjs",
-    "verify:windows:production": "pwsh -NoProfile -File scripts/verify-windows-production.ps1 -ArtifactDirectory dist/production"
+    "verify:windows:production": "pwsh -NoProfile -File scripts/verify-windows-production.ps1 -ArtifactDirectory dist/production",
+    "test:windows:real": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-real-machine.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
