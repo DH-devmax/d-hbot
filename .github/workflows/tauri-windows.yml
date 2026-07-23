@@ -46,6 +46,20 @@ jobs:
         run: pnpm test:contract-sanitizer
       - name: Test React pages and interactions
         run: pnpm test:ui
+      - name: Parse Windows real-machine probe
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'scripts\test-windows-real-machine.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw 'Windows 实机探针包含 PowerShell 语法错误'
+          }
       - run: pnpm test:production
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
       - name: Prepare Authenticode certificate

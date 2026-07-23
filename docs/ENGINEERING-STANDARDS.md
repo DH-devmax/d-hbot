@@ -33,6 +33,8 @@ pnpm test:production-isolation
 
 生产发布还需 Windows MSVC、NSIS、portable、Authenticode 和生产包深度扫描。真实写协议更新必须先采集、脱敏、回放 Contract v2，再更新能力注册表。
 
+Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针只存在于私有源码仓库，不复制到 NSIS、portable 或公开发行仓库。
+
 ## 代码评审清单
 
 1. 是否破坏账号、群、成员身份边界。

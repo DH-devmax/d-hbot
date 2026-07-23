@@ -86,3 +86,7 @@ gh secret list --repo DH-devmax/d-hbot
 ```
 
 Actions 额度、Windows Runner、PFX 证书和 Deploy Key 是四个独立条件。一个条件通过，不代表另外三个已经就绪。
+
+## Windows 实机验收
+
+Actions 成功只代表构建、自动测试和生产隔离通过。任务栏、托盘、旺商聊登录状态、9222 实际进程和退出残留使用 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md) 中的实机探针与人工清单验收。探针属于私有开发工具，不随公开生产包发布。
