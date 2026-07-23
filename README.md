@@ -9,16 +9,18 @@ DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管
 - 多群组与成员同步，以 `groupId` 识别群，以 `userId` / `nimId` 识别成员。
 - 确定性群管规则、群名片、黑名单、知识库、AI 回复、任务、每日摘要和定时开关群。
 - AI 群回复只由明确 `@DH` 或旺商聊提及元数据触发。
-- SQLite schema v5，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
+- SQLite schema v6，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
 - Windows 托盘、单实例、旺商聊 DevTools 启动、固定登录分区和 UAC 维护流程。
 
-## 构建通道
+## 本地构建与测试
 
-生产版固定连接 `127.0.0.1:9222`，编译时移除所有 Fixture 入口：
+私有源码仓库不运行 GitHub Actions。生产、Fixture 和界面测试均在开发机完成；生产版固定连接 `127.0.0.1:9222`，编译时移除所有 Fixture 入口：
 
 ```sh
 cd tauri3
 pnpm install --frozen-lockfile
+pnpm test:contract-sanitizer
+pnpm test:production-isolation
 pnpm test:production
 pnpm test:ui
 pnpm tauri:build:production
@@ -32,6 +34,8 @@ pnpm test:fixture
 pnpm test:e2e:fixture
 pnpm tauri:build:developer
 ```
+
+Windows 开发机在提交生产发布前还需执行生产打包、深度扫描和实机探针。完整顺序见 [`docs/ENGINEERING-STANDARDS.md`](docs/ENGINEERING-STANDARDS.md)。
 
 ## 目录
 
@@ -52,9 +56,10 @@ pnpm tauri:build:developer
 - 生产数据：`%APPDATA%\DH\3.0`
 - 开发 Fixture 数据：`%APPDATA%\DH\fixture`
 - 核心源码仓库保持私有；公开下载统一发布到 [`DH-devmax/d-hbot-releases`](https://github.com/DH-devmax/d-hbot-releases)。
-- 正式标签发布必须配置 Authenticode 证书。
-- 未签名的 CI 产物只作内部 beta，同时生成 SHA-256 校验文件。
+- 私有源码仓库的 Actions 已停用；`DH-devmax/d-hbot-releases` 是唯一生产构建与公开发布位置。
+- 生产发布在发行仓库中手动输入完整源码 commit SHA 与版本标签，并强制使用 Authenticode 证书。
+- 缺少证书、源码只读 Token 或生产门禁失败时不生成公开 Release。
 
-发布仓库边界、Deploy Key 和 Actions 投递流程见 [`docs/RELEASE-ARCHITECTURE.md`](docs/RELEASE-ARCHITECTURE.md)。
+发布仓库边界、只读源码访问和生产 Actions 流程见 [`docs/RELEASE-ARCHITECTURE.md`](docs/RELEASE-ARCHITECTURE.md)。
 
 详细进度和验收边界见 [`tauri3/STATUS.md`](tauri3/STATUS.md)。

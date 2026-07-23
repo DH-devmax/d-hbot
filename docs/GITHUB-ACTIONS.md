@@ -2,91 +2,87 @@
 
 ## 当前线路
 
-| 用途 | 仓库 | 可见性 | 内容 |
+| 用途 | 仓库 | 可见性 | Actions |
 | --- | --- | --- | --- |
-| 源码与构建 | `DH-devmax/d-hbot` | 私有 | Rust/Tauri、React、契约、Fixture、测试和 CI |
-| 公开发行 | `DH-devmax/d-hbot-releases` | 公开 | EXE、ZIP、手册、规则模板和 SHA-256 |
-| 历史归档 | `sh492773746/d-hbot`、`sh492773746/d-hbot-releases` | 旧线路 | 只读参考，不接收新投递 |
+| 私有源码 | `DH-devmax/d-hbot` | 私有 | 停用；测试和开发构建只在本地执行 |
+| 生产构建与发行 | `DH-devmax/d-hbot-releases` | 公开 | 唯一生产 workflow，手动触发 |
+| 历史归档 | `sh492773746/d-hbot`、`sh492773746/d-hbot-releases` | 旧线路 | 不接收当前线路的提交或发布 |
 
-本地源码仓库：
+源码仓库历史 Actions 记录只表示旧流程，不是当前生产入口。
 
-```sh
-git remote -v
-# origin  -> git@github.com:DH-devmax/d-hbot.git
-# legacy  -> https://github.com/sh492773746/d-hbot.git
-```
+## 账号与提交检查
 
-## 账号校验
+- 当前线路账号：`DH-devmax`。
+- 源码 `origin`：`git@github.com:DH-devmax/d-hbot.git`。
+- 旧账号 `sh492773746` 只用于历史仓库维护。
+- 提交和推送必须经过 `.githooks/pre-commit` 与 `.githooks/pre-push`，不得使用 `--no-verify`。
 
-- 当前新线路账号：`DH-devmax`。
-- 旧账号：`sh492773746`，仅在维护历史仓库时使用。
-- 源码仓库已启用 `.githooks/pre-commit` 和 `.githooks/pre-push`。
-- hook 会核对远端所有者、活动 `gh` 账号、Git 作者姓名和邮箱。
-- 不使用 `--no-verify` 绕过检查。
-
-提交或推送前：
+每次提交和发布前执行：
 
 ```sh
 gh auth status --active
 git status --short
 git diff --cached --check
+git remote get-url --push origin
+git config user.name
+git config user.email
 ```
 
-## Secrets
+## 本地门禁
 
-只在私有源码仓库配置 Secrets：
-
-| Secret | 用途 | 当前状态 |
-| --- | --- | --- |
-| `DH_RELEASE_DEPLOY_KEY` | 把构建产物投递到公开发行仓库 | 已配置；Deploy Key 只对发行仓库写入 |
-| `DH_SIGN_PFX_B64` | Authenticode PFX 的 Base64 内容 | 待真实证书 |
-| `DH_SIGN_PASSWORD` | PFX 密码 | 与真实证书一起配置 |
-
-配置命令在受控终端执行，禁止把 PFX、密码、解码文件或 Secret 输出到日志：
+在 `tauri3/` 依次执行：
 
 ```sh
-base64 < signing-certificate.pfx | tr -d '\\n' | gh secret set DH_SIGN_PFX_B64 --repo DH-devmax/d-hbot
-printf '%s' "$PFX_PASSWORD" | gh secret set DH_SIGN_PASSWORD --repo DH-devmax/d-hbot
-gh secret list --repo DH-devmax/d-hbot
+pnpm install --frozen-lockfile
+pnpm test:contract-sanitizer
+pnpm test:production-isolation
+pnpm test:production
+pnpm test:fixture
+pnpm test:ui
+pnpm test:e2e:fixture
+cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
 ```
 
-本机没有真实 Authenticode PFX 时，保持两个签名 Secret 为空。手动分支构建可生成内部未签名产物；`v3.*` 标签会在签名准备阶段检查并停止。
+Windows 开发机另外执行生产构建、`package:windows:production`、`verify:windows:production` 和 `test:windows:real`。本地门禁失败时不触发发行仓库 workflow。
 
-## Workflow
+## 生产 workflow
 
-私有源码仓库：
+`DH-devmax/d-hbot-releases` 只保留 `build-production.yml`，通过 `workflow_dispatch` 接收：
 
-- `tauri-windows.yml`：生产测试、Windows 构建、隔离扫描、签名和投递。
-- `tauri-developer.yml`：内部 Fixture 构建，不进入公开发行仓库。
+- `source_commit`：`DH-devmax/d-hbot` 中完整的 40 位 commit SHA。
+- `release_tag`：与应用版本一致的 `v3.x.y` 或预发布标签。
 
-生产构建只允许在 `DH-devmax/d-hbot` 执行，并固定投递到 `DH-devmax/d-hbot-releases`。生产包不包含 Fixture、`9233/51300`、测试数据库或开发命令。
+workflow 固定检出精确 SHA，运行生产门禁，构建 `--no-default-features`，签名所有 PE，扫描 NSIS/portable，并直接创建公开 Release。它不注册 PR、push 或 fork 触发，也不构建 Fixture。
 
-公开发行仓库的 `publish-staged-release.yml` 会校验：
+## 发行仓库 Secrets
 
-1. `release.json` 来源必须是 `DH-devmax/d-hbot`。
-2. 标签符合 `v3.x.y` 格式。
-3. 文件名没有目录、路径穿越、源码、调试文件或 Fixture。
-4. `SHA256SUMS.txt` 校验全部通过。
-5. 校验后创建 GitHub Release，再清理 `incoming/<tag>`。
+| Secret | 用途 |
+| --- | --- |
+| `DH_SOURCE_READ_TOKEN` | 只读检出私有源码仓库 |
+| `DH_SIGN_PFX_B64` | Authenticode PFX Base64 |
+| `DH_SIGN_PASSWORD` | PFX 密码 |
 
-## 运行检查
+三个 Secrets 只配置在发行仓库。缺少任一 Secret 时生产 workflow 在检出或构建前停止，不生成公开资产。源码仓库不再使用 `DH_RELEASE_DEPLOY_KEY`。
 
-完成 `workflow` scope 授权并推送源码后：
+## 运行与检查
 
 ```sh
-gh workflow list --repo DH-devmax/d-hbot
-gh workflow run tauri-windows.yml --repo DH-devmax/d-hbot --ref codex/tauri-3-backend
-gh run list --repo DH-devmax/d-hbot --limit 5
+gh workflow list --repo DH-devmax/d-hbot-releases
+gh workflow run build-production.yml \
+  --repo DH-devmax/d-hbot-releases \
+  -f source_commit=40_HEX_SOURCE_COMMIT \
+  -f release_tag=v3.0.0
+gh run list --repo DH-devmax/d-hbot-releases --limit 5
 ```
 
-手动分支构建不会要求签名证书；正式标签前必须先确认三个 Secrets：
+生产通过后检查：
 
 ```sh
-gh secret list --repo DH-devmax/d-hbot
+gh release view v3.0.0 --repo DH-devmax/d-hbot-releases
 ```
 
-Actions 额度、Windows Runner、PFX 证书和 Deploy Key 是四个独立条件。一个条件通过，不代表另外三个已经就绪。
+公开 Release 只包含已签名 EXE、安装包、portable ZIP、手册、默认规则、来源清单和 `SHA256SUMS.txt`。
 
 ## Windows 实机验收
 
-Actions 成功只代表构建、自动测试和生产隔离通过。任务栏、托盘、旺商聊登录状态、9222 实际进程和退出残留使用 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md) 中的实机探针与人工清单验收。探针属于私有开发工具，不随公开生产包发布。
+Actions 证明 Windows MSVC 构建、自动测试、签名和生产隔离通过；任务栏、托盘、旺商聊登录状态、9222 和退出残留仍按 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md) 验收。实机对象必须从公开 Release 下载，开发 Fixture 和本地未签名包不作为正式验收对象。

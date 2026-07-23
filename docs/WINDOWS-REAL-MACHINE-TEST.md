@@ -2,13 +2,13 @@
 
 ## 为什么要分层测试
 
-GitHub Actions 能证明源码可以在 Windows MSVC 下构建、测试和打包，但它不具备旺商聊账号，也不能替代真实桌面的任务栏、托盘、窗口焦点和登录状态测试。正式验收分三层：
+发行仓库的生产 Actions 能证明指定源码 SHA 可以在 Windows MSVC 下构建、签名、扫描和打包，但它不具备旺商聊账号，也不能替代真实桌面的任务栏、托盘、窗口焦点和登录状态测试。正式验收分三层：
 
 1. **Actions 构建层**：Rust、React、契约、生产隔离、NSIS 和 SHA-256。
 2. **Windows 自动探针层**：真实 EXE、WebView2、9222、旺商聊进程参数、普通最小化和退出残留。
 3. **人工桌面层**：图标观感、任务栏点击、X 关闭提示、账号登录状态复用。
 
-Fixture 不参与这套测试。测试对象必须是 `tauri-windows.yml` 生成的生产 artifact。
+Fixture 不参与这套测试。测试对象必须是 `DH-devmax/d-hbot-releases` 公开 Release 中的已签名生产包，不使用源码仓库历史 artifact 或本地未签名包。
 
 ## 推荐环境
 
@@ -22,7 +22,7 @@ Fixture 不参与这套测试。测试对象必须是 `tauri-windows.yml` 生成
 
 把以下两个文件放在同一台 Windows 电脑：
 
-- Actions 下载的 `DH-BOT-*-windows-x64-portable.zip`
+- 公开 Release 下载的 `DH-BOT-*-windows-x64-portable.zip`
 - 私有源码中的 `tauri3/scripts/test-windows-real-machine.ps1`
 
 在 PowerShell 中执行：
@@ -35,7 +35,7 @@ Set-ExecutionPolicy -Scope Process Bypass
   -VerifyInteractiveExit
 ```
 
-`ExpectedSha256` 填 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值。内部未签名 beta 会产生签名警告；正式版签名状态必须为 `Valid`。
+`ExpectedSha256` 填同一公开 Release 的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值。公开生产包签名状态必须为 `Valid`；未签名包不进入这套正式验收。
 
 脚本自动完成：
 

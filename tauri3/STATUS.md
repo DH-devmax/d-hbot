@@ -47,14 +47,14 @@
 - 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
 - 已用当前代码生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned-rust-final.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `97d2ca4075ff08573cfcba823ad660925406375b0b026fe830f38ff472b28880`，ZIP 为 `5610866f9fa594a110b1a7ed0011fe501e428f59f3e8a33b176696bd5afb4d4c`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。它只用于内部 beta，不替代 NSIS、Authenticode 和 Windows 实机验收。
 - Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
-- GitHub Actions 生产与开发工作流已经触发，但 GitHub 在 runner 启动前以账户付款或额度状态拒绝作业；这不是源码编译失败，账户恢复后需重新运行 Windows MSVC 门禁。
+- 构建归属已调整为“源码仓库只做本地测试、公开发行仓库唯一生产构建”。源码仓库不再保留生产或 Fixture workflow；正式发布由发行仓库手动输入完整源码 SHA 和标签，强制签名后创建公开 Release。
 
 ## Beta.2 / RC 必须由外部环境证明的门禁
 
-- Windows MSVC CI 编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
+- 发行仓库 Windows MSVC 生产编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
 - Windows 10 22H2 与 Windows 11 23H2/24H2 的标准用户/管理员、安装/升级/卸载/portable、UAC、托盘、休眠恢复和 100%/125%/150% DPI。
 - 基于真实旺商聊文件版本与主脚本 SHA-256 的脱敏 Contract v2 采集与回放。2.7.7 群公告已校准；双群全员禁言/解除全禁及其他待验证写能力继续保持 `Unverified`。
 - 16 人“大海兼职群”先做只读同步，再做测试消息撤回、短时禁言/立即解禁、临时改名/自动恢复；移出成员仍只在 Fixture 验证。
-- 正式标签发布的 Authenticode 签名和 `signtool verify`。未配置证书的构建仅作内部 beta。
+- 发行仓库正式生产构建的 Authenticode 签名和 `signtool verify`。未配置证书时阻止公开发布。
 
 生产新安装不创建测试群、成员、规则、知识库、计划或自动化开关；Fixture 仅存在于内部开发包。

@@ -154,7 +154,9 @@ test('developer fixture covers navigation, data and management workflows', async
 
   await page.getByRole('button', { name: '设置' }).click()
   await expect(page.getByText('DH Fixture · 9233')).toBeVisible()
-  await page.getByPlaceholder('输入一条测试问题').fill('你好')
+  await page.getByRole('button', { name: '知识与 AI' }).click()
+  await page.getByRole('button', { name: /AI 助手/ }).click()
+  await page.getByPlaceholder('输入一条测试问题，例如：@DH 群规是什么？').fill('你好')
   await page.getByRole('button', { name: '测试 AI' }).click()
   await expect(page.getByText(/可以回答群规和业务问题/)).toBeVisible()
 
@@ -188,7 +190,9 @@ test('captures current Tauri pages for the manual', async ({ page }) => {
   await capture('任务与计划', 'tasks.png')
   await capture('审计', 'audit.png')
   await capture('设置', 'settings.png')
-  await page.getByPlaceholder('输入一条测试问题').fill('你好，请简单说明群规')
+  await page.getByRole('button', { name: '知识与 AI' }).click()
+  await page.getByRole('button', { name: /AI 助手/ }).click()
+  await page.getByPlaceholder('输入一条测试问题，例如：@DH 群规是什么？').fill('你好，请简单说明群规')
   await page.getByRole('button', { name: '测试 AI' }).click()
   await expect(page.getByText(/可以回答群规和业务问题/)).toBeVisible()
   await page.screenshot({ path: path.join(directory, 'ai-test.png'), fullPage: false })
