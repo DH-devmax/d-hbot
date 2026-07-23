@@ -34,7 +34,7 @@ jobs:
           version: 11.15.1
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
           cache-dependency-path: tauri3/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
