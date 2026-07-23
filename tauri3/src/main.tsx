@@ -197,10 +197,10 @@ function App() {
       {page === '群组与成员' && <GroupMembersPage groups={groups} selectedGroup={selectedGroup} setSelectedGroup={setSelectedGroup} activeGroup={activeGroup} onError={setError} refresh={refresh} />}
       {page === '消息台' && <MessagesPage key={`messages-${accountId}-${pageEpoch}`} groups={groups} accountId={accountId} onError={setError} />}
       {page === '规则' && <RulesPage key={`rules-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
-      {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
       {page === '任务与计划' && <PlansPage key={`plans-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '审计' && <AuditPage key={`audit-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
-      {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
+      {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>
   </main><ButtonHelp />{showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={() => setClosePrompt(false)} onResolve={action => void resolveClose(action)} />}</>

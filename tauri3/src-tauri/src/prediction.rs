@@ -11,7 +11,12 @@ use crate::models::{PredictionResult, PredictionSnapshot};
 
 #[cfg(test)]
 pub fn is_prediction_request(text: &str) -> bool {
-    crate::ai::is_mentioned(text) && text.contains("预测")
+    crate::ai::is_mentioned(text)
+        && crate::ai::message_without_mention(text)
+            .trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, ':' | '：' | ',' | '，')
+            })
+            .starts_with("预测")
 }
 
 pub fn analyze(snapshot: &PredictionSnapshot) -> PredictionResult {
@@ -332,34 +337,6 @@ pub async fn fetch_status<S: PredictionSource + ?Sized>(
         )));
     };
     Ok(Ok(source.load(game).await?))
-}
-
-pub async fn fetch_with_source<S: PredictionSource + ?Sized>(
-    text: &str,
-    source: &S,
-) -> AppResult<Result<PredictionResult, String>> {
-    let Some(result) = fetch_status(text, source).await?.ok() else {
-        return Ok(Err(format!(
-            "请在“预测”后写出彩种名称，例如：@DH 预测 {}",
-            GAMES
-                .iter()
-                .map(|game| game.name)
-                .collect::<Vec<_>>()
-                .join("、")
-        )));
-    };
-    let Some(snapshot) = result.snapshot else {
-        return Err(AppError::new(
-            "prediction_unavailable",
-            "当前彩种暂未发现可用数据",
-        ));
-    };
-    Ok(Ok(analyze(&snapshot)))
-}
-
-pub async fn fetch(text: &str) -> AppResult<Result<PredictionResult, String>> {
-    let source = HttpPredictionSource::new(Duration::from_secs(8))?;
-    fetch_with_source(text, &source).await
 }
 
 pub fn format_reply(result: &PredictionResult) -> String {

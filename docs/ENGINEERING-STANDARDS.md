@@ -8,6 +8,8 @@
 - `DatabaseExecutor` 独占 SQLite 连接。Tokio、CDP、AI 和网络请求不占用数据库线程。
 - 入站消息、outbox、任务提醒和计划执行均使用稳定去重键。
 - API Key、Cookie、Token、Authorization、登录数据和原始账号信息不得写入日志或契约。
+- 业务应用必须通过 `BusinessAppRegistry` 注册和路由，不得在消息 worker 中增加应用专用文本分支。
+- 应用数据先强类型解析和确定性校验，AI 只处理规范化数据并只输出文字；上游地址、认证和原始响应不进入 AI 请求。
 
 ## React 与交互
 

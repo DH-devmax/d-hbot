@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 use crate::defaults;
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
-    Account, ActionRecord, AuditEvent, BatchIngestResult, CardPlan, CardRenameJob, DailySummary,
-    EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect, GatewayInboxEvent, GatewayInboxItem,
-    Group, GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeDocument, Member, Message,
-    ModerationRule, PersistedMessage, TaskItem,
+    Account, ActionRecord, AuditEvent, BatchIngestResult, BusinessAppRecord, BusinessAppRun,
+    CardPlan, CardRenameJob, DailySummary, EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect,
+    GatewayInboxEvent, GatewayInboxItem, Group, GroupAiPermissions, GroupSchedule, KnowledgeBase,
+    KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, TaskItem,
 };
 use crate::paths::AppPaths;
 
@@ -393,6 +393,38 @@ CREATE TABLE IF NOT EXISTS app_settings (
   sensitive INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS business_apps (
+  account_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'unchecked',
+  status_detail TEXT NOT NULL DEFAULT '',
+  last_checked_at TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(account_id, app_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS business_app_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL DEFAULT 0,
+  message_id INTEGER NOT NULL DEFAULT 0,
+  run_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'processing',
+  freshness TEXT NOT NULL DEFAULT 'missing',
+  ai_used INTEGER NOT NULL DEFAULT 0,
+  reply TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(account_id, app_id, run_key),
+  FOREIGN KEY(account_id, app_id) REFERENCES business_apps(account_id, app_id) ON DELETE CASCADE
+);
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -694,6 +726,98 @@ impl DatabaseExecutor {
 
     pub async fn ensure_account_defaults(&self, account_id: String) -> AppResult<()> {
         self.execute(move |database| database.ensure_account_defaults(&account_id))
+            .await
+    }
+
+    pub async fn ensure_business_apps(&self, account_id: String) -> AppResult<()> {
+        self.execute(move |database| database.ensure_business_apps(&account_id))
+            .await
+    }
+
+    pub async fn list_business_apps(
+        &self,
+        account_id: String,
+    ) -> AppResult<Vec<BusinessAppRecord>> {
+        self.execute(move |database| database.list_business_apps(&account_id))
+            .await
+    }
+
+    pub async fn set_business_app_enabled(
+        &self,
+        account_id: String,
+        app_id: String,
+        enabled: bool,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_business_app_enabled(&account_id, &app_id, enabled)
+        })
+        .await
+    }
+
+    pub async fn business_app_enabled(
+        &self,
+        account_id: String,
+        app_id: String,
+    ) -> AppResult<bool> {
+        self.execute(move |database| database.business_app_enabled(&account_id, &app_id))
+            .await
+    }
+
+    pub async fn update_business_app_health(
+        &self,
+        account_id: String,
+        app_id: String,
+        status: String,
+        detail: String,
+        checked_at: DateTime<Utc>,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.update_business_app_health(&account_id, &app_id, &status, &detail, checked_at)
+        })
+        .await
+    }
+
+    pub async fn claim_business_app_run(&self, run: BusinessAppRun) -> AppResult<bool> {
+        self.execute(move |database| database.claim_business_app_run(&run))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_business_app_run(
+        &self,
+        account_id: String,
+        app_id: String,
+        run_key: String,
+        status: String,
+        freshness: String,
+        ai_used: bool,
+        reply: String,
+        error: String,
+        elapsed_ms: i64,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.finish_business_app_run(
+                &account_id,
+                &app_id,
+                &run_key,
+                &status,
+                &freshness,
+                ai_used,
+                &reply,
+                &error,
+                elapsed_ms,
+            )
+        })
+        .await
+    }
+
+    pub async fn list_business_app_runs(
+        &self,
+        account_id: String,
+        app_id: String,
+        limit: usize,
+    ) -> AppResult<Vec<BusinessAppRun>> {
+        self.execute(move |database| database.list_business_app_runs(&account_id, &app_id, limit))
             .await
     }
 
@@ -1120,10 +1244,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 5 {
+    if old_version > 6 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v5"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v6"),
         ));
     }
     let transaction = connection
@@ -1220,7 +1344,7 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
         .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS tasks_source_key_idx ON tasks(account_id,source_key) WHERE source_key<>''")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
-        .execute_batch("PRAGMA user_version = 5;")
+        .execute_batch("PRAGMA user_version = 6;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -1317,7 +1441,7 @@ impl Database {
         let old_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| AppError::new("database_version", error.to_string()))?;
-        if database_existed && old_version < 5 {
+        if database_existed && old_version < 6 {
             snapshot_before_migration(paths, &connection, old_version)?;
         }
         connection.execute_batch(SCHEMA).map_err(|error| {
@@ -1440,6 +1564,11 @@ impl Database {
         let marker_key = format!("defaults.content.version.2.{account_id}");
         let result = self.with_connection(|connection| {
             let transaction = connection.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                params![account_id, now],
+            )?;
             if transaction
                 .query_row(
                     "SELECT value FROM app_settings WHERE key=?",
@@ -1453,7 +1582,6 @@ impl Database {
                 return Ok(());
             }
 
-            let now = Utc::now().to_rfc3339();
             for rule in defaults::default_rules(account_id) {
                 let exists: Option<i64> = transaction
                     .query_row(
@@ -1533,6 +1661,148 @@ impl Database {
             });
         }
         result.map_err(|error| AppError::new("database_account_defaults", error.to_string()))
+    }
+
+    pub fn ensure_business_apps(&self, account_id: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                params![account_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("business_app_defaults", error.to_string()))
+    }
+
+    pub fn list_business_apps(&self, account_id: &str) -> AppResult<Vec<BusinessAppRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at FROM business_apps WHERE account_id=? ORDER BY app_id",
+            )?;
+            let rows = statement
+                .query_map(params![account_id], |row| {
+                    Ok(BusinessAppRecord {
+                        account_id: row.get(0)?,
+                        app_id: row.get(1)?,
+                        name: row.get(2)?,
+                        description: row.get(3)?,
+                        version: row.get(4)?,
+                        enabled: row.get::<_, i64>(5)? != 0,
+                        status: row.get(6)?,
+                        status_detail: row.get(7)?,
+                        last_checked_at: optional_time(row.get(8)?),
+                        updated_at: parse_time(row.get(9)?),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>();
+            rows
+        })
+        .map_err(|error| AppError::new("business_apps_read", error.to_string()))
+    }
+
+    pub fn set_business_app_enabled(
+        &self,
+        account_id: &str,
+        app_id: &str,
+        enabled: bool,
+    ) -> AppResult<()> {
+        self.ensure_business_apps(account_id)?;
+        let changed = self
+            .with_connection(|connection| {
+                connection.execute(
+                "UPDATE business_apps SET enabled=?,updated_at=? WHERE account_id=? AND app_id=?",
+                params![bool_i(enabled), Utc::now().to_rfc3339(), account_id, app_id],
+            )
+            })
+            .map_err(|error| AppError::new("business_app_write", error.to_string()))?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "business_app_missing",
+                "没有找到指定业务应用",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn business_app_enabled(&self, account_id: &str, app_id: &str) -> AppResult<bool> {
+        self.ensure_business_apps(account_id)?;
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT enabled FROM business_apps WHERE account_id=? AND app_id=?",
+                    params![account_id, app_id],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )
+                .optional()
+        })
+        .map(|value| value.unwrap_or(false))
+        .map_err(|error| AppError::new("business_app_read", error.to_string()))
+    }
+
+    pub fn update_business_app_health(
+        &self,
+        account_id: &str,
+        app_id: &str,
+        status: &str,
+        detail: &str,
+        checked_at: DateTime<Utc>,
+    ) -> AppResult<()> {
+        self.ensure_business_apps(account_id)?;
+        self.with_connection(|connection| connection.execute(
+            "UPDATE business_apps SET status=?,status_detail=?,last_checked_at=?,updated_at=? WHERE account_id=? AND app_id=?",
+            params![status, detail, checked_at.to_rfc3339(), checked_at.to_rfc3339(), account_id, app_id],
+        ))
+        .map(|_| ())
+        .map_err(|error| AppError::new("business_app_health", error.to_string()))
+    }
+
+    pub fn claim_business_app_run(&self, run: &BusinessAppRun) -> AppResult<bool> {
+        self.ensure_business_apps(&run.account_id)?;
+        self.with_connection(|connection| connection.execute(
+            "INSERT OR IGNORE INTO business_app_runs(account_id,app_id,group_id,message_id,run_key,status,freshness,ai_used,reply,error,elapsed_ms,created_at,completed_at) VALUES(?,?,?,?,?,'processing','missing',0,'','',0,?,NULL)",
+            params![run.account_id,run.app_id,run.group_id,run.message_id,run.run_key,run.created_at.to_rfc3339()],
+        ))
+        .map(|changed| changed > 0)
+        .map_err(|error| AppError::new("business_app_run_claim", error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_business_app_run(
+        &self,
+        account_id: &str,
+        app_id: &str,
+        run_key: &str,
+        status: &str,
+        freshness: &str,
+        ai_used: bool,
+        reply: &str,
+        error: &str,
+        elapsed_ms: i64,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| connection.execute(
+            "UPDATE business_app_runs SET status=?,freshness=?,ai_used=?,reply=?,error=?,elapsed_ms=?,completed_at=? WHERE account_id=? AND app_id=? AND run_key=?",
+            params![status,freshness,bool_i(ai_used),reply,error,elapsed_ms,Utc::now().to_rfc3339(),account_id,app_id,run_key],
+        ))
+        .map(|_| ())
+        .map_err(|error| AppError::new("business_app_run_finish", error.to_string()))
+    }
+
+    pub fn list_business_app_runs(
+        &self,
+        account_id: &str,
+        app_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<BusinessAppRun>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,account_id,app_id,group_id,message_id,run_key,status,freshness,ai_used,reply,error,elapsed_ms,created_at,completed_at FROM business_app_runs WHERE account_id=? AND app_id=? ORDER BY id DESC LIMIT ?",
+            )?;
+            let rows = statement.query_map(params![account_id,app_id,limit.clamp(1,500) as i64], |row| Ok(BusinessAppRun {
+                id: row.get(0)?, account_id: row.get(1)?, app_id: row.get(2)?, group_id: row.get(3)?, message_id: row.get(4)?, run_key: row.get(5)?, status: row.get(6)?, freshness: row.get(7)?, ai_used: row.get::<_, i64>(8)? != 0, reply: row.get(9)?, error: row.get(10)?, elapsed_ms: row.get(11)?, created_at: parse_time(row.get(12)?), completed_at: optional_time(row.get(13)?),
+            }))?.collect::<Result<Vec<_>, _>>();
+            rows
+        })
+        .map_err(|error| AppError::new("business_app_runs_read", error.to_string()))
     }
 
     pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
@@ -2615,12 +2885,61 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 5);
+        assert_eq!(status.schema_version, 6);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn business_app_defaults_are_disabled_and_runs_are_idempotent() {
+        let database = populated_database();
+        database.ensure_account_defaults("a").unwrap();
+        let apps = database.list_business_apps("a").unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].app_id, "prediction");
+        assert!(!apps[0].enabled);
+        assert!(!database.business_app_enabled("a", "prediction").unwrap());
+        let now = Utc::now();
+        let run = BusinessAppRun {
+            id: 0,
+            account_id: "a".into(),
+            app_id: "prediction".into(),
+            group_id: 1,
+            message_id: 9,
+            run_key: "message:9".into(),
+            status: "processing".into(),
+            freshness: "missing".into(),
+            ai_used: false,
+            reply: String::new(),
+            error: String::new(),
+            elapsed_ms: 0,
+            created_at: now,
+            completed_at: None,
+        };
+        assert!(database.claim_business_app_run(&run).unwrap());
+        assert!(!database.claim_business_app_run(&run).unwrap());
+        database
+            .finish_business_app_run(
+                "a",
+                "prediction",
+                "message:9",
+                "fallback",
+                "fresh",
+                false,
+                "模板",
+                "",
+                12,
+            )
+            .unwrap();
+        let runs = database
+            .list_business_app_runs("a", "prediction", 10)
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "fallback");
+        assert_eq!(runs[0].reply, "模板");
     }
 
     #[test]
@@ -2824,7 +3143,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 5);
+        assert_eq!(database.status().unwrap().schema_version, 6);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -2852,7 +3171,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 5);
+        assert_eq!(reopened.status().unwrap().schema_version, 6);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -2884,7 +3203,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 5);
+        assert_eq!(database.status().unwrap().schema_version, 6);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -2898,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_and_v3_to_v5_idempotently() {
+    fn migrates_v2_and_v3_to_v6_idempotently() {
         for version in [2_i64, 3_i64] {
             let directory = tempdir().unwrap();
             let paths = AppPaths {
@@ -2923,7 +3242,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 5);
+            assert_eq!(database.status().unwrap().schema_version, 6);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -2937,7 +3256,7 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 5);
+            assert_eq!(reopened.status().unwrap().schema_version, 6);
             assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1

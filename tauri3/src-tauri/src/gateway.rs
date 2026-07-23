@@ -207,6 +207,10 @@ impl CdpClient {
         Ok(Self {
             base_url,
             http: reqwest::Client::builder()
+                // CDP is loopback-only. System proxies (for example Clash in
+                // global mode) must never receive or intercept these requests.
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(5))
                 .build()
                 .map_err(|error| AppError::new("devtools_client", error.to_string()))?,
@@ -215,31 +219,38 @@ impl CdpClient {
     }
 
     async fn pages(&self) -> AppResult<Vec<DevToolsPage>> {
-        let response = self
-            .http
-            .get(format!("{}/json/list", self.base_url))
-            .send()
-            .await
-            .map_err(|error| {
-                AppError::new(
-                    "devtools_unavailable",
-                    format!("读取 DevTools 页面失败：{error}"),
-                )
-                .retryable()
-            })?;
-        if !response.status().is_success() {
-            return Err(AppError::new(
-                "devtools_http",
-                format!("DevTools 返回 HTTP {}", response.status()),
-            )
-            .retryable());
+        let mut errors = Vec::new();
+        for path in ["/json/list", "/json"] {
+            match self
+                .http
+                .get(format!("{}{path}", self.base_url))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    return response.json().await.map_err(|error| {
+                        AppError::new(
+                            "devtools_response",
+                            format!("解析 DevTools 页面失败：{error}"),
+                        )
+                    });
+                }
+                Ok(response) => {
+                    errors.push(format!("{path} 返回 HTTP {}", response.status()));
+                }
+                Err(error) => {
+                    errors.push(format!("{path} 连接失败：{error}"));
+                }
+            }
         }
-        response.json().await.map_err(|error| {
-            AppError::new(
-                "devtools_response",
-                format!("解析 DevTools 页面失败：{error}"),
-            )
-        })
+        Err(AppError::new(
+            "devtools_unavailable",
+            format!(
+                "9222 端口尚未提供可用的 DevTools HTTP 服务。旺商聊可能已带调试参数启动，但端口仍未接受连接；DH BOT 会继续重试。详情：{}",
+                errors.join("；")
+            ),
+        )
+        .retryable())
     }
 
     async fn page(&self) -> AppResult<DevToolsPage> {
@@ -2020,6 +2031,51 @@ mod tests {
         server.await.unwrap();
         assert_eq!(diagnostic.status, ConnectionStatus::OtherService);
         assert!(diagnostic.detail.contains("9222"));
+    }
+
+    #[tokio::test]
+    async fn devtools_pages_fall_back_to_json_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let size = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                if index == 0 {
+                    assert!(request.starts_with("GET /json/list "));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.starts_with("GET /json "));
+                    let body = serde_json::json!([{
+                        "title": "旺商聊",
+                        "url": "http://127.0.0.1",
+                        "type": "page",
+                        "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/wang"
+                    }])
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let client = CdpClient::new(format!("http://{address}")).unwrap();
+        let pages = client.pages().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(is_wangshangliao_page(&pages[0]));
     }
 
     #[test]

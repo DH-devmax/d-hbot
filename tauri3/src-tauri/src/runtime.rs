@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::ai::{self, AiConfig, AiContextMessage, AiProvider, AiRequest, ConfiguredProvider};
+use crate::business_apps::{self, BusinessApp, BusinessAppContext, BusinessAppRegistry};
 use crate::database::DatabaseExecutor;
 use crate::diagnostics::{redact, Logger};
 use crate::error::{AppError, AppResult};
@@ -144,7 +145,7 @@ pub struct BackendRuntime {
     events: Arc<dyn RuntimeEventSink>,
     ai_factory: Arc<dyn AiProviderFactory>,
     semantic_classifier: Arc<dyn moderation::SemanticClassifier>,
-    prediction_source: Arc<dyn prediction::PredictionSource>,
+    business_apps: Arc<BusinessAppRegistry>,
 }
 
 impl BackendRuntime {
@@ -178,7 +179,7 @@ impl BackendRuntime {
             events: dependencies.events,
             ai_factory: dependencies.ai_factory,
             semantic_classifier: dependencies.semantic_classifier,
-            prediction_source: dependencies.prediction_source,
+            business_apps: Arc::new(BusinessAppRegistry::new(dependencies.prediction_source)),
         }
     }
 
@@ -2422,57 +2423,32 @@ impl BackendRuntime {
                 .await;
             }
         }
-        let ai_has_permission = ["reply", "tasks", "recall", "mute", "remove"]
-            .into_iter()
-            .map(|name| self.ai_permission(account_id, group.group_id, name, name == "tasks"));
-        let ai_has_permission = futures_util::future::join_all(ai_has_permission)
-            .await
-            .into_iter()
-            .any(|allowed| allowed);
+        let ai_reply_allowed = self
+            .ai_permission(account_id, group.group_id, "reply", group.ai_enabled)
+            .await;
         if group.enabled
             && group.ai_enabled
-            && ai_has_permission
+            && ai_reply_allowed
             && !group.manual_takeover
             && message_explicitly_mentions(&job.message, account_id)
         {
-            if job.message.text.contains("预测") {
-                match prediction::fetch_with_source(
-                    &job.message.text,
-                    self.prediction_source.as_ref(),
-                )
-                .await
+            if let Some(business_app) = self.business_apps.find_for_message(&job.message.text) {
+                let app_id = business_app.manifest().id.to_string();
+                let management_enabled = self.is_group_manager(sender_id, group.group_id).await;
+                if management_enabled
+                    && self
+                        .database
+                        .business_app_enabled(account_id.to_string(), app_id)
+                        .await?
                 {
-                    Ok(Ok(result)) => {
-                        let _ = self
-                                .enqueue_text_effect(
-                                    account_id,
-                                    group.group_id,
-                                    &prediction::format_reply(&result),
-                                    "prediction-reply",
-                                    format!("prediction-reply:{}", job.message.id),
-                                    serde_json::json!({"messageId":job.message.id,"userId":job.message.user_id}),
-                                ).await;
-                    }
-                    Ok(Err(message)) => {
-                        let _ = self.enqueue_text_effect(
-                                account_id,
-                                group.group_id,
-                                &message,
-                                "prediction-status",
-                                format!("prediction-status:{}", job.message.id),
-                            serde_json::json!({"messageId":job.message.id,"userId":job.message.user_id}),
-                            ).await;
-                    }
-                    Err(error) => {
-                        let _ = self.enqueue_text_effect(
-                                account_id,
-                                group.group_id,
-                                &format!("预测数据暂时不可用：{}", error.message),
-                                "prediction-error",
-                                format!("prediction-error:{}", job.message.id),
-                            serde_json::json!({"messageId":job.message.id,"userId":job.message.user_id}),
-                            ).await;
-                    }
+                    self.process_business_app(
+                        account_id,
+                        &group,
+                        &member,
+                        &job.message,
+                        business_app,
+                    )
+                    .await?;
                 }
             } else {
                 self.process_ai(app, account_id, &group, &member, &job.message)
@@ -2705,6 +2681,162 @@ impl BackendRuntime {
         };
         let decision = provider.decide(&request).await?;
         parse_semantic_scores(&decision.reply, categories)
+    }
+
+    async fn process_business_app(
+        &self,
+        account_id: &str,
+        group: &Group,
+        member: &Member,
+        message: &Message,
+        app: Arc<dyn BusinessApp>,
+    ) -> AppResult<()> {
+        let manifest = app.manifest();
+        let run_key = format!("message:{}", message.id);
+        let started = std::time::Instant::now();
+        let claimed = self
+            .database
+            .claim_business_app_run(crate::models::BusinessAppRun {
+                id: 0,
+                account_id: account_id.into(),
+                app_id: manifest.id.into(),
+                group_id: group.group_id,
+                message_id: message.id,
+                run_key: run_key.clone(),
+                status: "processing".into(),
+                freshness: "missing".into(),
+                ai_used: false,
+                reply: String::new(),
+                error: String::new(),
+                elapsed_ms: 0,
+                created_at: self.clock.now_utc(),
+                completed_at: None,
+            })
+            .await?;
+        if !claimed {
+            return Ok(());
+        }
+
+        let result: AppResult<()> = async {
+            let outcome = app
+                .run(&BusinessAppContext {
+                    account_id,
+                    group,
+                    member,
+                    message,
+                    now: self.clock.now_utc(),
+                })
+                .await?;
+            if outcome.app_id != manifest.id {
+                return Err(AppError::new(
+                    "business_app_result",
+                    "业务应用返回了错误的应用标识",
+                ));
+            }
+            let mut reply = outcome.fallback_reply.clone();
+            let mut ai_used = false;
+            let mut ai_error = String::new();
+
+            if let Some(data) = outcome.narration.as_ref() {
+                let provider = self.ai_factory.create(AiConfig {
+                    base_url: self
+                        .database
+                        .get_setting("ai.base_url".into())
+                        .await?
+                        .unwrap_or_default(),
+                    webhook_url: self
+                        .database
+                        .get_setting("ai.webhook_url".into())
+                        .await?
+                        .unwrap_or_default(),
+                    model: self
+                        .database
+                        .get_setting("ai.model".into())
+                        .await?
+                        .unwrap_or_else(|| "deepseek-v4-pro".into()),
+                    api_key: self.gateway_secret("ai.api_key").await,
+                    timeout: Duration::from_secs(20),
+                })?;
+                let request = AiRequest {
+                    version: "1",
+                    event_id: format!("business-app-{}-{}", manifest.id, message.id),
+                    persona: ai::PERSONA,
+                    group_id: group.group_id,
+                    group_name: group.name.clone(),
+                    member_id: member.user_id,
+                    member_name: member.card_name.clone(),
+                    member_role: member.role.clone(),
+                    message_id: message.server_message_id.clone(),
+                    message: business_apps::prediction_narration_prompt(data),
+                    recent_context: Vec::new(),
+                    knowledge: Vec::new(),
+                };
+                match provider.decide(&request).await {
+                    Ok(decision) if !decision.reply.trim().is_empty() => {
+                        // Business applications accept text only. Structured actions and tasks
+                        // are deliberately discarded even when a provider returns them.
+                        reply = decision.reply.trim().to_string();
+                        ai_used = true;
+                    }
+                    Ok(_) => ai_error = "AI 没有返回文字，已使用应用模板".into(),
+                    Err(error) => ai_error = format!("{}；已使用应用模板", error.message),
+                }
+            }
+
+            if !reply.trim().is_empty() {
+                self.enqueue_text_effect(
+                    account_id,
+                    group.group_id,
+                    &reply,
+                    "business-app-reply",
+                    format!("business-app:{}:{}", manifest.id, message.id),
+                    serde_json::json!({
+                        "appId": manifest.id,
+                        "messageId": message.id,
+                        "userId": message.user_id,
+                    }),
+                )
+                .await?;
+            }
+            let final_status = if !ai_error.is_empty() && outcome.status == "succeeded" {
+                "fallback"
+            } else {
+                outcome.status.as_str()
+            };
+            self.database
+                .finish_business_app_run(
+                    account_id.into(),
+                    manifest.id.into(),
+                    run_key.clone(),
+                    final_status.into(),
+                    outcome.freshness,
+                    ai_used,
+                    reply,
+                    ai_error,
+                    started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = &result {
+            let _ = self
+                .database
+                .finish_business_app_run(
+                    account_id.into(),
+                    manifest.id.into(),
+                    run_key,
+                    "failed".into(),
+                    "missing".into(),
+                    false,
+                    String::new(),
+                    error.message.clone(),
+                    started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                )
+                .await;
+        }
+        result
     }
 
     async fn process_ai(
