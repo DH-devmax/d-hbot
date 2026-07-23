@@ -58,7 +58,7 @@ fn protect(value: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: value.len() as u32,
         pbData: value.as_ptr() as *mut u8,
     };
@@ -68,7 +68,7 @@ fn protect(value: &[u8]) -> Result<Vec<u8>, String> {
     };
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             ptr::null(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -94,7 +94,7 @@ fn unprotect(value: &[u8]) -> Result<Vec<u8>, String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: value.len() as u32,
         pbData: value.as_ptr() as *mut u8,
     };
@@ -104,7 +104,7 @@ fn unprotect(value: &[u8]) -> Result<Vec<u8>, String> {
     };
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
