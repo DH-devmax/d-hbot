@@ -55,11 +55,11 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 
 - 生产数据：`%APPDATA%\DH\3.0`
 - 开发 Fixture 数据：`%APPDATA%\DH\fixture`
-- 核心源码仓库保持私有；公开下载统一发布到 [`DH-devmax/d-hbot-releases`](https://github.com/DH-devmax/d-hbot-releases)。
-- 私有源码仓库的 Actions 已停用；`DH-devmax/d-hbot-releases` 是唯一生产构建与公开发布位置。
-- 生产发布在发行仓库中手动输入完整源码 commit SHA 与版本标签，并强制使用 Authenticode 证书。
-- 缺少证书、源码只读 Token 或生产门禁失败时不生成公开 Release。
+- 核心源码仓库保持私有，GitHub Actions 停用；生产构建与测试只在受控 Windows 开发机执行。
+- 个人发行采用未签名便携 ZIP，随包提供 `SHA256SUMS.txt`，通过管理员公布的云盘链接分发。
+- [`DH-devmax/d-hbot-releases`](https://github.com/DH-devmax/d-hbot-releases) 仅作为可选下载说明或历史索引，不构建程序、不保存源码和 Fixture。
+- Windows 首次启动可能显示“未知发布者”或 SmartScreen 提示，这是当前未签名个人发行的预期状态。
 
-发布仓库边界、只读源码访问和生产 Actions 流程见 [`docs/RELEASE-ARCHITECTURE.md`](docs/RELEASE-ARCHITECTURE.md)。
+本地发布步骤见 [`docs/LOCAL-RELEASE.md`](docs/LOCAL-RELEASE.md)，仓库边界见 [`docs/RELEASE-ARCHITECTURE.md`](docs/RELEASE-ARCHITECTURE.md)。
 
 详细进度和验收边界见 [`tauri3/STATUS.md`](tauri3/STATUS.md)。

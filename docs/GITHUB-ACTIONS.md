@@ -1,38 +1,22 @@
-# DH BOT GitHub Actions 运维说明
+# DH BOT GitHub Actions 状态
 
-## 当前线路
+## 当前结论
 
-| 用途 | 仓库 | 可见性 | Actions |
-| --- | --- | --- | --- |
-| 私有源码 | `DH-devmax/d-hbot` | 私有 | 停用；测试和开发构建只在本地执行 |
-| 生产构建与发行 | `DH-devmax/d-hbot-releases` | 公开 | 唯一生产 workflow，手动触发 |
-| 历史归档 | `sh492773746/d-hbot`、`sh492773746/d-hbot-releases` | 旧线路 | 不接收当前线路的提交或发布 |
+DH BOT 不使用 GitHub Actions 构建程序：
 
-源码仓库历史 Actions 记录只表示旧流程，不是当前生产入口。
+| 仓库 | 用途 | Actions |
+|---|---|---|
+| `DH-devmax/d-hbot` | 私有 Rust/Tauri 源码、Fixture、脱敏契约和本地工具 | 停用 |
+| `DH-devmax/d-hbot-releases` | 可选下载说明与历史发行索引 | 停用 |
+| `sh492773746/*` | 旧账号归档 | 不参与当前线路 |
 
-## 账号与提交检查
+测试、Windows MSVC 构建、NSIS/portable 打包、生产隔离扫描和真实桌面验收都在开发机本地完成。GitHub 不保存签名证书、源码读取 Token 或构建产物。
 
-- 当前线路账号：`DH-devmax`。
-- 源码 `origin`：`git@github.com:DH-devmax/d-hbot.git`。
-- 旧账号 `sh492773746` 只用于历史仓库维护。
-- 提交和推送必须经过 `.githooks/pre-commit` 与 `.githooks/pre-push`，不得使用 `--no-verify`。
+## 本地必检
 
-每次提交和发布前执行：
+在 `tauri3` 目录运行：
 
-```sh
-gh auth status --active
-git status --short
-git diff --cached --check
-git remote get-url --push origin
-git config user.name
-git config user.email
-```
-
-## 本地门禁
-
-在 `tauri3/` 依次执行：
-
-```sh
+```text
 pnpm install --frozen-lockfile
 pnpm test:contract-sanitizer
 pnpm test:production-isolation
@@ -40,49 +24,28 @@ pnpm test:production
 pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
-cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --no-default-features --all-targets -- -D warnings
 ```
 
-Windows 开发机另外执行生产构建、`package:windows:production`、`verify:windows:production` 和 `test:windows:real`。本地门禁失败时不触发发行仓库 workflow。
+Windows 开发机随后运行：
 
-## 生产 workflow
+```text
+pnpm tauri:build:production
+pnpm package:windows:production
+pnpm verify:windows:production
+```
 
-`DH-devmax/d-hbot-releases` 只保留 `build-production.yml`，通过 `workflow_dispatch` 接收：
+最后使用 `scripts/test-windows-real-machine.ps1` 验收 portable ZIP。完整流程见 [LOCAL-RELEASE.md](LOCAL-RELEASE.md)。
 
-- `source_commit`：`DH-devmax/d-hbot` 中完整的 40 位 commit SHA。
-- `release_tag`：与应用版本一致的 `v3.x.y` 或预发布标签。
+## GitHub 检查
 
-workflow 固定检出精确 SHA，运行生产门禁，构建 `--no-default-features`，签名所有 PE，扫描 NSIS/portable，并直接创建公开 Release。它不注册 PR、push 或 fork 触发，也不构建 Fixture。
+以下命令用于确认远端没有活动 workflow：
 
-## 发行仓库 Secrets
-
-| Secret | 用途 |
-| --- | --- |
-| `DH_SOURCE_READ_TOKEN` | 只读检出私有源码仓库 |
-| `DH_SIGN_PFX_B64` | Authenticode PFX Base64 |
-| `DH_SIGN_PASSWORD` | PFX 密码 |
-
-三个 Secrets 只配置在发行仓库。缺少任一 Secret 时生产 workflow 在检出或构建前停止，不生成公开资产。源码仓库不再使用 `DH_RELEASE_DEPLOY_KEY`。
-
-## 运行与检查
-
-```sh
+```text
+gh workflow list --repo DH-devmax/d-hbot
 gh workflow list --repo DH-devmax/d-hbot-releases
-gh workflow run build-production.yml \
-  --repo DH-devmax/d-hbot-releases \
-  -f source_commit=40_HEX_SOURCE_COMMIT \
-  -f release_tag=v3.0.0
-gh run list --repo DH-devmax/d-hbot-releases --limit 5
+gh api repos/DH-devmax/d-hbot/actions/permissions
+gh api repos/DH-devmax/d-hbot-releases/actions/permissions
 ```
 
-生产通过后检查：
-
-```sh
-gh release view v3.0.0 --repo DH-devmax/d-hbot-releases
-```
-
-公开 Release 只包含已签名 EXE、安装包、portable ZIP、手册、默认规则、来源清单和 `SHA256SUMS.txt`。
-
-## Windows 实机验收
-
-Actions 证明 Windows MSVC 构建、自动测试、签名和生产隔离通过；任务栏、托盘、旺商聊登录状态、9222 和退出残留仍按 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md) 验收。实机对象必须从公开 Release 下载，开发 Fixture 和本地未签名包不作为正式验收对象。
+两个权限接口都应返回 `enabled: false`，workflow 列表应为空。后续若采用公共信任代码签名或恢复 GitHub Release，需要先更新本规范和长期记忆，再建立新的独立发布方案。

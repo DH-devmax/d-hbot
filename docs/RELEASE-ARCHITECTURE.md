@@ -1,50 +1,56 @@
-# DH BOT 发布仓库边界
+# DH BOT 个人发行架构
 
-## 仓库职责
+## 归属
 
-- `DH-devmax/d-hbot`：私有源码仓库，保存 Rust/Tauri、脱敏契约、Fixture、本地测试脚本和开发文档。仓库 Actions 停用，不生成任何构建产物。
-- `DH-devmax/d-hbot-releases`：公开发行仓库，唯一负责 Windows 生产构建、签名、扫描和 GitHub Release。
-- `sh492773746/d-hbot` 与 `sh492773746/d-hbot-releases`：旧账号归档，不接收提交、Secrets 或发布。
+- `DH-devmax/d-hbot`：私有源码仓库，Actions 停用。
+- `DH-devmax/d-hbot-releases`：可选下载说明或历史索引，Actions 停用。
+- Windows 开发机：唯一生产构建、扫描和实机验收环境。
+- 管理员云盘：个人用户下载 portable ZIP、手册和 SHA-256 清单的位置。
 
-公开发行仓库不保存 Rust、TypeScript、Go、PDB、Source Map、Fixture、旺商聊原始协议、账号数据或构建凭据。Windows Runner 只在任务期间读取指定的私有源码提交，任务结束后由 GitHub 托管环境销毁工作目录。
+## 发布数据流
 
-## 生产 Actions 链路
+```text
+固定源码 commit
+  -> 本地自动测试
+  -> Windows --no-default-features 生产构建
+  -> NSIS 与 portable 深度隔离扫描
+  -> Windows 真实桌面验收
+  -> 生成 SHA256SUMS.txt
+  -> 上传管理员云盘
+  -> 下载后复核 SHA-256
+```
 
-1. 开发机完成生产、Fixture、界面和实机测试，并记录准备发布的 40 位源码 commit SHA。
-2. 管理员在公开发行仓库手动运行 `build-production.yml`，输入 `source_commit` 和 `release_tag`。
-3. workflow 先校验 SHA、标签、现有 Tag/Release 和三个必需 Secrets，再使用只读 Token 检出精确源码提交。
-4. Windows Hosted Runner 执行生产边界、契约、Rust、React 和 Clippy 门禁，再用 `--no-default-features` 构建。
-5. 主程序与 NSIS 安装包完成 Authenticode 签名和 `signtool verify`，随后执行 NSIS、portable 和生产隔离深度扫描。
-6. workflow 生成来源清单与 `SHA256SUMS.txt`，使用发行仓库自己的 `GITHUB_TOKEN` 创建公开 Release。
+当前个人发行采用未签名产物。Windows 可能显示“未知发布者”或 SmartScreen 提示；云盘页面需要同时公开 `SHA256SUMS.txt`，便于用户核对文件完整性。
 
-生产 workflow 不接受 push、pull request、fork 或源码仓库事件触发，不使用 `incoming/<tag>` 中转，也不覆盖既有标签或 Release。
+## 产物边界
 
-## Secrets
+主发行文件：
 
-Secrets 只配置在 `DH-devmax/d-hbot-releases`：
+```text
+DH-BOT-VERSION-windows-x64-portable.zip
+SHA256SUMS.txt
+DH-Manual-ZH.pdf
+```
 
-| Secret | 最小权限与用途 |
-| --- | --- |
-| `DH_SOURCE_READ_TOKEN` | Fine-grained Token，只授予 `DH-devmax/d-hbot` 的 Metadata/Contents 只读权限 |
-| `DH_SIGN_PFX_B64` | Authenticode PFX 的 Base64 内容 |
-| `DH_SIGN_PASSWORD` | PFX 密码 |
+可选文件：
 
-源码仓库不保存以上 Secrets。旧 `DH_RELEASE_DEPLOY_KEY` 及发行仓库写入 Deploy Key 在迁移完成后删除。
+```text
+DH-BOT-VERSION-windows-x64-setup.exe
+DH-Manual-ZH.md
+DH-BOT-Default-Rules.json
+```
 
-配置 Secrets 时只在受控终端操作，禁止把 Token、PFX、密码或解码文件放入仓库、日志和命令历史。配置完成后仅用 `gh secret list` 核对名称与更新时间，不读取 Secret 内容。
+云盘中不得出现 Fixture、开发 EXE、`9233/51300`、测试数据库、源码、PDB、Source Map、PFX、私钥、密码、Token、Cookie、原始契约或真实群数据。
 
-## 手动发布
+## 发布记录
 
-1. 确认本地工作树、源码远端、活动 GitHub 账号和本地测试报告。
-2. 推送源码 commit，复制 `git rev-parse HEAD` 的完整 40 位 SHA。
-3. 在 `DH-devmax/d-hbot-releases/actions` 选择 `Build DH BOT production`。
-4. 输入完整 `source_commit` 和与 `tauri3/package.json` 一致的 `release_tag`。
-5. workflow 全部通过后，从公开 Release 下载并按 `SHA256SUMS.txt` 做 Windows 实机验收。
+每次发行应在本地记录：
 
-缺少签名证书、Token、版本不一致、重复标签或任一生产门禁失败时，workflow 停止且不创建公开 Release。
+- 应用版本和完整源码 commit SHA。
+- 构建日期与 Windows 版本。
+- portable ZIP、主 EXE 和安装包 SHA-256。
+- 生产隔离扫描结果。
+- Windows 实机验收报告路径。
+- 已上传云盘文件清单。
 
-## 回滚
-
-- workflow 失败：修复源码或仓库配置后使用新的源码 SHA 重新运行；失败任务不会留下半成品 Release。
-- Release 已创建但实机验收失败：将 Release 标记为预发布并保留证据，修复后使用新版本号发布，不覆盖原资产。
-- 源码读取凭据异常：立即撤销 Fine-grained Token，重新创建最小权限 Token 并更新发行仓库 Secret。
+已有版本不覆盖；修复后增加版本号并生成新的校验清单。云盘链接失效时只重新上传字节完全一致的文件，否则视为新构建。

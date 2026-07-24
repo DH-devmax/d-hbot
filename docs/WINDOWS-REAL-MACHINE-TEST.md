@@ -2,13 +2,13 @@
 
 ## 为什么要分层测试
 
-发行仓库的生产 Actions 能证明指定源码 SHA 可以在 Windows MSVC 下构建、签名、扫描和打包，但它不具备旺商聊账号，也不能替代真实桌面的任务栏、托盘、窗口焦点和登录状态测试。正式验收分三层：
+DH BOT 生产包由 Windows 开发机本地构建。构建脚本能证明指定源码可以通过 MSVC、扫描和打包，但仍需要真实旺商聊账号与桌面环境验证任务栏、托盘、窗口焦点和登录状态。正式验收分三层：
 
-1. **Actions 构建层**：Rust、React、契约、生产隔离、NSIS 和 SHA-256。
+1. **本地构建层**：Rust、React、契约、生产隔离、NSIS 和 SHA-256。
 2. **Windows 自动探针层**：真实 EXE、WebView2、9222、旺商聊进程参数、普通最小化和退出残留。
 3. **人工桌面层**：图标观感、任务栏点击、X 关闭提示、账号登录状态复用。
 
-Fixture 不参与这套测试。测试对象必须是 `DH-devmax/d-hbot-releases` 公开 Release 中的已签名生产包，不使用源码仓库历史 artifact 或本地未签名包。
+Fixture 不参与这套测试。测试对象必须是 Windows 开发机生成并准备上传云盘的同一份未签名生产包，不使用历史 artifact 或开发 Fixture 包。
 
 ## 推荐环境
 
@@ -22,7 +22,7 @@ Fixture 不参与这套测试。测试对象必须是 `DH-devmax/d-hbot-releases
 
 把以下两个文件放在同一台 Windows 电脑：
 
-- 公开 Release 下载的 `DH-BOT-*-windows-x64-portable.zip`
+- Windows 本地构建的 `DH-BOT-*-windows-x64-portable.zip`
 - 私有源码中的 `tauri3/scripts/test-windows-real-machine.ps1`
 
 在 PowerShell 中执行：
@@ -35,12 +35,12 @@ Set-ExecutionPolicy -Scope Process Bypass
   -VerifyInteractiveExit
 ```
 
-`ExpectedSha256` 填同一公开 Release 的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值。公开生产包签名状态必须为 `Valid`；未签名包不进入这套正式验收。
+`ExpectedSha256` 填同次本地构建的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值。当前个人发行的签名状态预期为 `NotSigned`，脚本将其记录为信息而不是失败。
 
 脚本自动完成：
 
 - 解压到独立临时目录，并验证 portable 文件边界。
-- 校验 `DH-BOT.exe` 的 SHA-256 和 Authenticode 状态。
+- 校验 `DH-BOT.exe` 的 SHA-256，并记录 Authenticode 状态。
 - 检查 WebView2 Runtime。
 - 记录启动前是否已有 DH BOT 残留。
 - 启动真实 `DH-BOT.exe`，等待主窗口。
@@ -122,4 +122,5 @@ Get-ChildItem "$env:APPDATA\DH\3.0\logs" -File |
 - DH BOT 退出不结束旺商聊。
 - 登录状态在旺商聊重启及 Windows 重启后继续复用。
 - 生产包中没有 Fixture、测试端口、测试数据库、开发命令或源码。
-- 正式标签产物 Authenticode 状态为 `Valid`，SHA-256 与公开清单一致。
+- 未签名状态与当前个人发行策略一致，SHA-256 与待上传清单一致。
+- 云盘上传后重新下载的 ZIP 与本地原文件 SHA-256 一致。

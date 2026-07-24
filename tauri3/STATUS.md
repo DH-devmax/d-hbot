@@ -1,6 +1,6 @@
 # DH BOT 3.0 beta.1 状态
 
-当前 Rust + Tauri 重构的代码闭环约 **99%**，考虑尚未获得的 Windows 实机、Authenticode 和真实旺商聊契约证据，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、业务页面与自动化测试已落地；剩余百分比由 Windows 发布闭环、真实旺商聊契约校准和实机 RC 验收解锁。
+当前 Rust + Tauri 重构的代码闭环约 **99%**，考虑尚未完成的 Windows 本地生产构建、真实旺商聊契约证据和实机 RC 验收，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、业务页面与自动化测试已落地。
 
 ## 已完成
 
@@ -42,19 +42,19 @@
 - `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用。
 - Contract v2 采集组装与脱敏器 9 项测试及自检，可在多 DevTools 页面中唯一选择旺商聊；生产/开发构建边界、9 场景生产隔离扫描、前端生产扫描、Rust release 构建和两套文档目录扫描通过。
 - `DH-Manual-ZH.pdf`：11 页，全页重新渲染为 PNG 并通过联系表视觉检查。
-- 本机 macOS 未安装 `x86_64-pc-windows-msvc` 所需的 MSVC/C 头文件，也未安装 MinGW；Windows GUI 交叉检查因此停在 `ring` 工具链准备阶段，需由 Windows MSVC/GitHub Runner 生成新产物后完成实机烟测。
+- 本机 macOS 未安装 `x86_64-pc-windows-msvc` 所需的 MSVC/C 头文件，也未安装 MinGW；最终生产包需由受控 Windows MSVC 开发机生成并完成实机烟测。
 - macOS Tauri 桌面包已连接真实旺商聊 2.6.3 的 `127.0.0.1:9222`；能识别登录路由和 `nim-not-ready`，本地 Rust 诊断桥正常返回。关闭窗口的“取消 / 挂到托盘 / 退出”确认框与后台进程存活已通过 Computer Use 实测。
 - 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
-- 已用当前代码生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned-rust-final.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `97d2ca4075ff08573cfcba823ad660925406375b0b026fe830f38ff472b28880`，ZIP 为 `5610866f9fa594a110b1a7ed0011fe501e428f59f3e8a33b176696bd5afb4d4c`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。它只用于内部 beta，不替代 NSIS、Authenticode 和 Windows 实机验收。
+- 已用当前代码生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned-rust-final.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `97d2ca4075ff08573cfcba823ad660925406375b0b026fe830f38ff472b28880`，ZIP 为 `5610866f9fa594a110b1a7ed0011fe501e428f59f3e8a33b176696bd5afb4d4c`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。当前个人发行正式采用未签名 portable ZIP；新包仍需在 Windows 重新构建并完成实机验收。
 - Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
-- 构建归属已调整为“源码仓库只做本地测试、公开发行仓库唯一生产构建”。源码仓库不再保留生产或 Fixture workflow；正式发布由发行仓库手动输入完整源码 SHA 和标签，强制签名后创建公开 Release。
+- 构建归属已调整为“两个 GitHub 仓库均停用 Actions，Windows 开发机本地生产构建，云盘个人分发”。发行仓库仅保留下载说明或历史索引。
 
 ## Beta.2 / RC 必须由外部环境证明的门禁
 
-- 发行仓库 Windows MSVC 生产编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
+- Windows 开发机的 MSVC 生产编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
 - Windows 10 22H2 与 Windows 11 23H2/24H2 的标准用户/管理员、安装/升级/卸载/portable、UAC、托盘、休眠恢复和 100%/125%/150% DPI。
 - 基于真实旺商聊文件版本与主脚本 SHA-256 的脱敏 Contract v2 采集与回放。2.7.7 群公告已校准；双群全员禁言/解除全禁及其他待验证写能力继续保持 `Unverified`。
 - 16 人“大海兼职群”先做只读同步，再做测试消息撤回、短时禁言/立即解禁、临时改名/自动恢复；移出成员仍只在 Fixture 验证。
-- 发行仓库正式生产构建的 Authenticode 签名和 `signtool verify`。未配置证书时阻止公开发布。
+- 云盘上传后下载文件的 SHA-256 回读校验与版本记录。
 
 生产新安装不创建测试群、成员、规则、知识库、计划或自动化开关；Fixture 仅存在于内部开发包。

@@ -36,11 +36,11 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 
 所有测试和开发构建在开发机执行，私有源码仓库不运行 GitHub Actions。真实写协议更新必须先采集、脱敏、回放 Contract v2，再更新能力注册表。
 
-生产发布由 `DH-devmax/d-hbot-releases` 唯一执行：管理员手动输入经过本地验收的完整源码 commit SHA 与版本标签，Windows Runner 复跑生产安全门禁、MSVC/NSIS/portable 构建、Authenticode 和生产包深度扫描。发行 workflow 不运行 Fixture，也不接受可变源码引用。
+生产发布只在受控 Windows 开发机执行：固定经过本地验收的源码 commit SHA，完成 MSVC/NSIS/portable 构建、生产包深度扫描和真实桌面验收。生产包使用 `--no-default-features`，Fixture 不参与构建或发行。
 
 Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针只存在于私有源码仓库，不复制到 NSIS、portable 或公开发行仓库。
 
-触发生产发布前还必须确认：源码工作树干净、commit 已推送到 `DH-devmax/d-hbot`、当前 `gh` 账号为 `DH-devmax`、发行仓库三个 Secrets 已配置、公开标签与应用版本一致。生产 Release 已存在时使用新版本号，不覆盖旧资产。
+上传云盘前还必须确认：源码工作树干净、记录完整 commit SHA、应用版本与文件名一致、生产隔离扫描通过、Windows 实机报告通过、`SHA256SUMS.txt` 与待上传文件一致。已有文件使用新版本号，不覆盖旧包。
 
 ## 代码评审清单
 
