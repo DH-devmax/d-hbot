@@ -202,7 +202,7 @@ try {
   if ($Signature.Status -eq 'Valid') {
     Add-Result 'Authenticode 签名' 'passed' $Signature.SignerCertificate.Subject
   } else {
-    Add-Result 'Authenticode 签名' 'warning' "状态：$($Signature.Status)；内部 beta 可继续，正式版必须为 Valid"
+    Add-Result 'Authenticode 签名' 'info' "状态：$($Signature.Status)；当前个人云盘发行采用未签名产物，首次运行可能显示未知发布者"
   }
 
   $WebViewRoots = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA) |
