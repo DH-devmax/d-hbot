@@ -5,6 +5,7 @@ import { readableError } from './api/client'
 
 type CalibrationStatus = {
   active: boolean
+  finishing: boolean
   startedAt: string
   appFileVersion: string
   mainScriptSha256: string
@@ -34,6 +35,7 @@ const capabilityOptions = [
 
 const emptyStatus: CalibrationStatus = {
   active: false,
+  finishing: false,
   startedAt: '',
   appFileVersion: '',
   mainScriptSha256: '',
@@ -121,7 +123,7 @@ export default function CalibrationControls({ onError }: { onError: (value: stri
 
   return <section className="section calibration-control">
     <div className="section-head"><div><span className="eyebrow">Contract v2</span><h2>真实 9222 能力校准</h2></div>{status.active ? <Radio size={18} className="calibration-live" /> : <Square size={18} />}</div>
-    <dl className="runtime-details debug-details"><dt>采集状态</dt><dd>{status.active ? '正在采集' : '未开始'}</dd><dt>旺商聊版本</dt><dd>{status.appFileVersion || '-'}</dd><dt>主脚本 SHA-256</dt><dd>{status.mainScriptSha256 || '-'}</dd><dt>请求 / 回调</dt><dd>{status.active ? `${status.operationCount} / ${status.callbackCount}` : '-'}</dd><dt>真实写操作</dt><dd>{status.active ? status.writeOperationCount : '-'}</dd><dt>恢复基线</dt><dd>{status.active ? `${status.restoredBaselineCount} / ${status.baselineCount}` : '-'}</dd><dt>恢复回读</dt><dd>{status.active ? (status.restorationVerified ? '已验证' : status.restorationError || '未完成') : '-'}</dd></dl>
+    <dl className="runtime-details debug-details"><dt>采集状态</dt><dd>{status.finishing ? '正在最终回读并导出' : status.active ? '正在采集' : '未开始'}</dd><dt>旺商聊版本</dt><dd>{status.appFileVersion || '-'}</dd><dt>主脚本 SHA-256</dt><dd>{status.mainScriptSha256 || '-'}</dd><dt>请求 / 回调</dt><dd>{status.active ? `${status.operationCount} / ${status.callbackCount}` : '-'}</dd><dt>真实写操作</dt><dd>{status.active ? status.writeOperationCount : '-'}</dd><dt>恢复基线</dt><dd>{status.active ? `${status.restoredBaselineCount} / ${status.baselineCount}` : '-'}</dd><dt>恢复回读</dt><dd>{status.active ? (status.restorationVerified ? '已验证' : status.restorationError || '未完成') : '-'}</dd></dl>
     {!status.active && <div className="calibration-capabilities">{capabilityOptions.map(([key, label]) => <label className="check-row" key={key}><input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />{label}</label>)}</div>}
     {status.active && <label className="check-row calibration-restored"><input type="checkbox" checked={restorationNoted} onChange={event => setRestorationNoted(event.target.checked)} />人工备注：已检查恢复结果（不替代上方真实回读验证）</label>}
     <div className="button-row">{status.active ? <><button className="primary" disabled={busy} onClick={() => void finish()}><FileCheck2 size={15} />完成并导出原始 Contract v2</button><button className="secondary" disabled={busy} onClick={() => void cancel()}>取消采集</button></> : <button className="primary" disabled={busy || selected.length === 0} onClick={() => void begin()}><Radio size={15} />开始真实 9222 采集</button>}</div>

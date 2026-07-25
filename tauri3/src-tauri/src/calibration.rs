@@ -43,6 +43,7 @@ pub struct CalibrationMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct DeveloperCalibrationStatus {
     pub active: bool,
+    pub finishing: bool,
     pub started_at: String,
     pub app_file_version: String,
     pub main_script_sha256: String,
@@ -88,6 +89,7 @@ pub(crate) struct CalibrationRestorationTarget {
 #[derive(Debug, Default)]
 pub(crate) struct DeveloperCalibrationRecorder {
     metadata: Option<CalibrationMetadata>,
+    finishing: bool,
     started_at: String,
     capabilities: BTreeSet<String>,
     operations: Vec<CalibrationOperation>,
@@ -103,6 +105,10 @@ impl DeveloperCalibrationRecorder {
         self.metadata.is_some()
     }
 
+    pub(crate) fn is_finishing(&self) -> bool {
+        self.finishing
+    }
+
     pub(crate) fn start(
         &mut self,
         metadata: CalibrationMetadata,
@@ -116,6 +122,7 @@ impl DeveloperCalibrationRecorder {
         }
         let normalized = normalize_capabilities(capabilities)?;
         self.metadata = Some(metadata);
+        self.finishing = false;
         self.started_at = Utc::now().to_rfc3339();
         self.capabilities = normalized;
         self.operations.clear();
@@ -127,9 +134,15 @@ impl DeveloperCalibrationRecorder {
         Ok(self.status())
     }
 
-    pub(crate) fn cancel(&mut self) -> DeveloperCalibrationStatus {
+    pub(crate) fn cancel(&mut self) -> AppResult<DeveloperCalibrationStatus> {
+        if self.finishing {
+            return Err(AppError::new(
+                "calibration_finishing",
+                "正在执行最终恢复回读和原子导出，暂时不能取消校准",
+            ));
+        }
         *self = Self::default();
-        self.status()
+        Ok(self.status())
     }
 
     pub(crate) fn status(&self) -> DeveloperCalibrationStatus {
@@ -141,6 +154,7 @@ impl DeveloperCalibrationRecorder {
         });
         DeveloperCalibrationStatus {
             active: self.metadata.is_some(),
+            finishing: self.finishing,
             started_at: self.started_at.clone(),
             app_file_version: metadata.app_file_version,
             main_script_sha256: metadata.main_script_sha256,
@@ -166,7 +180,7 @@ impl DeveloperCalibrationRecorder {
     }
 
     pub(crate) fn allows(&self, capability: &str) -> bool {
-        self.metadata.is_some() && self.capabilities.contains(capability)
+        self.metadata.is_some() && !self.finishing && self.capabilities.contains(capability)
     }
 
     pub(crate) fn record_ipc(&mut self, route: &str, kind: &str, payload: Value, result: &Value) {
@@ -343,12 +357,40 @@ impl DeveloperCalibrationRecorder {
         }
     }
 
-    pub(crate) fn prepare_final_verification(&mut self) -> Vec<CalibrationRestorationTarget> {
+    pub(crate) fn begin_finalization(&mut self) -> AppResult<()> {
+        if self.metadata.is_none() {
+            return Err(AppError::new(
+                "calibration_inactive",
+                "当前没有正在运行的校准采集",
+            ));
+        }
+        if self.finishing {
+            return Err(AppError::new(
+                "calibration_finishing",
+                "最终恢复回读和导出已经在进行中",
+            ));
+        }
+        self.finishing = true;
         self.observed_states.clear();
-        self.required_restorations
+        Ok(())
+    }
+
+    pub(crate) fn finalization_targets(&self) -> AppResult<Vec<CalibrationRestorationTarget>> {
+        if !self.finishing {
+            return Err(AppError::new(
+                "calibration_not_finalizing",
+                "校准尚未进入最终恢复回读状态",
+            ));
+        }
+        Ok(self
+            .required_restorations
             .iter()
             .filter_map(|key| self.baseline_targets.get(key).cloned())
-            .collect()
+            .collect())
+    }
+
+    pub(crate) fn abort_finalization(&mut self) {
+        self.finishing = false;
     }
 
     pub(crate) fn record_restored_state(&mut self, route: &str, identity: Value, state: Value) {
@@ -377,6 +419,12 @@ impl DeveloperCalibrationRecorder {
                 "当前没有正在运行的校准采集",
             ));
         };
+        if !self.finishing {
+            return Err(AppError::new(
+                "calibration_not_finalizing",
+                "必须先冻结写操作并完成最终恢复回读",
+            ));
+        }
         if self.operations.is_empty() {
             return Err(AppError::new(
                 "calibration_empty",
@@ -633,7 +681,7 @@ mod tests {
         }]);
         assert_eq!(
             recorder.finish(false).unwrap_err().code,
-            "calibration_not_restored"
+            "calibration_not_finalizing"
         );
         assert!(recorder.status().active);
         recorder.record_restored_state(
@@ -651,7 +699,11 @@ mod tests {
             json!({"groupId": 1, "userId": 2}),
             json!({"muted": false}),
         );
-        let targets = recorder.prepare_final_verification();
+        recorder.begin_finalization().unwrap();
+        assert!(recorder.status().finishing);
+        assert!(!recorder.allows("mute"));
+        assert_eq!(recorder.cancel().unwrap_err().code, "calibration_finishing");
+        let targets = recorder.finalization_targets().unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(
             recorder.finish(true).unwrap_err().code,

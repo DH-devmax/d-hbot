@@ -595,7 +595,9 @@ fn get_developer_calibration_status(state: State<'_, AppState>) -> DeveloperCali
 
 #[cfg(feature = "fixture")]
 #[tauri::command]
-fn cancel_developer_calibration(state: State<'_, AppState>) -> DeveloperCalibrationStatus {
+fn cancel_developer_calibration(
+    state: State<'_, AppState>,
+) -> AppResult<DeveloperCalibrationStatus> {
     state.gateway.cancel_developer_calibration()
 }
 
@@ -605,6 +607,10 @@ async fn finish_developer_calibration(
     state: State<'_, AppState>,
     restored: bool,
 ) -> AppResult<DeveloperCalibrationCaptureResult> {
+    let finalization = state
+        .gateway
+        .begin_developer_calibration_finalization()
+        .await?;
     state
         .gateway
         .verify_developer_calibration_restoration()
@@ -672,7 +678,7 @@ async fn finish_developer_calibration(
             format!("提交本机 Contract v2 原子文件失败：{error}"),
         )
     })?;
-    state.gateway.commit_developer_calibration();
+    finalization.commit()?;
     Ok(DeveloperCalibrationCaptureResult {
         path: output.display().to_string(),
         status: exported.status,

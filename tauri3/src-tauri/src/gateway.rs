@@ -660,6 +660,15 @@ pub trait RuntimeGateway: GroupGateway {
         DeveloperCalibrationRecorder::default().status()
     }
     #[cfg(feature = "fixture")]
+    async fn begin_developer_calibration_finalization(
+        &self,
+    ) -> AppResult<DeveloperCalibrationFinalizationPermit> {
+        Err(AppError::new(
+            "calibration_unsupported",
+            "当前网关不支持最终恢复回读",
+        ))
+    }
+    #[cfg(feature = "fixture")]
     async fn verify_developer_calibration_restoration(
         &self,
     ) -> AppResult<DeveloperCalibrationStatus> {
@@ -679,16 +688,44 @@ pub trait RuntimeGateway: GroupGateway {
         ))
     }
     #[cfg(feature = "fixture")]
-    fn commit_developer_calibration(&self) {}
-    #[cfg(feature = "fixture")]
-    fn cancel_developer_calibration(&self) -> DeveloperCalibrationStatus {
-        DeveloperCalibrationRecorder::default().status()
+    fn cancel_developer_calibration(&self) -> AppResult<DeveloperCalibrationStatus> {
+        Ok(DeveloperCalibrationRecorder::default().status())
     }
 }
 
 #[derive(Debug, Default)]
 pub struct AutomaticWritePermit {
     _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+#[cfg(feature = "fixture")]
+pub struct DeveloperCalibrationFinalizationPermit {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    recorder: Arc<SyncMutex<DeveloperCalibrationRecorder>>,
+    committed: bool,
+}
+
+#[cfg(feature = "fixture")]
+impl DeveloperCalibrationFinalizationPermit {
+    pub fn commit(mut self) -> AppResult<()> {
+        self.recorder
+            .lock()
+            .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
+            .commit();
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fixture")]
+impl Drop for DeveloperCalibrationFinalizationPermit {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut recorder) = self.recorder.lock() {
+                recorder.abort_finalization();
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -709,6 +746,7 @@ pub struct CdpGateway {
     group_refresh_gate: Arc<tokio::sync::Mutex<()>>,
     member_cache: Arc<RwLock<BTreeMap<i64, (Instant, MemberRoster)>>>,
     automatic_write_gate: Arc<tokio::sync::RwLock<()>>,
+    calibration_write_gate: Arc<tokio::sync::RwLock<()>>,
     #[cfg(feature = "fixture")]
     developer_calibration: Arc<SyncMutex<DeveloperCalibrationRecorder>>,
 }
@@ -743,6 +781,7 @@ impl CdpGateway {
             group_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_cache: Arc::new(RwLock::new(BTreeMap::new())),
             automatic_write_gate: Arc::new(tokio::sync::RwLock::new(())),
+            calibration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(feature = "fixture")]
             developer_calibration: Arc::new(
                 SyncMutex::new(DeveloperCalibrationRecorder::default()),
@@ -805,6 +844,18 @@ impl CdpGateway {
             .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
+    fn calibration_write_permit(&self) -> AppResult<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.calibration_write_gate
+            .clone()
+            .try_read_owned()
+            .map_err(|_| {
+                AppError::new(
+                    "calibration_finishing",
+                    "正在执行最终恢复回读和原子导出，新的写操作已被拒绝",
+                )
+            })
+    }
+
     fn require_capability(
         &self,
         status: CapabilityStatus,
@@ -813,6 +864,17 @@ impl CdpGateway {
     ) -> AppResult<()> {
         #[cfg(not(feature = "fixture"))]
         let _ = capability_key;
+        #[cfg(feature = "fixture")]
+        if self
+            .developer_calibration
+            .lock()
+            .is_ok_and(|recorder| recorder.is_finishing())
+        {
+            return Err(AppError::new(
+                "calibration_finishing",
+                "正在执行最终恢复回读和原子导出，新的写操作已被拒绝",
+            ));
+        }
         match status {
             CapabilityStatus::Supported => Ok(()),
             CapabilityStatus::Unverified => {
@@ -1452,6 +1514,22 @@ impl RuntimeGateway for CdpGateway {
     }
 
     #[cfg(feature = "fixture")]
+    async fn begin_developer_calibration_finalization(
+        &self,
+    ) -> AppResult<DeveloperCalibrationFinalizationPermit> {
+        let guard = self.calibration_write_gate.clone().write_owned().await;
+        self.developer_calibration
+            .lock()
+            .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
+            .begin_finalization()?;
+        Ok(DeveloperCalibrationFinalizationPermit {
+            _guard: guard,
+            recorder: self.developer_calibration.clone(),
+            committed: false,
+        })
+    }
+
+    #[cfg(feature = "fixture")]
     async fn verify_developer_calibration_restoration(
         &self,
     ) -> AppResult<DeveloperCalibrationStatus> {
@@ -1459,7 +1537,7 @@ impl RuntimeGateway for CdpGateway {
             .developer_calibration
             .lock()
             .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
-            .prepare_final_verification();
+            .finalization_targets()?;
         let mut rosters = BTreeMap::new();
         let mut groups = None;
         let mut notices = BTreeMap::new();
@@ -1589,18 +1667,11 @@ impl RuntimeGateway for CdpGateway {
     }
 
     #[cfg(feature = "fixture")]
-    fn commit_developer_calibration(&self) {
-        if let Ok(mut recorder) = self.developer_calibration.lock() {
-            recorder.commit();
-        }
-    }
-
-    #[cfg(feature = "fixture")]
-    fn cancel_developer_calibration(&self) -> DeveloperCalibrationStatus {
+    fn cancel_developer_calibration(&self) -> AppResult<DeveloperCalibrationStatus> {
         self.developer_calibration
             .lock()
-            .map(|mut recorder| recorder.cancel())
-            .unwrap_or_else(|_| DeveloperCalibrationRecorder::default().status())
+            .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
+            .cancel()
     }
 
     fn session_epoch(&self) -> u64 {
@@ -2159,6 +2230,7 @@ impl GroupGateway for CdpGateway {
     }
 
     async fn send_text(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().send_text, "sendText", "发送消息")?;
         require_positive("groupId", group_id)?;
         if text.trim().is_empty() {
@@ -2249,6 +2321,7 @@ impl GroupGateway for CdpGateway {
         sender_user_id: i64,
         message_id: &str,
     ) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().recall, "recall", "撤回消息")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", sender_user_id)?;
@@ -2295,6 +2368,7 @@ impl GroupGateway for CdpGateway {
         user_id: i64,
         duration_seconds: i64,
     ) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().mute, "mute", "成员禁言")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
@@ -2340,6 +2414,7 @@ impl GroupGateway for CdpGateway {
         Ok(receipt)
     }
     async fn unmute(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().mute, "mute", "成员解禁")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
@@ -2389,6 +2464,7 @@ impl GroupGateway for CdpGateway {
         member: &MemberRef,
         nickname: &str,
     ) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().rename, "rename", "修改群名片")?;
         require_positive("groupId", group_id)?;
         require_non_empty("nickname", nickname)?;
@@ -2527,6 +2603,7 @@ impl GroupGateway for CdpGateway {
         }
     }
     async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(
             self.capabilities().remove_member,
             "removeMember",
@@ -2544,6 +2621,7 @@ impl GroupGateway for CdpGateway {
         self.verify_removed_member(group_id, user_id, receipt).await
     }
     async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().group_mute, "groupMute", "全群发言控制")?;
         require_positive("groupId", group_id)?;
         self.manager_roster(group_id).await?;
@@ -2649,6 +2727,7 @@ impl GroupGateway for CdpGateway {
     }
 
     async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().announcement, "announcement", "群公告")?;
         require_positive("groupId", group_id)?;
         require_non_empty("noticeContent", text)?;
@@ -3659,8 +3738,50 @@ mod tests {
             gateway.automatic_write_permit().await.unwrap_err().code,
             "calibration_active"
         );
-        gateway.cancel_developer_calibration();
+        gateway.cancel_developer_calibration().unwrap();
         assert!(gateway.automatic_write_permit().await.is_ok());
+    }
+
+    #[cfg(feature = "fixture")]
+    #[tokio::test]
+    async fn finalization_blocks_manual_writes_and_recovers_or_commits_atomically() {
+        let gateway = CdpGateway::new(CdpClient::new("http://127.0.0.1:9222").unwrap());
+        gateway
+            .begin_developer_calibration(
+                CalibrationMetadata {
+                    app_file_version: "2.7.8".into(),
+                    main_script_sha256: "b".repeat(64),
+                    page_title: "旺商聊".into(),
+                    page_url: "file:///index.html".into(),
+                },
+                vec!["sendText".into()],
+            )
+            .await
+            .unwrap();
+
+        let finalization = gateway
+            .begin_developer_calibration_finalization()
+            .await
+            .unwrap();
+        assert!(gateway.developer_calibration_status().finishing);
+        assert_eq!(
+            gateway.send_text(1, "blocked").await.unwrap_err().code,
+            "calibration_finishing"
+        );
+        drop(finalization);
+        let status = gateway.developer_calibration_status();
+        assert!(status.active);
+        assert!(!status.finishing);
+
+        gateway
+            .begin_developer_calibration_finalization()
+            .await
+            .unwrap()
+            .commit()
+            .unwrap();
+        let status = gateway.developer_calibration_status();
+        assert!(!status.active);
+        assert!(!status.finishing);
     }
 
     #[test]
