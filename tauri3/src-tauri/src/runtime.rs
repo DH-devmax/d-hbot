@@ -202,6 +202,11 @@ impl BackendRuntime {
         workers.push(tauri::async_runtime::spawn(async move {
             connection.connection_loop(connection_app).await;
         }));
+        let roster_sync = self.clone();
+        let roster_app = app.clone();
+        workers.push(tauri::async_runtime::spawn(async move {
+            roster_sync.roster_sync_loop(roster_app).await;
+        }));
         let reminders = self.clone();
         let reminders_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
@@ -227,6 +232,12 @@ impl BackendRuntime {
         payload: Value,
         dedupe_key: String,
     ) -> AppResult<()> {
+        if self.gateway.calibration_active() {
+            return Err(AppError::new(
+                "calibration_active",
+                "真实校准期间已暂停自动副作用，避免后台任务修改测试群状态",
+            ));
+        }
         self.database
             .enqueue_effect(EffectOutboxRequest {
                 account_id: account_id.into(),
@@ -258,7 +269,9 @@ impl BackendRuntime {
 
     async fn effect_loop(&self, app: AppHandle) {
         loop {
-            if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
+            if !self.gateway.calibration_active()
+                && self.gateway.diagnose().await.status == ConnectionStatus::Ready
+            {
                 if let Ok((_, account_id)) = self.gateway.session_identity().await {
                     if let Ok(items) = self
                         .database
@@ -295,13 +308,15 @@ impl BackendRuntime {
             "group_mute" => Some(&capabilities.group_mute),
             _ => None,
         };
-        let result = if capability.is_some_and(|value| !value.is_supported()) {
-            Err(AppError::new(
-                "capability_unverified",
-                "当前旺商聊版本尚未完成该协议能力校准",
-            ))
-        } else {
-            match item.effect_type.as_str() {
+        let result = match self.gateway.automatic_write_permit().await {
+            Err(error) => Err(error),
+            Ok(_permit) if capability.is_some_and(|value| !value.is_supported()) => {
+                Err(AppError::new(
+                    "capability_unverified",
+                    "当前旺商聊版本尚未完成该协议能力校准",
+                ))
+            }
+            Ok(_permit) => match item.effect_type.as_str() {
                 "send_text" => {
                     self.gateway
                         .send_text(
@@ -364,7 +379,7 @@ impl BackendRuntime {
                         .await
                 }
                 _ => Err(AppError::new("effect_unsupported", "当前副作用类型未开放")),
-            }
+            },
         };
         let (status, error_text, receipt) = match result {
             Ok(receipt) if receipt.status == "unknown" => (
@@ -863,7 +878,10 @@ impl BackendRuntime {
                 .flatten()
                 .as_deref()
                 == Some("paused");
-            if !globally_paused && self.gateway.diagnose().await.status == ConnectionStatus::Ready {
+            if !globally_paused
+                && !self.gateway.calibration_active()
+                && self.gateway.diagnose().await.status == ConnectionStatus::Ready
+            {
                 if let Ok((sender_id, account_id)) = self.gateway.session_identity().await {
                     if let Ok(Some(job)) =
                         self.database.claim_next_card_job(account_id.clone()).await
@@ -884,18 +902,22 @@ impl BackendRuntime {
                                 "需要将账号权限设置为管理",
                             ))
                         } else {
-                            self.gateway
-                                .rename(
-                                    job.group_id,
-                                    &MemberRef {
-                                        user_id: Some(job.user_id),
-                                        nim_id: (!job.nim_id.is_empty())
-                                            .then(|| job.nim_id.clone()),
-                                    },
-                                    &job.desired_name,
-                                )
-                                .await
-                                .map(|_| ())
+                            match self.gateway.automatic_write_permit().await {
+                                Err(error) => Err(error),
+                                Ok(_permit) => self
+                                    .gateway
+                                    .rename(
+                                        job.group_id,
+                                        &MemberRef {
+                                            user_id: Some(job.user_id),
+                                            nim_id: (!job.nim_id.is_empty())
+                                                .then(|| job.nim_id.clone()),
+                                        },
+                                        &job.desired_name,
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                            }
                         };
                         let result = match result {
                             Ok(()) => {
@@ -1013,9 +1035,219 @@ impl BackendRuntime {
             .unwrap_or(false)
     }
 
+    async fn roster_sync_loop(&self, app: AppHandle) {
+        let mut delay = Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                _ = sleep(delay) => {},
+                _ = self.shutdown.cancelled() => break,
+            }
+            if !self.gateway.calibration_active()
+                && self.gateway.diagnose().await.status == ConnectionStatus::Ready
+            {
+                if let Ok((_, account_id)) = self.gateway.session_identity().await {
+                    self.sync_members(&app, &account_id).await;
+                }
+            }
+            delay = Duration::from_secs(600);
+        }
+    }
+
+    async fn sync_members(&self, app: &AppHandle, account_id: &str) {
+        let session_epoch = self.gateway.session_epoch();
+        if self.gateway.calibration_active() || self.gateway.member_sync_paused() {
+            return;
+        }
+        let groups = match self.gateway.list_groups().await {
+            Ok(groups) => groups,
+            Err(error) => {
+                self.logger.write(
+                    "WARN",
+                    &format!("群成员对账无法读取群列表：{}", error.message),
+                );
+                return;
+            }
+        };
+        let enabled_group_ids = self
+            .database
+            .list_groups(Some(account_id.to_string()))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|group| group.enabled)
+            .map(|group| group.group_id)
+            .collect::<HashSet<_>>();
+        let mut synced_enabled_group = false;
+        for group in groups {
+            if self.gateway.calibration_active()
+                || self.gateway.session_epoch() != session_epoch
+                || self.gateway.member_sync_paused()
+            {
+                return;
+            }
+            let _ = self.database.upsert_group(group.clone()).await;
+            if !enabled_group_ids.contains(&group.group_id) {
+                continue;
+            }
+            if synced_enabled_group {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(2)) => {},
+                    _ = self.shutdown.cancelled() => return,
+                }
+            }
+            synced_enabled_group = true;
+            self.gateway.invalidate_member_cache(group.group_id).await;
+            let snapshot_started_at = Utc::now();
+            let roster = match self.gateway.list_members(group.group_id).await {
+                Ok(roster) => roster,
+                Err(error) => {
+                    self.events.emit(
+                        "member-roster-status",
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "groupId": group.group_id,
+                            "status": if error.code == "gateway_rate_limited" { "rate-limited" } else { "error" },
+                            "reportedCount": 0,
+                            "resolvedCount": 0,
+                            "complete": false,
+                            "completenessReason": error.message,
+                        }),
+                    );
+                    return;
+                }
+            };
+            if roster.authority != "authoritative"
+                || !roster.source_errors.is_empty()
+                || self.gateway.session_epoch() != session_epoch
+            {
+                continue;
+            }
+            let existing = self
+                .database
+                .list_members(account_id.to_string(), group.group_id)
+                .await
+                .unwrap_or_default();
+            let baseline = existing.is_empty();
+            let mut present_ids = HashSet::new();
+            let mut newly_discovered = HashSet::new();
+            for mut member in roster.members {
+                member.account_id = account_id.to_string();
+                if let Some(saved) = existing.iter().find(|saved| {
+                    saved.user_id == member.user_id
+                        || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
+                }) {
+                    merge_managed_member_state(&mut member, saved);
+                } else {
+                    let now = Utc::now();
+                    member.original_card_name = member.card_name.clone();
+                    member.join_source = if baseline {
+                        "baseline"
+                    } else {
+                        "offline-discovered"
+                    }
+                    .into();
+                    member.prompt_read = baseline;
+                    member.discovered_at = now;
+                    member.joined_at = (!baseline).then_some(now);
+                    newly_discovered.insert(member.user_id);
+                }
+                member.present = true;
+                member.last_seen_at = Utc::now();
+                member.updated_at = member.last_seen_at;
+                if let Ok(canonical_user_id) = self.database.upsert_member(member.clone()).await {
+                    present_ids.insert(canonical_user_id);
+                }
+                if !baseline && newly_discovered.contains(&member.user_id) && member.blacklisted {
+                    let queued = self
+                        .enqueue_effect(
+                            account_id,
+                            group.group_id,
+                            "remove",
+                            serde_json::json!({
+                                "userId": member.user_id,
+                                "recordAction": true,
+                                "actionKind": "remove",
+                                "mode": "automatic",
+                                "reason": "blacklisted_member_rejoined",
+                            }),
+                            format!(
+                                "blacklist-roster-rejoin:{account_id}:{}:{}",
+                                group.group_id, member.user_id
+                            ),
+                        )
+                        .await
+                        .is_ok();
+                    let _ = self
+                        .database
+                        .record_audit(AuditEvent {
+                            id: 0,
+                            account_id: account_id.into(),
+                            group_id: group.group_id,
+                            user_id: member.user_id,
+                            actor: "DH BOT".into(),
+                            event: "blacklisted_member_rejoined".into(),
+                            level: if queued { "info" } else { "error" }.into(),
+                            details: "名单对账发现黑名单成员重新入群".into(),
+                            created_at: Utc::now(),
+                        })
+                        .await;
+                }
+            }
+            if self.gateway.session_epoch() != session_epoch {
+                return;
+            }
+            let missing = self
+                .database
+                .mark_members_not_present_before(
+                    account_id.to_string(),
+                    group.group_id,
+                    present_ids.into_iter().collect(),
+                    snapshot_started_at,
+                )
+                .await
+                .unwrap_or_default();
+            let missing_count = missing.len();
+            for member in missing {
+                let _ = self
+                    .database
+                    .record_audit(AuditEvent {
+                        id: 0,
+                        account_id: account_id.into(),
+                        group_id: group.group_id,
+                        user_id: member.user_id,
+                        actor: "DH BOT".into(),
+                        event: "member_left".into(),
+                        level: "info".into(),
+                        details: "名单对账确认成员已离群".into(),
+                        created_at: Utc::now(),
+                    })
+                    .await;
+            }
+            let _ = app.emit(
+                "member-roster-status",
+                serde_json::json!({
+                    "accountId": account_id,
+                    "groupId": group.group_id,
+                    "status": roster.status,
+                    "reportedCount": roster.reported_count,
+                    "resolvedCount": roster.resolved_count,
+                    "complete": roster.complete,
+                    "source": "background-reconciliation",
+                    "newlyDiscovered": newly_discovered.len(),
+                    "missing": missing_count,
+                }),
+            );
+            if self.gateway.member_sync_paused() {
+                return;
+            }
+        }
+    }
+
     async fn schedule_loop(&self, app: AppHandle) {
         loop {
-            if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
+            if !self.gateway.calibration_active()
+                && self.gateway.diagnose().await.status == ConnectionStatus::Ready
+            {
                 if let Ok((sender_id, account_id)) = self.gateway.session_identity().await {
                     if let Ok(schedules) = self.database.list_schedules(account_id.clone()).await {
                         for schedule in schedules.into_iter().filter(|schedule| schedule.enabled) {
@@ -2434,6 +2666,10 @@ impl BackendRuntime {
         automatic: bool,
     ) {
         if !automatic {
+            return;
+        }
+        if self.gateway.calibration_active() {
+            self.logger.write("INFO", "真实校准期间跳过自动规则副作用");
             return;
         }
         let permission = self

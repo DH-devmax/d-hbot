@@ -584,6 +584,7 @@ async fn begin_developer_calibration(
     state
         .gateway
         .begin_developer_calibration(metadata, capabilities)
+        .await
 }
 
 #[cfg(feature = "fixture")]
@@ -600,10 +601,14 @@ fn cancel_developer_calibration(state: State<'_, AppState>) -> DeveloperCalibrat
 
 #[cfg(feature = "fixture")]
 #[tauri::command]
-fn finish_developer_calibration(
+async fn finish_developer_calibration(
     state: State<'_, AppState>,
     restored: bool,
 ) -> AppResult<DeveloperCalibrationCaptureResult> {
+    state
+        .gateway
+        .verify_developer_calibration_restoration()
+        .await?;
     let exported = state.gateway.finish_developer_calibration(restored)?;
     let output_directory = state
         .paths
@@ -619,10 +624,12 @@ fn finish_developer_calibration(
     })?;
     let version = exported.status.app_file_version.replace(['.', ' '], "-");
     let file_name = format!(
-        "wangshangliao-{version}-{}.json",
-        Utc::now().format("%Y%m%d-%H%M%S")
+        "wangshangliao-{version}-{}-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S-%3f"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8],
     );
     let output = output_directory.join(file_name);
+    let temporary = output.with_extension("json.tmp");
     let serialized = serde_json::to_vec_pretty(&exported.capture).map_err(|error| {
         AppError::new(
             "calibration_serialize",
@@ -632,7 +639,7 @@ fn finish_developer_calibration(
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&output)
+        .open(&temporary)
         .map_err(|error| {
             AppError::new(
                 "calibration_write",
@@ -651,6 +658,21 @@ fn finish_developer_calibration(
             format!("完成本机 Contract v2 失败：{error}"),
         )
     })?;
+    file.sync_all().map_err(|error| {
+        AppError::new(
+            "calibration_write",
+            format!("刷新本机 Contract v2 到磁盘失败：{error}"),
+        )
+    })?;
+    drop(file);
+    std::fs::rename(&temporary, &output).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        AppError::new(
+            "calibration_write",
+            format!("提交本机 Contract v2 原子文件失败：{error}"),
+        )
+    })?;
+    state.gateway.commit_developer_calibration();
     Ok(DeveloperCalibrationCaptureResult {
         path: output.display().to_string(),
         status: exported.status,

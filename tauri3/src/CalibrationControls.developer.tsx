@@ -14,6 +14,10 @@ type CalibrationStatus = {
   operationCount: number
   callbackCount: number
   writeOperationCount: number
+  baselineCount: number
+  restoredBaselineCount: number
+  restorationVerified: boolean
+  restorationError: string
 }
 
 type CaptureResult = { path: string; status: CalibrationStatus }
@@ -39,12 +43,16 @@ const emptyStatus: CalibrationStatus = {
   operationCount: 0,
   callbackCount: 0,
   writeOperationCount: 0,
+  baselineCount: 0,
+  restoredBaselineCount: 0,
+  restorationVerified: false,
+  restorationError: '',
 }
 
 export default function CalibrationControls({ onError }: { onError: (value: string) => void }) {
   const [status, setStatus] = useState<CalibrationStatus>(emptyStatus)
   const [selected, setSelected] = useState(() => capabilityOptions.map(([key]) => key as string))
-  const [restored, setRestored] = useState(false)
+  const [restorationNoted, setRestorationNoted] = useState(false)
   const [busy, setBusy] = useState(false)
   const [capturePath, setCapturePath] = useState('')
 
@@ -72,7 +80,7 @@ export default function CalibrationControls({ onError }: { onError: (value: stri
   const begin = async () => {
     setBusy(true)
     setCapturePath('')
-    setRestored(false)
+    setRestorationNoted(false)
     onError('')
     try {
       setStatus(await invoke<CalibrationStatus>('begin_developer_calibration', { capabilities: selected }))
@@ -87,10 +95,10 @@ export default function CalibrationControls({ onError }: { onError: (value: stri
     setBusy(true)
     onError('')
     try {
-      const result = await invoke<CaptureResult>('finish_developer_calibration', { restored })
+      const result = await invoke<CaptureResult>('finish_developer_calibration', { restored: restorationNoted })
       setCapturePath(result.path)
       setStatus(emptyStatus)
-      setRestored(false)
+      setRestorationNoted(false)
     } catch (reason) {
       onError(readableError(reason))
     } finally {
@@ -103,7 +111,7 @@ export default function CalibrationControls({ onError }: { onError: (value: stri
     onError('')
     try {
       setStatus(await invoke<CalibrationStatus>('cancel_developer_calibration'))
-      setRestored(false)
+      setRestorationNoted(false)
     } catch (reason) {
       onError(readableError(reason))
     } finally {
@@ -113,9 +121,9 @@ export default function CalibrationControls({ onError }: { onError: (value: stri
 
   return <section className="section calibration-control">
     <div className="section-head"><div><span className="eyebrow">Contract v2</span><h2>真实 9222 能力校准</h2></div>{status.active ? <Radio size={18} className="calibration-live" /> : <Square size={18} />}</div>
-    <dl className="runtime-details debug-details"><dt>采集状态</dt><dd>{status.active ? '正在采集' : '未开始'}</dd><dt>旺商聊版本</dt><dd>{status.appFileVersion || '-'}</dd><dt>主脚本 SHA-256</dt><dd>{status.mainScriptSha256 || '-'}</dd><dt>请求 / 回调</dt><dd>{status.active ? `${status.operationCount} / ${status.callbackCount}` : '-'}</dd><dt>真实写操作</dt><dd>{status.active ? status.writeOperationCount : '-'}</dd></dl>
+    <dl className="runtime-details debug-details"><dt>采集状态</dt><dd>{status.active ? '正在采集' : '未开始'}</dd><dt>旺商聊版本</dt><dd>{status.appFileVersion || '-'}</dd><dt>主脚本 SHA-256</dt><dd>{status.mainScriptSha256 || '-'}</dd><dt>请求 / 回调</dt><dd>{status.active ? `${status.operationCount} / ${status.callbackCount}` : '-'}</dd><dt>真实写操作</dt><dd>{status.active ? status.writeOperationCount : '-'}</dd><dt>恢复基线</dt><dd>{status.active ? `${status.restoredBaselineCount} / ${status.baselineCount}` : '-'}</dd><dt>恢复回读</dt><dd>{status.active ? (status.restorationVerified ? '已验证' : status.restorationError || '未完成') : '-'}</dd></dl>
     {!status.active && <div className="calibration-capabilities">{capabilityOptions.map(([key, label]) => <label className="check-row" key={key}><input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />{label}</label>)}</div>}
-    {status.active && <label className="check-row calibration-restored"><input type="checkbox" checked={restored} onChange={event => setRestored(event.target.checked)} />所有测试写操作均已回读确认，并恢复公告、名片、禁言和全群原状态</label>}
+    {status.active && <label className="check-row calibration-restored"><input type="checkbox" checked={restorationNoted} onChange={event => setRestorationNoted(event.target.checked)} />人工备注：已检查恢复结果（不替代上方真实回读验证）</label>}
     <div className="button-row">{status.active ? <><button className="primary" disabled={busy} onClick={() => void finish()}><FileCheck2 size={15} />完成并导出原始 Contract v2</button><button className="secondary" disabled={busy} onClick={() => void cancel()}>取消采集</button></> : <button className="primary" disabled={busy || selected.length === 0} onClick={() => void begin()}><Radio size={15} />开始真实 9222 采集</button>}</div>
     {capturePath && <dl className="runtime-details debug-details calibration-output"><dt>原始文件</dt><dd>{capturePath}</dd></dl>}
   </section>

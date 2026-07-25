@@ -17,8 +17,8 @@ use tokio_tungstenite::{
 
 #[cfg(feature = "fixture")]
 use crate::calibration::{
-    CalibrationMetadata, DeveloperCalibrationExport, DeveloperCalibrationRecorder,
-    DeveloperCalibrationStatus,
+    CalibrationMetadata, CalibrationRestorationTarget, DeveloperCalibrationExport,
+    DeveloperCalibrationRecorder, DeveloperCalibrationStatus,
 };
 use crate::contracts::{runtime_capabilities, unverified_production_capabilities};
 use crate::error::{
@@ -638,8 +638,14 @@ pub trait RuntimeGateway: GroupGateway {
     fn member_sync_paused(&self) -> bool {
         false
     }
+    fn calibration_active(&self) -> bool {
+        false
+    }
+    async fn automatic_write_permit(&self) -> AppResult<AutomaticWritePermit> {
+        Ok(AutomaticWritePermit::default())
+    }
     #[cfg(feature = "fixture")]
-    fn begin_developer_calibration(
+    async fn begin_developer_calibration(
         &self,
         _metadata: CalibrationMetadata,
         _capabilities: Vec<String>,
@@ -654,6 +660,15 @@ pub trait RuntimeGateway: GroupGateway {
         DeveloperCalibrationRecorder::default().status()
     }
     #[cfg(feature = "fixture")]
+    async fn verify_developer_calibration_restoration(
+        &self,
+    ) -> AppResult<DeveloperCalibrationStatus> {
+        Err(AppError::new(
+            "calibration_unsupported",
+            "当前网关不支持恢复状态回读",
+        ))
+    }
+    #[cfg(feature = "fixture")]
     fn finish_developer_calibration(
         &self,
         _restored: bool,
@@ -664,9 +679,16 @@ pub trait RuntimeGateway: GroupGateway {
         ))
     }
     #[cfg(feature = "fixture")]
+    fn commit_developer_calibration(&self) {}
+    #[cfg(feature = "fixture")]
     fn cancel_developer_calibration(&self) -> DeveloperCalibrationStatus {
         DeveloperCalibrationRecorder::default().status()
     }
+}
+
+#[derive(Debug, Default)]
+pub struct AutomaticWritePermit {
+    _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 #[derive(Clone)]
@@ -686,6 +708,7 @@ pub struct CdpGateway {
     group_cache: Arc<RwLock<GroupCache>>,
     group_refresh_gate: Arc<tokio::sync::Mutex<()>>,
     member_cache: Arc<RwLock<BTreeMap<i64, (Instant, MemberRoster)>>>,
+    automatic_write_gate: Arc<tokio::sync::RwLock<()>>,
     #[cfg(feature = "fixture")]
     developer_calibration: Arc<SyncMutex<DeveloperCalibrationRecorder>>,
 }
@@ -719,6 +742,7 @@ impl CdpGateway {
             group_cache: Arc::new(RwLock::new(None)),
             group_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_cache: Arc::new(RwLock::new(BTreeMap::new())),
+            automatic_write_gate: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(feature = "fixture")]
             developer_calibration: Arc::new(
                 SyncMutex::new(DeveloperCalibrationRecorder::default()),
@@ -828,6 +852,27 @@ impl CdpGateway {
     ) {
         if let Ok(mut recorder) = self.developer_calibration.lock() {
             recorder.complete_operation(route, receipt, normalized_state);
+        }
+    }
+
+    #[cfg(feature = "fixture")]
+    fn calibration_baseline(&self, route: &str, identity: Value, state: Value) {
+        if let Ok(mut recorder) = self.developer_calibration.lock() {
+            recorder.record_baseline(route, identity, state);
+        }
+    }
+
+    #[cfg(feature = "fixture")]
+    fn calibration_restored_state(&self, route: &str, identity: Value, state: Value) {
+        if let Ok(mut recorder) = self.developer_calibration.lock() {
+            recorder.record_restored_state(route, identity, state);
+        }
+    }
+
+    #[cfg(feature = "fixture")]
+    fn calibration_requires_baseline(&self, route: &str, identity: Value) {
+        if let Ok(mut recorder) = self.developer_calibration.lock() {
+            recorder.require_baseline(route, identity);
         }
     }
 
@@ -1358,12 +1403,40 @@ impl RuntimeGateway for CdpGateway {
         CdpGateway::member_sync_paused(self)
     }
 
+    fn calibration_active(&self) -> bool {
+        #[cfg(feature = "fixture")]
+        {
+            self.developer_calibration
+                .lock()
+                .map(|recorder| recorder.is_active())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "fixture"))]
+        {
+            false
+        }
+    }
+
+    async fn automatic_write_permit(&self) -> AppResult<AutomaticWritePermit> {
+        let guard = self.automatic_write_gate.clone().read_owned().await;
+        if self.calibration_active() {
+            return Err(AppError::new(
+                "calibration_active",
+                "真实校准期间已暂停自动副作用，后台任务将在校准结束后重试",
+            ));
+        }
+        Ok(AutomaticWritePermit {
+            _guard: Some(guard),
+        })
+    }
+
     #[cfg(feature = "fixture")]
-    fn begin_developer_calibration(
+    async fn begin_developer_calibration(
         &self,
         metadata: CalibrationMetadata,
         capabilities: Vec<String>,
     ) -> AppResult<DeveloperCalibrationStatus> {
+        let _automatic_writes = self.automatic_write_gate.clone().write_owned().await;
         self.developer_calibration
             .lock()
             .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
@@ -1379,6 +1452,132 @@ impl RuntimeGateway for CdpGateway {
     }
 
     #[cfg(feature = "fixture")]
+    async fn verify_developer_calibration_restoration(
+        &self,
+    ) -> AppResult<DeveloperCalibrationStatus> {
+        let targets = self
+            .developer_calibration
+            .lock()
+            .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
+            .prepare_final_verification();
+        let mut rosters = BTreeMap::new();
+        let mut groups = None;
+        let mut notices = BTreeMap::new();
+
+        for target in targets {
+            let group_id = calibration_identity_i64(&target, "groupId")?;
+            let state = match target.route.as_str() {
+                MEMBER_MUTE_ROUTE | MEMBER_UNMUTE_ROUTE => {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        rosters.entry(group_id)
+                    {
+                        self.invalidate_member_cache(group_id).await;
+                        let roster = self.list_members(group_id).await?;
+                        if roster.authority != "authoritative" || !roster.source_errors.is_empty() {
+                            return Err(AppError::new(
+                                "calibration_final_read",
+                                format!("群 {group_id} 的最终成员名单不是权威快照"),
+                            ));
+                        }
+                        entry.insert(roster);
+                    }
+                    let user_id = calibration_identity_i64(&target, "userId")?;
+                    let member = rosters
+                        .get(&group_id)
+                        .and_then(|roster| {
+                            roster
+                                .members
+                                .iter()
+                                .find(|member| member.user_id == user_id && member.present)
+                        })
+                        .ok_or_else(|| {
+                            AppError::new(
+                                "calibration_final_read",
+                                format!("最终成员名单中找不到校准目标 {user_id}"),
+                            )
+                        })?;
+                    let muted =
+                        member_mute_observation(&member.account_state).ok_or_else(|| {
+                            AppError::new(
+                                "calibration_final_read",
+                                format!("无法确认成员 {user_id} 的最终禁言状态"),
+                            )
+                        })?;
+                    json!({"muted": muted})
+                }
+                MEMBER_RENAME_ROUTE | "nim.updateNickInTeam" => {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        rosters.entry(group_id)
+                    {
+                        self.invalidate_member_cache(group_id).await;
+                        let roster = self.list_members(group_id).await?;
+                        if roster.authority != "authoritative" || !roster.source_errors.is_empty() {
+                            return Err(AppError::new(
+                                "calibration_final_read",
+                                format!("群 {group_id} 的最终成员名单不是权威快照"),
+                            ));
+                        }
+                        entry.insert(roster);
+                    }
+                    let user_id = calibration_identity_i64(&target, "userId")?;
+                    let member = rosters
+                        .get(&group_id)
+                        .and_then(|roster| {
+                            roster
+                                .members
+                                .iter()
+                                .find(|member| member.user_id == user_id && member.present)
+                        })
+                        .ok_or_else(|| {
+                            AppError::new(
+                                "calibration_final_read",
+                                format!("最终成员名单中找不到校准目标 {user_id}"),
+                            )
+                        })?;
+                    json!({"cardName": member.card_name})
+                }
+                GROUP_MUTE_ROUTE => {
+                    if groups.is_none() {
+                        *self.group_cache.write().await = None;
+                        groups = Some(self.group_infos().await?);
+                    }
+                    let group = groups
+                        .as_ref()
+                        .and_then(|groups| groups.iter().find(|group| group.group_id == group_id))
+                        .ok_or_else(|| {
+                            AppError::new(
+                                "calibration_final_read",
+                                format!("最终群列表中找不到群 {group_id}"),
+                            )
+                        })?;
+                    json!({"muteMode": group.mute_mode})
+                }
+                GROUP_NOTICE_ADD_ROUTE | GROUP_NOTICE_UPDATE_ROUTE => {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        notices.entry(group_id)
+                    {
+                        entry.insert(self.get_group_announcement(group_id).await?);
+                    }
+                    let notice = notices.get(&group_id).and_then(Option::as_ref);
+                    json!({
+                        "noticeId": notice.map(|notice| notice.notice_id.clone()).unwrap_or_default(),
+                        "content": notice.map(|notice| notice.content.clone()).unwrap_or_default(),
+                    })
+                }
+                route => {
+                    return Err(AppError::new(
+                        "calibration_final_read",
+                        format!("不支持最终恢复回读的路由：{route}"),
+                    ));
+                }
+            };
+            self.calibration_restored_state(&target.route, target.identity, state);
+        }
+
+        Ok(self.developer_calibration_status())
+    }
+
+    #[cfg(feature = "fixture")]
     fn finish_developer_calibration(
         &self,
         restored: bool,
@@ -1387,6 +1586,13 @@ impl RuntimeGateway for CdpGateway {
             .lock()
             .map_err(|_| AppError::new("calibration_state", "校准采集状态不可用"))?
             .finish(restored)
+    }
+
+    #[cfg(feature = "fixture")]
+    fn commit_developer_calibration(&self) {
+        if let Ok(mut recorder) = self.developer_calibration.lock() {
+            recorder.commit();
+        }
     }
 
     #[cfg(feature = "fixture")]
@@ -1492,6 +1698,12 @@ impl CdpGateway {
             member.user_id == user_id
                 && (member.card_name == nickname || member.nickname == nickname)
         });
+        #[cfg(feature = "fixture")]
+        self.calibration_restored_state(
+            MEMBER_RENAME_ROUTE,
+            json!({"groupId": group_id, "userId": user_id}),
+            json!({"cardName": roster.members.iter().find(|member| member.user_id == user_id).map(|member| member.card_name.clone()).unwrap_or_default()}),
+        );
         if matches {
             Ok(receipt)
         } else {
@@ -1546,25 +1758,15 @@ impl CdpGateway {
             receipt.verification = Some("unknown".into());
             return Ok(receipt);
         };
-        let raw_state = member.account_state.to_ascii_lowercase();
-        let state = if raw_state.contains("unmute")
-            || raw_state.contains("not_mute")
-            || raw_state.contains("normal")
-            || raw_state.contains("good")
-            || raw_state.contains("active")
-            || raw_state.contains("ok")
-        {
-            "mute_none".to_string()
-        } else {
-            raw_state
-        };
-        let observed = if state.contains("mute") || state.contains("禁言") {
-            Some(!state.contains("no") && !state.contains("cancel") && !state.contains("none"))
-        } else {
-            None
-        };
+        let observed = member_mute_observation(&member.account_state);
         match observed {
             Some(value) if value == muted => {
+                #[cfg(feature = "fixture")]
+                self.calibration_restored_state(
+                    MEMBER_MUTE_ROUTE,
+                    json!({"groupId": group_id, "userId": user_id}),
+                    json!({"muted": value}),
+                );
                 receipt.verification = Some("verified".into());
                 Ok(receipt)
             }
@@ -2097,7 +2299,23 @@ impl GroupGateway for CdpGateway {
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
         require_positive("durationSeconds", duration_seconds)?;
+        #[cfg(feature = "fixture")]
+        let target = self.writable_member(group_id, user_id).await?;
+        #[cfg(not(feature = "fixture"))]
         self.writable_member(group_id, user_id).await?;
+        #[cfg(feature = "fixture")]
+        if let Some(muted) = member_mute_observation(&target.account_state) {
+            self.calibration_baseline(
+                MEMBER_MUTE_ROUTE,
+                json!({"groupId": group_id, "userId": user_id}),
+                json!({"muted": muted}),
+            );
+        } else {
+            self.calibration_requires_baseline(
+                MEMBER_MUTE_ROUTE,
+                json!({"groupId": group_id, "userId": user_id}),
+            );
+        }
         let receipt = self
             .action(
                 MEMBER_MUTE_ROUTE,
@@ -2125,7 +2343,23 @@ impl GroupGateway for CdpGateway {
         self.require_capability(self.capabilities().mute, "mute", "成员解禁")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
+        #[cfg(feature = "fixture")]
+        let target = self.writable_member(group_id, user_id).await?;
+        #[cfg(not(feature = "fixture"))]
         self.writable_member(group_id, user_id).await?;
+        #[cfg(feature = "fixture")]
+        if let Some(muted) = member_mute_observation(&target.account_state) {
+            self.calibration_baseline(
+                MEMBER_MUTE_ROUTE,
+                json!({"groupId": group_id, "userId": user_id}),
+                json!({"muted": muted}),
+            );
+        } else {
+            self.calibration_requires_baseline(
+                MEMBER_MUTE_ROUTE,
+                json!({"groupId": group_id, "userId": user_id}),
+            );
+        }
         let receipt = self
             .action(
                 MEMBER_UNMUTE_ROUTE,
@@ -2163,6 +2397,12 @@ impl GroupGateway for CdpGateway {
         })?;
         require_positive("userId", requested_user_id)?;
         let target = self.writable_member(group_id, requested_user_id).await?;
+        #[cfg(feature = "fixture")]
+        self.calibration_baseline(
+            MEMBER_RENAME_ROUTE,
+            json!({"groupId": group_id, "userId": requested_user_id}),
+            json!({"cardName": target.card_name}),
+        );
         if member
             .nim_id
             .as_deref()
@@ -2307,6 +2547,21 @@ impl GroupGateway for CdpGateway {
         self.require_capability(self.capabilities().group_mute, "groupMute", "全群发言控制")?;
         require_positive("groupId", group_id)?;
         self.manager_roster(group_id).await?;
+        #[cfg(feature = "fixture")]
+        if let Some(group) = self
+            .group_infos()
+            .await?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+        {
+            self.calibration_baseline(
+                GROUP_MUTE_ROUTE,
+                json!({"groupId": group_id}),
+                json!({"muteMode": group.mute_mode}),
+            );
+        }
+        #[cfg(feature = "fixture")]
+        self.calibration_requires_baseline(GROUP_MUTE_ROUTE, json!({"groupId": group_id}));
         let mut receipt = self
             .action(
                 GROUP_MUTE_ROUTE,
@@ -2323,6 +2578,12 @@ impl GroupGateway for CdpGateway {
             .map(|group| group.mute_mode)
         {
             Some(mode) if !mode.is_empty() && mode.eq_ignore_ascii_case(expected) => {
+                #[cfg(feature = "fixture")]
+                self.calibration_restored_state(
+                    GROUP_MUTE_ROUTE,
+                    json!({"groupId": group_id}),
+                    json!({"muteMode": mode}),
+                );
                 receipt.verification = Some("verified".into());
             }
             Some(_) | None => {
@@ -2405,6 +2666,19 @@ impl GroupGateway for CdpGateway {
                 json!({"groupId": group_id, "v": "0"}),
             )
             .await?;
+        #[cfg(feature = "fixture")]
+        if let Some(baseline) = self.get_group_announcement(group_id).await? {
+            self.calibration_baseline(
+                GROUP_NOTICE_UPDATE_ROUTE,
+                json!({"groupId": group_id}),
+                json!({"noticeId": baseline.notice_id, "content": baseline.content}),
+            );
+        } else {
+            self.calibration_requires_baseline(
+                GROUP_NOTICE_UPDATE_ROUTE,
+                json!({"groupId": group_id}),
+            );
+        }
         let notices = current
             .get("noticeInfoList")
             .and_then(Value::as_array)
@@ -2479,6 +2753,12 @@ impl GroupGateway for CdpGateway {
                 "群公告保存后的公告 ID 或内容与请求不一致",
             ));
         }
+        #[cfg(feature = "fixture")]
+        self.calibration_restored_state(
+            route,
+            json!({"groupId": group_id}),
+            json!({"noticeId": confirmed.notice_id, "content": confirmed.content}),
+        );
 
         let broadcast = async {
             let cloud = self.resolve_cloud_id(group_id).await?;
@@ -3097,6 +3377,50 @@ fn member_role(value: &str) -> String {
     }
     .into()
 }
+
+fn member_mute_observation(account_state: &str) -> Option<bool> {
+    let raw_state = account_state.to_ascii_lowercase();
+    if raw_state.is_empty() {
+        return None;
+    }
+    if raw_state.contains("unmute")
+        || raw_state.contains("not_mute")
+        || raw_state.contains("normal")
+        || raw_state.contains("good")
+        || raw_state.contains("active")
+        || raw_state == "ok"
+    {
+        return Some(false);
+    }
+    if raw_state.contains("mute") || raw_state.contains("禁言") {
+        return Some(
+            !raw_state.contains("no")
+                && !raw_state.contains("cancel")
+                && !raw_state.contains("none"),
+        );
+    }
+    None
+}
+
+#[cfg(feature = "fixture")]
+fn calibration_identity_i64(target: &CalibrationRestorationTarget, field: &str) -> AppResult<i64> {
+    target
+        .identity
+        .get(field)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            AppError::new(
+                "calibration_final_read",
+                format!("校准恢复目标缺少有效的 {field}"),
+            )
+        })
+}
+
 fn wire_name_missing(value: &str) -> bool {
     matches!(value.trim(), "" | "1" | ".")
 }
@@ -3305,6 +3629,40 @@ mod tests {
         assert!(CdpClient::new("http://127.0.0.1:9222").is_ok());
         assert!(CdpClient::new("https://example.com").is_err());
     }
+
+    #[cfg(feature = "fixture")]
+    #[tokio::test]
+    async fn calibration_waits_for_automatic_writes_and_blocks_new_ones() {
+        let gateway = Arc::new(CdpGateway::new(
+            CdpClient::new("http://127.0.0.1:9222").unwrap(),
+        ));
+        let permit = gateway.automatic_write_permit().await.unwrap();
+        let starting_gateway = gateway.clone();
+        let starting = tokio::spawn(async move {
+            starting_gateway
+                .begin_developer_calibration(
+                    CalibrationMetadata {
+                        app_file_version: "2.7.8".into(),
+                        main_script_sha256: "a".repeat(64),
+                        page_title: "旺商聊".into(),
+                        page_url: "file:///index.html".into(),
+                    },
+                    vec!["rename".into()],
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!starting.is_finished());
+        drop(permit);
+        assert!(starting.await.unwrap().unwrap().active);
+        assert_eq!(
+            gateway.automatic_write_permit().await.unwrap_err().code,
+            "calibration_active"
+        );
+        gateway.cancel_developer_calibration();
+        assert!(gateway.automatic_write_permit().await.is_ok());
+    }
+
     #[test]
     fn member_roles_are_normalized() {
         assert_eq!(member_role("MSG_ADMIN"), "admin");

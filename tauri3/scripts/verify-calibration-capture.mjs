@@ -1,10 +1,17 @@
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
+import { isDeepStrictEqual } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 const capabilityNames = ['sendText', 'recall', 'mute', 'rename', 'announcement', 'groupMute', 'memberEvents']
 const outputCapabilityNames = ['announcement', 'sendText', 'mute', 'recall', 'rename', 'removeMember', 'groupMute', 'memberEvents']
+const restorationPrefixes = {
+  mute: 'member-mute',
+  rename: 'member-rename',
+  announcement: 'group-notice',
+  groupMute: 'group-mute',
+}
 
 function requireObject(value, label) {
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(`${label} 必须是对象`)
@@ -47,6 +54,29 @@ function capabilityEvidence(capture) {
   }
 }
 
+function verifyRestorationEvidence(state, requested) {
+  if (state.restored !== true) throw new Error('校准证据未确认恢复原状态')
+  if (state.restorationError) throw new Error(`校准恢复回读仍有错误：${state.restorationError}`)
+  if (!Array.isArray(state.baselines)) throw new Error('expectedNormalizedState.baselines 必须是数组')
+  if (!Array.isArray(state.observedStates)) throw new Error('expectedNormalizedState.observedStates 必须是数组')
+  for (const [index, baseline] of state.baselines.entries()) {
+    requireObject(baseline, `expectedNormalizedState.baselines[${index}]`)
+    requireObject(baseline.identity, `expectedNormalizedState.baselines[${index}].identity`)
+    const observed = state.observedStates.find(candidate => candidate?.family === baseline.family
+      && isDeepStrictEqual(candidate?.identity, baseline.identity))
+    if (!observed) throw new Error(`校准恢复回读缺少基线目标：${baseline.family}`)
+    if (!isDeepStrictEqual(observed.state, baseline.state)) {
+      throw new Error(`校准最终状态与操作前基线不一致：${baseline.family}`)
+    }
+  }
+  for (const capability of requested) {
+    const family = restorationPrefixes[capability]
+    if (family && !state.baselines.some(baseline => baseline?.family === family)) {
+      throw new Error(`能力 ${capability} 缺少操作前基线和最终回读证据`)
+    }
+  }
+}
+
 export function verifyCalibrationCapture(capture) {
   requireObject(capture, 'Contract v2')
   if (capture.version !== 2) throw new Error('只接受 Contract v2')
@@ -60,7 +90,6 @@ export function verifyCalibrationCapture(capture) {
   if (!Array.isArray(capture.operations) || capture.operations.length === 0) throw new Error('校准证据缺少 operations')
   if (!Array.isArray(capture.callbacks) || capture.callbacks.length === 0) throw new Error('校准证据缺少 callbacks')
   requireObject(capture.expectedNormalizedState, 'expectedNormalizedState')
-  if (capture.expectedNormalizedState.restored !== true) throw new Error('校准证据未确认恢复原状态')
   for (const [index, operation] of capture.operations.entries()) {
     requireObject(operation, `operations[${index}]`)
     for (const field of ['request', 'transport', 'business', 'normalizedReceipt', 'expectedNormalizedState']) {
@@ -81,6 +110,7 @@ export function verifyCalibrationCapture(capture) {
   if (!Array.isArray(requested) || requested.length === 0) throw new Error('校准证据缺少能力清单')
   const unknown = requested.filter(capability => !capabilityNames.includes(capability))
   if (unknown.length) throw new Error(`校准证据包含未知能力：${unknown.join(', ')}`)
+  verifyRestorationEvidence(capture.expectedNormalizedState, requested)
   const evidence = capabilityEvidence(capture)
   const missing = requested.filter(capability => !evidence[capability])
   if (missing.length) throw new Error(`以下能力缺少成功、回读或恢复证据：${missing.join(', ')}`)

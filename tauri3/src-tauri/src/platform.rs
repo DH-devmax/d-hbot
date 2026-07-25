@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-#[cfg(any(test, windows))]
+#[cfg(windows)]
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;

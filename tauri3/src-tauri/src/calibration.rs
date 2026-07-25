@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,10 @@ pub struct DeveloperCalibrationStatus {
     pub operation_count: usize,
     pub callback_count: usize,
     pub write_operation_count: usize,
+    pub baseline_count: usize,
+    pub restored_baseline_count: usize,
+    pub restoration_verified: bool,
+    pub restoration_error: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,8 +74,15 @@ struct CalibrationOperation {
     transport: Value,
     business: Value,
     normalized_receipt: GatewayReceipt,
+    baseline_state: Option<Value>,
     expected_normalized_state: Value,
     captured_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CalibrationRestorationTarget {
+    pub route: String,
+    pub identity: Value,
 }
 
 #[derive(Debug, Default)]
@@ -81,9 +92,17 @@ pub(crate) struct DeveloperCalibrationRecorder {
     capabilities: BTreeSet<String>,
     operations: Vec<CalibrationOperation>,
     callbacks: Vec<Value>,
+    baselines: BTreeMap<String, Value>,
+    baseline_targets: BTreeMap<String, CalibrationRestorationTarget>,
+    required_restorations: BTreeSet<String>,
+    observed_states: BTreeMap<String, Value>,
 }
 
 impl DeveloperCalibrationRecorder {
+    pub(crate) fn is_active(&self) -> bool {
+        self.metadata.is_some()
+    }
+
     pub(crate) fn start(
         &mut self,
         metadata: CalibrationMetadata,
@@ -101,6 +120,10 @@ impl DeveloperCalibrationRecorder {
         self.capabilities = normalized;
         self.operations.clear();
         self.callbacks.clear();
+        self.baselines.clear();
+        self.baseline_targets.clear();
+        self.required_restorations.clear();
+        self.observed_states.clear();
         Ok(self.status())
     }
 
@@ -131,6 +154,14 @@ impl DeveloperCalibrationRecorder {
                 .iter()
                 .filter(|operation| is_write_route(&operation.route))
                 .count(),
+            baseline_count: self.baselines.len(),
+            restored_baseline_count: self
+                .baselines
+                .iter()
+                .filter(|(key, baseline)| self.observed_states.get(*key) == Some(*baseline))
+                .count(),
+            restoration_verified: self.restoration_report().0,
+            restoration_error: self.restoration_report().1,
         }
     }
 
@@ -196,6 +227,7 @@ impl DeveloperCalibrationRecorder {
                 dropped: 0,
                 verification: None,
             },
+            baseline_state: None,
             expected_normalized_state: json!({"captured": true}),
             captured_at: Utc::now().to_rfc3339(),
         });
@@ -258,6 +290,7 @@ impl DeveloperCalibrationRecorder {
                 dropped: 0,
                 verification: None,
             },
+            baseline_state: None,
             expected_normalized_state: json!({"captured": true}),
             captured_at: Utc::now().to_rfc3339(),
         });
@@ -282,6 +315,50 @@ impl DeveloperCalibrationRecorder {
         }
     }
 
+    pub(crate) fn record_baseline(&mut self, route: &str, identity: Value, state: Value) {
+        if self.metadata.is_none() || !requires_restoration(route) {
+            return;
+        }
+        let key = state_key(route, &identity);
+        self.required_restorations.insert(key.clone());
+        self.baselines.entry(key.clone()).or_insert(state);
+        self.baseline_targets
+            .entry(key)
+            .or_insert(CalibrationRestorationTarget {
+                route: route.into(),
+                identity,
+            });
+    }
+
+    pub(crate) fn require_baseline(&mut self, route: &str, identity: Value) {
+        if self.metadata.is_some() && requires_restoration(route) {
+            let key = state_key(route, &identity);
+            self.required_restorations.insert(key.clone());
+            self.baseline_targets
+                .entry(key)
+                .or_insert(CalibrationRestorationTarget {
+                    route: route.into(),
+                    identity,
+                });
+        }
+    }
+
+    pub(crate) fn prepare_final_verification(&mut self) -> Vec<CalibrationRestorationTarget> {
+        self.observed_states.clear();
+        self.required_restorations
+            .iter()
+            .filter_map(|key| self.baseline_targets.get(key).cloned())
+            .collect()
+    }
+
+    pub(crate) fn record_restored_state(&mut self, route: &str, identity: Value, state: Value) {
+        if self.metadata.is_none() || !requires_restoration(route) {
+            return;
+        }
+        let key = state_key(route, &identity);
+        self.observed_states.insert(key, state);
+    }
+
     pub(crate) fn record_callbacks(&mut self, records: &[GatewayRecord]) {
         if self.metadata.is_none() {
             return;
@@ -293,7 +370,7 @@ impl DeveloperCalibrationRecorder {
         );
     }
 
-    pub(crate) fn finish(&mut self, restored: bool) -> AppResult<DeveloperCalibrationExport> {
+    pub(crate) fn finish(&self, manually_restored: bool) -> AppResult<DeveloperCalibrationExport> {
         let Some(metadata) = self.metadata.clone() else {
             return Err(AppError::new(
                 "calibration_inactive",
@@ -317,13 +394,15 @@ impl DeveloperCalibrationRecorder {
             .iter()
             .filter(|operation| is_write_route(&operation.route))
             .count();
-        if write_operation_count > 0 && !restored {
+        let (restoration_verified, restoration_error) = self.restoration_report();
+        if write_operation_count > 0 && !restoration_verified {
             return Err(AppError::new(
                 "calibration_not_restored",
-                "检测到真实写操作，必须确认公告、名片、禁言和全群状态均已恢复",
+                format!("真实回读未确认所有状态已恢复：{restoration_error}"),
             ));
         }
         let status = self.status();
+        let (baselines, observed_states) = self.restoration_evidence();
         let capture = json!({
             "version": 2,
             "metadata": {
@@ -337,15 +416,79 @@ impl DeveloperCalibrationRecorder {
             "operations": self.operations,
             "callbacks": self.callbacks,
             "expectedNormalizedState": {
-                "restored": restored,
+                "restored": restoration_verified,
+                "restorationError": restoration_error,
+                "manualRestoredAcknowledged": manually_restored,
+                "baselines": baselines,
+                "observedStates": observed_states,
                 "operationCount": status.operation_count,
                 "callbackCount": status.callback_count,
                 "writeOperationCount": write_operation_count,
                 "capabilities": status.capabilities,
             },
         });
-        *self = Self::default();
         Ok(DeveloperCalibrationExport { capture, status })
+    }
+
+    pub(crate) fn commit(&mut self) {
+        *self = Self::default();
+    }
+
+    fn restoration_evidence(&self) -> (Vec<Value>, Vec<Value>) {
+        let evidence = |states: &BTreeMap<String, Value>| {
+            states
+                .iter()
+                .filter_map(|(key, state)| {
+                    let target = self.baseline_targets.get(key)?;
+                    Some(json!({
+                        "family": restoration_family(&target.route),
+                        "identity": target.identity.clone(),
+                        "state": state.clone(),
+                    }))
+                })
+                .collect::<Vec<_>>()
+        };
+        (evidence(&self.baselines), evidence(&self.observed_states))
+    }
+
+    fn restoration_report(&self) -> (bool, String) {
+        if self.required_restorations.is_empty() {
+            return (true, String::new());
+        }
+        let mut missing = BTreeSet::new();
+        let mut mismatched = BTreeSet::new();
+        for key in &self.required_restorations {
+            match (self.baselines.get(key), self.observed_states.get(key)) {
+                (None, _) => {
+                    missing.insert(key.clone());
+                }
+                (Some(_), None) => {
+                    missing.insert(key.clone());
+                }
+                (Some(baseline), Some(observed)) if observed != baseline => {
+                    mismatched.insert(key.clone());
+                }
+                (Some(_), Some(_)) => {}
+            }
+        }
+        if missing.is_empty() && mismatched.is_empty() {
+            (true, String::new())
+        } else {
+            let mut parts = Vec::new();
+            if !missing.is_empty() {
+                parts.push(format!(
+                    "缺少基线或最终回读：{}",
+                    missing.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if !mismatched.is_empty() {
+                parts.push(format!(
+                    "最终状态与基线不一致：{}",
+                    mismatched.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            (false, parts.join("；"))
+        }
     }
 }
 
@@ -414,6 +557,33 @@ fn is_write_route(route: &str) -> bool {
     WRITE_ROUTES.contains(&route)
 }
 
+fn requires_restoration(route: &str) -> bool {
+    matches!(
+        route,
+        "/v1/group/set-member-mute"
+            | "/v1/group/member-mute-cancel"
+            | "/v1/group/set-member-nickname"
+            | "nim.updateNickInTeam"
+            | "/v1/group/set-group-mute"
+            | "/v1/group/add-notice"
+            | "/v1/group/notice-opt"
+    )
+}
+
+fn state_key(route: &str, identity: &Value) -> String {
+    format!("{}:{identity}", restoration_family(route))
+}
+
+fn restoration_family(route: &str) -> &str {
+    match route {
+        "/v1/group/set-member-mute" | "/v1/group/member-mute-cancel" => "member-mute",
+        "/v1/group/set-member-nickname" | "nim.updateNickInTeam" => "member-rename",
+        "/v1/group/add-notice" | "/v1/group/notice-opt" => "group-notice",
+        "/v1/group/set-group-mute" => "group-mute",
+        _ => route,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +609,10 @@ mod tests {
     fn write_capture_requires_restoration_confirmation() {
         let mut recorder = DeveloperCalibrationRecorder::default();
         recorder.start(metadata(), vec!["mute".into()]).unwrap();
+        recorder.require_baseline(
+            "/v1/group/set-member-mute",
+            json!({"groupId": 1, "userId": 2}),
+        );
         recorder.record_ipc(
             "/v1/group/set-member-mute",
             "request",
@@ -461,6 +635,41 @@ mod tests {
             recorder.finish(false).unwrap_err().code,
             "calibration_not_restored"
         );
-        assert!(recorder.finish(true).is_ok());
+        assert!(recorder.status().active);
+        recorder.record_restored_state(
+            "/v1/group/member-mute-cancel",
+            json!({"groupId": 1, "userId": 2}),
+            json!({"muted": false}),
+        );
+        recorder.record_baseline(
+            "/v1/group/set-member-mute",
+            json!({"groupId": 1, "userId": 2}),
+            json!({"muted": false}),
+        );
+        recorder.record_restored_state(
+            "/v1/group/member-mute-cancel",
+            json!({"groupId": 1, "userId": 2}),
+            json!({"muted": false}),
+        );
+        let targets = recorder.prepare_final_verification();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            recorder.finish(true).unwrap_err().code,
+            "calibration_not_restored"
+        );
+        recorder.record_restored_state(
+            "/v1/group/member-mute-cancel",
+            json!({"groupId": 1, "userId": 2}),
+            json!({"muted": false}),
+        );
+        let exported = recorder.finish(true).unwrap();
+        let baselines = exported.capture["expectedNormalizedState"]["baselines"]
+            .as_array()
+            .unwrap();
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0]["family"], "member-mute");
+        assert_eq!(baselines[0]["identity"]["groupId"], 1);
+        recorder.commit();
+        assert!(!recorder.status().active);
     }
 }
