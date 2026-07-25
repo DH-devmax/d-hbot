@@ -39,6 +39,7 @@ assert(/--bin\s+dh-bot/.test(productionRustBuild), '生产 Rust 构建未限定 
 assert(!/--features\s+fixture/.test(productionRustBuild), '生产 Rust 构建启用了 fixture feature')
 assert(developer.productName === 'DH BOT Dev', '开发产品名必须为 DH BOT Dev')
 assert(/--features\s+fixture/.test(developerBuild), '开发 Tauri 构建应启用 fixture feature')
+assert(/--features\s+fixture,custom-protocol/.test(developerBuild), '开发 release 构建应启用 custom-protocol feature')
 assert(developerResources.some(resource => String(resource).includes('resources/tools')), '开发 Tauri 配置缺少 Fixture 资源')
 
 console.log('生产/开发构建边界校验通过')

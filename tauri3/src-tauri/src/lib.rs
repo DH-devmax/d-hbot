@@ -4,6 +4,8 @@ mod ai;
 mod bridge;
 mod build_channel;
 mod business_apps;
+#[cfg(feature = "fixture")]
+mod calibration;
 mod cardnames;
 mod contracts;
 mod database;
@@ -40,9 +42,13 @@ use build_channel::BuildChannel;
 use business_apps::{
     BusinessAppContext, BusinessAppHealth, BusinessAppRegistry, PREDICTION_APP_ID,
 };
+#[cfg(feature = "fixture")]
+use calibration::{CalibrationMetadata, DeveloperCalibrationStatus};
 use database::{Database, DatabaseExecutor, DatabaseStatus};
 use diagnostics::redact;
 use error::{AppError, AppResult};
+#[cfg(feature = "fixture")]
+use gateway::ConnectionStatus;
 use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
     ActionRecord, AuditEvent, BusinessAppRecord, BusinessAppRun, CardPlan, CardPreview,
@@ -516,6 +522,167 @@ fn start_fixture_host(app: tauri::AppHandle, state: State<'_, AppState>) -> AppR
     let capabilities = state.gateway.calibrate_capabilities(&version, &script_hash);
     let _ = app.emit("gateway-capabilities", capabilities);
     Ok(fixture.display().to_string())
+}
+
+#[cfg(feature = "fixture")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeveloperCalibrationCaptureResult {
+    path: String,
+    status: DeveloperCalibrationStatus,
+}
+
+#[cfg(feature = "fixture")]
+async fn calibration_metadata(state: &State<'_, AppState>) -> AppResult<CalibrationMetadata> {
+    if state.paths.runtime_mode() != "real"
+        || state.paths.default_devtools_url() != "http://127.0.0.1:9222"
+    {
+        return Err(AppError::new(
+            "calibration_environment",
+            "真实校准只能连接真实旺商聊 127.0.0.1:9222，Fixture、9233 和 51300 均不可用",
+        ));
+    }
+    let diagnostic = state.gateway.diagnose().await;
+    if diagnostic.status != ConnectionStatus::Ready {
+        return Err(AppError::new(
+            "calibration_not_ready",
+            format!("旺商聊 NIM 尚未就绪：{}", diagnostic.detail),
+        ));
+    }
+    let configured_path = state
+        .database_executor
+        .get_setting("wangshangliao.path".into())
+        .await?
+        .filter(|value| !value.trim().is_empty());
+    let process = platform::running_process_identity_for(configured_path)
+        .await?
+        .ok_or_else(|| {
+            AppError::new("calibration_process", "没有找到当前 9222 对应的旺商聊进程")
+        })?;
+    let profile = platform::profile_status(Some(process.image_path)).await?;
+    if profile.script_hash.len() != 64 {
+        return Err(AppError::new(
+            "calibration_script",
+            "无法读取旺商聊主脚本 SHA-256，拒绝开始校准",
+        ));
+    }
+    Ok(CalibrationMetadata {
+        app_file_version: process.file_version,
+        main_script_sha256: profile.script_hash,
+        page_title: diagnostic.page_title,
+        page_url: diagnostic.page_url,
+    })
+}
+
+#[cfg(feature = "fixture")]
+#[tauri::command]
+async fn begin_developer_calibration(
+    state: State<'_, AppState>,
+    capabilities: Vec<String>,
+) -> AppResult<DeveloperCalibrationStatus> {
+    let metadata = calibration_metadata(&state).await?;
+    state
+        .gateway
+        .begin_developer_calibration(metadata, capabilities)
+        .await
+}
+
+#[cfg(feature = "fixture")]
+#[tauri::command]
+fn get_developer_calibration_status(state: State<'_, AppState>) -> DeveloperCalibrationStatus {
+    state.gateway.developer_calibration_status()
+}
+
+#[cfg(feature = "fixture")]
+#[tauri::command]
+fn cancel_developer_calibration(
+    state: State<'_, AppState>,
+) -> AppResult<DeveloperCalibrationStatus> {
+    state.gateway.cancel_developer_calibration()
+}
+
+#[cfg(feature = "fixture")]
+#[tauri::command]
+async fn finish_developer_calibration(
+    state: State<'_, AppState>,
+    restored: bool,
+) -> AppResult<DeveloperCalibrationCaptureResult> {
+    let finalization = state
+        .gateway
+        .begin_developer_calibration_finalization()
+        .await?;
+    state
+        .gateway
+        .verify_developer_calibration_restoration()
+        .await?;
+    let exported = state.gateway.finish_developer_calibration(restored)?;
+    let output_directory = state
+        .paths
+        .root
+        .join("developer")
+        .join("contracts")
+        .join("raw");
+    std::fs::create_dir_all(&output_directory).map_err(|error| {
+        AppError::new(
+            "calibration_write",
+            format!("创建本机校准目录失败：{error}"),
+        )
+    })?;
+    let version = exported.status.app_file_version.replace(['.', ' '], "-");
+    let file_name = format!(
+        "wangshangliao-{version}-{}-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S-%3f"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8],
+    );
+    let output = output_directory.join(file_name);
+    let temporary = output.with_extension("json.tmp");
+    let serialized = serde_json::to_vec_pretty(&exported.capture).map_err(|error| {
+        AppError::new(
+            "calibration_serialize",
+            format!("序列化 Contract v2 失败：{error}"),
+        )
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| {
+            AppError::new(
+                "calibration_write",
+                format!("创建本机 Contract v2 失败：{error}"),
+            )
+        })?;
+    std::io::Write::write_all(&mut file, &serialized).map_err(|error| {
+        AppError::new(
+            "calibration_write",
+            format!("写入本机 Contract v2 失败：{error}"),
+        )
+    })?;
+    std::io::Write::write_all(&mut file, b"\n").map_err(|error| {
+        AppError::new(
+            "calibration_write",
+            format!("完成本机 Contract v2 失败：{error}"),
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        AppError::new(
+            "calibration_write",
+            format!("刷新本机 Contract v2 到磁盘失败：{error}"),
+        )
+    })?;
+    drop(file);
+    std::fs::rename(&temporary, &output).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        AppError::new(
+            "calibration_write",
+            format!("提交本机 Contract v2 原子文件失败：{error}"),
+        )
+    })?;
+    finalization.commit()?;
+    Ok(DeveloperCalibrationCaptureResult {
+        path: output.display().to_string(),
+        status: exported.status,
+    })
 }
 
 #[tauri::command]
@@ -3263,7 +3430,11 @@ pub fn run() {
     let builder = builder.invoke_handler(dh_handlers![
         get_runtime_mode,
         set_runtime_mode,
-        start_fixture_host
+        start_fixture_host,
+        begin_developer_calibration,
+        get_developer_calibration_status,
+        cancel_developer_calibration,
+        finish_developer_calibration
     ]);
     #[cfg(not(feature = "fixture"))]
     let builder = builder.invoke_handler(dh_handlers![]);

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +17,8 @@ use crate::database::DatabaseExecutor;
 use crate::diagnostics::{redact, Logger};
 use crate::error::{AppError, AppResult};
 use crate::gateway::{
-    ConnectionStatus, GatewayEvent, GatewayReceipt, GatewayRecord, GatewayRecordKind,
-    RuntimeGateway,
+    AutomaticWritePermit, ConnectionStatus, GatewayEvent, GatewayReceipt, GatewayRecord,
+    GatewayRecordKind, RuntimeGateway,
 };
 use crate::models::{
     Account, ActionRecord, AuditEvent, DailySummary, EffectOutboxItem, EffectOutboxRequest,
@@ -203,6 +202,10 @@ impl BackendRuntime {
         workers.push(tauri::async_runtime::spawn(async move {
             connection.connection_loop(connection_app).await;
         }));
+        let roster_sync = self.clone();
+        workers.push(tauri::async_runtime::spawn(async move {
+            roster_sync.roster_sync_loop().await;
+        }));
         let reminders = self.clone();
         let reminders_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
@@ -228,6 +231,12 @@ impl BackendRuntime {
         payload: Value,
         dedupe_key: String,
     ) -> AppResult<()> {
+        if self.gateway.calibration_active() {
+            return Err(AppError::new(
+                "calibration_active",
+                "真实校准期间已暂停自动副作用，避免后台任务修改测试群状态",
+            ));
+        }
         self.database
             .enqueue_effect(EffectOutboxRequest {
                 account_id: account_id.into(),
@@ -261,14 +270,11 @@ impl BackendRuntime {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((_, account_id)) = self.gateway.session_identity().await {
-                    if let Ok(items) = self
-                        .database
-                        .claim_effect_outbox(Some(account_id), 50)
-                        .await
+                    if let Ok(Some((permit, item))) =
+                        self.claim_effect_for_dispatch(account_id).await
                     {
-                        for item in items {
-                            self.dispatch_effect(Some(&app), item).await;
-                        }
+                        self.dispatch_effect_permitted(Some(&app), item, &permit)
+                            .await;
                     }
                 }
             }
@@ -279,7 +285,26 @@ impl BackendRuntime {
         }
     }
 
-    async fn dispatch_effect(&self, app: Option<&AppHandle>, item: EffectOutboxItem) {
+    async fn claim_effect_for_dispatch(
+        &self,
+        account_id: String,
+    ) -> AppResult<Option<(AutomaticWritePermit, EffectOutboxItem)>> {
+        let permit = self.gateway.automatic_write_permit().await?;
+        let item = self
+            .database
+            .claim_effect_outbox(Some(account_id), 1)
+            .await?
+            .into_iter()
+            .next();
+        Ok(item.map(|item| (permit, item)))
+    }
+
+    async fn dispatch_effect_permitted(
+        &self,
+        app: Option<&AppHandle>,
+        item: EffectOutboxItem,
+        _permit: &AutomaticWritePermit,
+    ) {
         let payload: Value = serde_json::from_str(&item.payload_json).unwrap_or(Value::Null);
         let user_id = payload.get("userId").and_then(Value::as_i64).unwrap_or(0);
         let duration = payload
@@ -789,11 +814,12 @@ impl BackendRuntime {
     async fn reminder_loop(&self, app: AppHandle) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
-                if let Ok(tasks) = self
-                    .database
-                    .claim_due_task_reminders(self.clock.now_utc(), 20)
-                    .await
-                {
+                if let Ok(_permit) = self.gateway.automatic_write_permit().await {
+                    let tasks = self
+                        .database
+                        .claim_due_task_reminders(self.clock.now_utc(), 1)
+                        .await
+                        .unwrap_or_default();
                     for task in tasks {
                         let text = format!(
                             "任务提醒：{}{}",
@@ -866,88 +892,92 @@ impl BackendRuntime {
                 == Some("paused");
             if !globally_paused && self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((sender_id, account_id)) = self.gateway.session_identity().await {
-                    if let Ok(Some(job)) =
-                        self.database.claim_next_card_job(account_id.clone()).await
-                    {
-                        let paused = self
-                            .database
-                            .get_setting(format!("card.paused.{}.{}", job.account_id, job.group_id))
-                            .await
-                            .ok()
-                            .flatten()
-                            .as_deref()
-                            == Some("true");
-                        let result = if paused {
-                            Err(AppError::new("card_queue_paused", "群名片队列已暂停"))
-                        } else if !self.is_group_manager(sender_id, job.group_id).await {
-                            Err(AppError::new(
-                                "management_required",
-                                "需要将账号权限设置为管理",
-                            ))
-                        } else {
-                            self.gateway
-                                .rename(
-                                    job.group_id,
-                                    &MemberRef {
-                                        user_id: Some(job.user_id),
-                                        nim_id: (!job.nim_id.is_empty())
-                                            .then(|| job.nim_id.clone()),
-                                    },
-                                    &job.desired_name,
-                                )
-                                .await
-                                .map(|_| ())
-                        };
-                        let result = match result {
-                            Ok(()) => {
-                                sleep(Duration::from_millis(500)).await;
-                                match self.gateway.list_members(job.group_id).await {
-                                    Ok(roster) => {
-                                        if roster.members.iter().any(|member| {
-                                            (member.user_id == job.user_id
-                                                || (!job.nim_id.is_empty()
-                                                    && member.nim_id == job.nim_id))
-                                                && member.card_name == job.desired_name
-                                        }) {
-                                            Ok(())
-                                        } else {
-                                            Err(AppError::new(
-                                                "card_verify",
-                                                "群名片修改回执成功，但重新读取后尚未生效",
-                                            )
-                                            .retryable())
-                                        }
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        };
-                        let (success, error) = match result {
-                            Ok(()) => (true, String::new()),
-                            Err(error) => (false, error.message),
-                        };
-                        let _ = self
-                            .database
-                            .finish_card_job(job.clone(), success, error.clone())
-                            .await;
-                        if success && job.welcome_pending {
-                            let welcome = self
+                    if let Ok(_permit) = self.gateway.automatic_write_permit().await {
+                        if let Ok(Some(job)) =
+                            self.database.claim_next_card_job(account_id.clone()).await
+                        {
+                            let paused = self
                                 .database
-                                .list_groups(Some(job.account_id.clone()))
+                                .get_setting(format!(
+                                    "card.paused.{}.{}",
+                                    job.account_id, job.group_id
+                                ))
                                 .await
                                 .ok()
-                                .and_then(|groups| {
-                                    groups
-                                        .into_iter()
-                                        .find(|group| group.group_id == job.group_id)
-                                })
-                                .map(|group| group.welcome_message)
-                                .unwrap_or_default();
-                            if welcome.trim().is_empty() {
-                                let _ = self.database.mark_card_welcome_sent(job.id).await;
+                                .flatten()
+                                .as_deref()
+                                == Some("true");
+                            let result = if paused {
+                                Err(AppError::new("card_queue_paused", "群名片队列已暂停"))
+                            } else if !self.is_group_manager(sender_id, job.group_id).await {
+                                Err(AppError::new(
+                                    "management_required",
+                                    "需要将账号权限设置为管理",
+                                ))
                             } else {
-                                let _ = self.enqueue_text_effect(
+                                self.gateway
+                                    .rename(
+                                        job.group_id,
+                                        &MemberRef {
+                                            user_id: Some(job.user_id),
+                                            nim_id: (!job.nim_id.is_empty())
+                                                .then(|| job.nim_id.clone()),
+                                        },
+                                        &job.desired_name,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            };
+                            let result = match result {
+                                Ok(()) => {
+                                    sleep(Duration::from_millis(500)).await;
+                                    match self.gateway.list_members(job.group_id).await {
+                                        Ok(roster) => {
+                                            if roster.members.iter().any(|member| {
+                                                (member.user_id == job.user_id
+                                                    || (!job.nim_id.is_empty()
+                                                        && member.nim_id == job.nim_id))
+                                                    && member.card_name == job.desired_name
+                                            }) {
+                                                Ok(())
+                                            } else {
+                                                Err(AppError::new(
+                                                    "card_verify",
+                                                    "群名片修改回执成功，但重新读取后尚未生效",
+                                                )
+                                                .retryable())
+                                            }
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            };
+                            let (success, error) = match result {
+                                Ok(()) => (true, String::new()),
+                                Err(error) => (false, error.message),
+                            };
+                            let _ = self
+                                .database
+                                .finish_card_job(job.clone(), success, error.clone())
+                                .await;
+                            if success && job.welcome_pending {
+                                let welcome = self
+                                    .database
+                                    .list_groups(Some(job.account_id.clone()))
+                                    .await
+                                    .ok()
+                                    .and_then(|groups| {
+                                        groups
+                                            .into_iter()
+                                            .find(|group| group.group_id == job.group_id)
+                                    })
+                                    .map(|group| group.welcome_message)
+                                    .unwrap_or_default();
+                                if welcome.trim().is_empty() {
+                                    let _ = self.database.mark_card_welcome_sent(job.id).await;
+                                } else {
+                                    let _ = self.enqueue_text_effect(
                                     &job.account_id,
                                     job.group_id,
                                     &welcome.replace("[成员]", &job.desired_name),
@@ -955,27 +985,27 @@ impl BackendRuntime {
                                     format!("card-welcome:{}", job.id),
                                     serde_json::json!({"cardJobId":job.id,"userId":job.user_id}),
                                 ).await;
+                                }
                             }
-                        }
-                        let _ = self
-                            .database
-                            .record_audit(AuditEvent {
-                                id: 0,
-                                account_id: job.account_id.clone(),
-                                group_id: job.group_id,
-                                user_id: job.user_id,
-                                actor: "DH BOT".into(),
-                                event: "card_rename_job".into(),
-                                level: if success { "info" } else { "error" }.into(),
-                                details: if success {
-                                    format!("群名片已改为“{}”", job.desired_name)
-                                } else {
-                                    error.clone()
-                                },
-                                created_at: Utc::now(),
-                            })
-                            .await;
-                        let _ = app.emit(
+                            let _ = self
+                                .database
+                                .record_audit(AuditEvent {
+                                    id: 0,
+                                    account_id: job.account_id.clone(),
+                                    group_id: job.group_id,
+                                    user_id: job.user_id,
+                                    actor: "DH BOT".into(),
+                                    event: "card_rename_job".into(),
+                                    level: if success { "info" } else { "error" }.into(),
+                                    details: if success {
+                                        format!("群名片已改为“{}”", job.desired_name)
+                                    } else {
+                                        error.clone()
+                                    },
+                                    created_at: Utc::now(),
+                                })
+                                .await;
+                            let _ = app.emit(
                             "task-progress",
                             serde_json::json!({
                                 "kind":"cardRename",
@@ -985,11 +1015,12 @@ impl BackendRuntime {
                                 "error":error
                             }),
                         );
-                        tokio::select! {
-                            _ = sleep(Duration::from_millis(500)) => {},
-                            _ = self.shutdown.cancelled() => break,
+                            tokio::select! {
+                                _ = sleep(Duration::from_millis(500)) => {},
+                                _ = self.shutdown.cancelled() => break,
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
             }
@@ -1014,28 +1045,68 @@ impl BackendRuntime {
             .unwrap_or(false)
     }
 
-    async fn sync_members(&self, account_id: &str, sender_id: i64, session_epoch: u64) {
-        if self.gateway.session_epoch() != session_epoch {
-            return;
+    async fn roster_sync_loop(&self) {
+        let mut delay = Duration::from_secs(5);
+        loop {
+            tokio::select! {
+                _ = sleep(delay) => {},
+                _ = self.shutdown.cancelled() => break,
+            }
+            if !self.gateway.calibration_active()
+                && self.gateway.diagnose().await.status == ConnectionStatus::Ready
+            {
+                if let Ok((_, account_id)) = self.gateway.session_identity().await {
+                    self.sync_members(&account_id).await;
+                }
+            }
+            delay = Duration::from_secs(600);
         }
-        if self.gateway.member_sync_paused() {
-            self.logger
-                .write("WARN", "旺商聊成员同步已暂停，等待限流退避结束");
+    }
+
+    async fn sync_members(&self, account_id: &str) {
+        let session_epoch = self.gateway.session_epoch();
+        if self.gateway.calibration_active() || self.gateway.member_sync_paused() {
             return;
         }
         let groups = match self.gateway.list_groups().await {
             Ok(groups) => groups,
-            Err(_) => return,
+            Err(error) => {
+                self.logger.write(
+                    "WARN",
+                    &format!("群成员对账无法读取群列表：{}", error.message),
+                );
+                return;
+            }
         };
+        let enabled_group_ids = self
+            .database
+            .list_groups(Some(account_id.to_string()))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|group| group.enabled)
+            .map(|group| group.group_id)
+            .collect::<HashSet<_>>();
+        let mut synced_enabled_group = false;
         for group in groups {
-            if self.gateway.session_epoch() != session_epoch {
-                break;
+            if self.gateway.calibration_active()
+                || self.gateway.session_epoch() != session_epoch
+                || self.gateway.member_sync_paused()
+            {
+                return;
             }
-            if self.gateway.member_sync_paused() {
-                self.logger
-                    .write("WARN", "旺商聊成员同步触发限流，后台同步进入退避");
-                break;
+            let _ = self.database.upsert_group(group.clone()).await;
+            if !enabled_group_ids.contains(&group.group_id) {
+                continue;
             }
+            if synced_enabled_group {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(2)) => {},
+                    _ = self.shutdown.cancelled() => return,
+                }
+            }
+            synced_enabled_group = true;
+            self.gateway.invalidate_member_cache(group.group_id).await;
             let snapshot_started_at = Utc::now();
             let roster = match self.gateway.list_members(group.group_id).await {
                 Ok(roster) => roster,
@@ -1049,47 +1120,18 @@ impl BackendRuntime {
                             "reportedCount": 0,
                             "resolvedCount": 0,
                             "complete": false,
-                            "completenessReason": error.message.clone(),
+                            "completenessReason": error.message,
                         }),
                     );
-                    self.logger.write(
-                        "WARN",
-                        &format!(
-                            "群 {} 成员同步失败：{}{}",
-                            group.group_id,
-                            error.message,
-                            if self.gateway.member_sync_paused() {
-                                "；后台同步已暂停"
-                            } else {
-                                ""
-                            }
-                        ),
-                    );
-                    if self.gateway.member_sync_paused() {
-                        break;
-                    }
-                    continue;
+                    return;
                 }
             };
-            if self.gateway.session_epoch() != session_epoch {
-                break;
+            if roster.authority != "authoritative"
+                || !roster.source_errors.is_empty()
+                || self.gateway.session_epoch() != session_epoch
+            {
+                continue;
             }
-            self.events.emit(
-                "member-roster-status",
-                serde_json::json!({
-                    "accountId": account_id,
-                    "groupId": group.group_id,
-                    "status": roster.status.clone(),
-                    "reportedCount": roster.reported_count,
-                    "resolvedCount": roster.resolved_count,
-                    "complete": roster.complete,
-                    "completenessReason": roster.completeness_reason.clone(),
-                    "retryAt": roster.retry_at.clone(),
-                    "canonicalCount": roster.canonical_count,
-                    "syntheticUserIds": roster.synthetic_user_ids.clone(),
-                    "sourceErrors": roster.source_errors.clone(),
-                }),
-            );
             let existing = self
                 .database
                 .list_members(account_id.to_string(), group.group_id)
@@ -1098,22 +1140,22 @@ impl BackendRuntime {
             let baseline = existing.is_empty();
             let mut present_ids = HashSet::new();
             let mut newly_discovered = HashSet::new();
+            let mut card_candidate_ids = HashSet::new();
             for mut member in roster.members {
                 member.account_id = account_id.to_string();
-                if let Some(saved) = existing.iter().find(|saved| {
+                let is_new = if let Some(saved) = existing.iter().find(|saved| {
                     saved.user_id == member.user_id
                         || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
                 }) {
-                    member.original_card_name = saved.original_card_name.clone();
-                    member.managed_card_name = saved.managed_card_name.clone();
-                    member.card_suffix = saved.card_suffix.clone();
-                    member.locked_card_name = saved.locked_card_name.clone();
-                    member.violation_count = saved.violation_count;
-                    member.blacklisted = saved.blacklisted;
-                    member.join_source = saved.join_source.clone();
-                    member.prompt_read = saved.prompt_read;
-                    member.discovered_at = saved.discovered_at;
-                    member.joined_at = saved.joined_at;
+                    merge_managed_member_state(&mut member, saved);
+                    if !saved.present {
+                        let now = Utc::now();
+                        member.join_source = "offline-discovered".into();
+                        member.joined_at = Some(now);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     let now = Utc::now();
                     member.original_card_name = member.card_name.clone();
@@ -1126,15 +1168,21 @@ impl BackendRuntime {
                     member.prompt_read = baseline;
                     member.discovered_at = now;
                     member.joined_at = (!baseline).then_some(now);
-                    newly_discovered.insert(member.user_id);
-                }
+                    true
+                };
                 member.present = true;
                 member.last_seen_at = Utc::now();
                 member.updated_at = member.last_seen_at;
                 if let Ok(canonical_user_id) = self.database.upsert_member(member.clone()).await {
                     present_ids.insert(canonical_user_id);
+                    if is_new {
+                        newly_discovered.insert(canonical_user_id);
+                        if !member.blacklisted {
+                            card_candidate_ids.insert(canonical_user_id);
+                        }
+                    }
                 }
-                if !baseline && newly_discovered.contains(&member.user_id) && member.blacklisted {
+                if !baseline && is_new && member.blacklisted {
                     let queued = self
                         .enqueue_effect(
                             account_id,
@@ -1148,10 +1196,8 @@ impl BackendRuntime {
                                 "reason": "blacklisted_member_rejoined",
                             }),
                             format!(
-                                "blacklist-roster-rejoin:{account_id}:{}:{}:{}",
-                                group.group_id,
-                                member.user_id,
-                                member.discovered_at.timestamp_millis()
+                                "blacklist-roster-rejoin:{account_id}:{}:{}",
+                                group.group_id, member.user_id
                             ),
                         )
                         .await
@@ -1166,87 +1212,116 @@ impl BackendRuntime {
                             actor: "DH BOT".into(),
                             event: "blacklisted_member_rejoined".into(),
                             level: if queued { "info" } else { "error" }.into(),
-                            details: if queued {
-                                "黑名单成员重新入群，已进入自动移出队列"
-                            } else {
-                                "黑名单成员重新入群，自动移出入队失败"
-                            }
-                            .into(),
+                            details: "名单对账发现黑名单成员重新入群".into(),
                             created_at: Utc::now(),
                         })
                         .await;
                 }
             }
-            let automatic = self
-                .database
-                .get_setting(format!("card.auto.{account_id}.{}", group.group_id))
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("true");
-            if !baseline && automatic && !newly_discovered.is_empty() {
-                let prefix = self
-                    .database
-                    .get_setting(format!("card.prefix.{account_id}.{}", group.group_id))
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "DH".into());
-                if let Ok(preview) = crate::cardnames::preview(
-                    group.group_id,
-                    &prefix,
-                    self.database
-                        .list_members(account_id.to_string(), group.group_id)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|member| member.present)
-                        .collect(),
-                    sender_id,
-                ) {
-                    for plan in preview.items.into_iter().filter(|plan| {
-                        plan.status == "planned" && newly_discovered.contains(&plan.member.user_id)
-                    }) {
-                        let _ = self
-                            .database
-                            .enqueue_card_job(account_id.to_string(), group.group_id, plan, false)
-                            .await;
-                    }
-                }
-            }
-            if roster.authority == "authoritative"
-                && !baseline
-                && self.gateway.session_epoch() == session_epoch
-            {
-                let missing = self
-                    .database
-                    .mark_members_not_present_before(
-                        account_id.to_string(),
+            if !baseline && !card_candidate_ids.is_empty() {
+                if let Err(error) = self
+                    .enqueue_discovered_member_card_jobs(
+                        account_id,
                         group.group_id,
-                        present_ids.iter().copied().collect::<Vec<_>>(),
-                        snapshot_started_at,
+                        &card_candidate_ids,
                     )
                     .await
-                    .unwrap_or_default();
-                for member in missing {
-                    let _ = self
-                        .database
-                        .record_audit(AuditEvent {
-                            id: 0,
-                            account_id: account_id.into(),
-                            group_id: group.group_id,
-                            user_id: member.user_id,
-                            actor: "DH BOT".into(),
-                            event: "member_left".into(),
-                            level: "info".into(),
-                            details: "成员同步确认已离群".into(),
-                            created_at: Utc::now(),
-                        })
-                        .await;
+                {
+                    self.logger.write(
+                        "WARN",
+                        &format!("离线新增成员自动群名片入队失败：{}", error.message),
+                    );
                 }
             }
+            if self.gateway.session_epoch() != session_epoch {
+                return;
+            }
+            let missing = self
+                .database
+                .mark_members_not_present_before(
+                    account_id.to_string(),
+                    group.group_id,
+                    present_ids.into_iter().collect(),
+                    snapshot_started_at,
+                )
+                .await
+                .unwrap_or_default();
+            let missing_count = missing.len();
+            for member in missing {
+                let _ = self
+                    .database
+                    .record_audit(AuditEvent {
+                        id: 0,
+                        account_id: account_id.into(),
+                        group_id: group.group_id,
+                        user_id: member.user_id,
+                        actor: "DH BOT".into(),
+                        event: "member_left".into(),
+                        level: "info".into(),
+                        details: "名单对账确认成员已离群".into(),
+                        created_at: Utc::now(),
+                    })
+                    .await;
+            }
+            self.events.emit(
+                "member-roster-status",
+                serde_json::json!({
+                    "accountId": account_id,
+                    "groupId": group.group_id,
+                    "status": roster.status,
+                    "reportedCount": roster.reported_count,
+                    "resolvedCount": roster.resolved_count,
+                    "complete": roster.complete,
+                    "source": "background-reconciliation",
+                    "newlyDiscovered": newly_discovered.len(),
+                    "missing": missing_count,
+                }),
+            );
+            if self.gateway.member_sync_paused() {
+                return;
+            }
         }
+    }
+
+    async fn enqueue_discovered_member_card_jobs(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        member_ids: &HashSet<i64>,
+    ) -> AppResult<()> {
+        if self
+            .database
+            .get_setting(format!("card.auto.{account_id}.{group_id}"))
+            .await?
+            .as_deref()
+            != Some("true")
+        {
+            return Ok(());
+        }
+        let prefix = self
+            .database
+            .get_setting(format!("card.prefix.{account_id}.{group_id}"))
+            .await?
+            .unwrap_or_else(|| "DH".into());
+        let members = self
+            .database
+            .list_members(account_id.to_string(), group_id)
+            .await?
+            .into_iter()
+            .filter(|member| member.present)
+            .collect();
+        let sender_id = self.gateway.session_identity().await?.0;
+        let preview = crate::cardnames::preview(group_id, &prefix, members, sender_id)?;
+        for plan in preview
+            .items
+            .into_iter()
+            .filter(|plan| plan.status == "planned" && member_ids.contains(&plan.member.user_id))
+        {
+            self.database
+                .enqueue_card_job(account_id.to_string(), group_id, plan, true)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn schedule_loop(&self, app: AppHandle) {
@@ -1261,6 +1336,10 @@ impl BackendRuntime {
                                     *group_id,
                                     self.clock.now_local(),
                                 ) else {
+                                    continue;
+                                };
+                                let Ok(_permit) = self.gateway.automatic_write_permit().await
+                                else {
                                     continue;
                                 };
                                 if !self
@@ -1368,10 +1447,8 @@ impl BackendRuntime {
         let mut workers: HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>> = HashMap::new();
         let mut worker_tasks = JoinSet::new();
         let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
-        let member_sync_running = Arc::new(AtomicBool::new(false));
         let mut active_account = String::new();
         let mut session_epoch = 0u64;
-        let mut last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
         'connection: loop {
             let diagnostic = self.gateway.diagnose().await;
@@ -1404,7 +1481,6 @@ impl BackendRuntime {
                 member_event_cache.clear();
                 active_account = account_id.clone();
                 session_epoch = gateway_epoch;
-                last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
                 last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             }
             let now = Utc::now();
@@ -1462,24 +1538,6 @@ impl BackendRuntime {
             let mut last_batch_session: Option<String> = None;
             let mut last_ack_sequence: Option<u64> = None;
             'batch: loop {
-                if Utc::now()
-                    .signed_duration_since(last_roster_sync)
-                    .num_seconds()
-                    >= 60
-                {
-                    if !member_sync_running.swap(true, Ordering::AcqRel) {
-                        let runtime = self.clone();
-                        let sync_account = account_id.clone();
-                        let running = member_sync_running.clone();
-                        tauri::async_runtime::spawn(async move {
-                            runtime
-                                .sync_members(&sync_account, sender_id, session_epoch)
-                                .await;
-                            running.store(false, Ordering::Release);
-                        });
-                    }
-                    last_roster_sync = Utc::now();
-                }
                 if Utc::now()
                     .signed_duration_since(last_retry_scan)
                     .num_seconds()
@@ -2088,7 +2146,6 @@ impl BackendRuntime {
                 tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
             }
             member_event_cache.clear();
-            last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
             last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
         }
@@ -2692,6 +2749,10 @@ impl BackendRuntime {
         automatic: bool,
     ) {
         if !automatic {
+            return;
+        }
+        if self.gateway.calibration_active() {
+            self.logger.write("INFO", "真实校准期间跳过自动规则副作用");
             return;
         }
         let permission = self
@@ -3379,13 +3440,14 @@ impl BackendRuntime {
     #[cfg(feature = "fixture")]
     pub async fn headless_dispatch_once(&self) -> AppResult<usize> {
         let account_id = self.gateway.session_identity().await?.1;
-        let items = self
-            .database
-            .claim_effect_outbox(Some(account_id), 100)
-            .await?;
-        let count = items.len();
-        for item in items {
-            self.dispatch_effect(None, item).await;
+        let mut count = 0;
+        while count < 100 {
+            let Some((permit, item)) = self.claim_effect_for_dispatch(account_id.clone()).await?
+            else {
+                break;
+            };
+            self.dispatch_effect_permitted(None, item, &permit).await;
+            count += 1;
         }
         Ok(count)
     }
@@ -3410,6 +3472,7 @@ fn merge_managed_member_state(incoming: &mut Member, saved: &Member) {
     incoming.locked_card_name = saved.locked_card_name.clone();
     incoming.violation_count = saved.violation_count;
     incoming.discovered_at = saved.discovered_at;
+    incoming.join_source = saved.join_source.clone();
     if incoming.joined_at.is_none() {
         incoming.joined_at = saved.joined_at;
     }
@@ -3558,8 +3621,13 @@ fn json_action(kind: &str, success: bool, error: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fixture")]
+    use crate::calibration::CalibrationMetadata;
     use crate::database::Database;
     use crate::fixture::{FixtureGateway, FIXTURE_ACCOUNT, FIXTURE_GROUP};
+    use crate::gateway::GroupGateway;
+    #[cfg(feature = "fixture")]
+    use crate::gateway::{CdpClient, CdpGateway};
     use crate::paths::AppPaths;
     use tempfile::tempdir;
 
@@ -3576,6 +3644,20 @@ mod tests {
             runtime_mode_file: root.join("runtime-mode"),
         };
         (directory, paths)
+    }
+
+    #[test]
+    fn connection_loop_never_schedules_member_roster_refreshes() {
+        let source = include_str!("runtime.rs");
+        let connection_loop = source
+            .split_once("    async fn connection_loop")
+            .and_then(|(_, remainder)| remainder.split_once("    async fn handle_gateway_event"))
+            .map(|(body, _)| body)
+            .expect("connection loop source must remain inspectable");
+
+        assert!(!connection_loop.contains("list_members("));
+        assert!(!connection_loop.contains("last_roster_sync"));
+        assert!(!connection_loop.contains("sync_members("));
     }
 
     #[test]
@@ -3693,7 +3775,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(items.len(), 1);
-        runtime.dispatch_effect(None, items[0].clone()).await;
+        let permit = runtime.gateway.automatic_write_permit().await.unwrap();
+        runtime
+            .dispatch_effect_permitted(None, items[0].clone(), &permit)
+            .await;
         assert!(database
             .claim_effect_outbox(Some(FIXTURE_ACCOUNT.into()), 10)
             .await
@@ -3738,6 +3823,201 @@ mod tests {
             assert!(archived.contains("fixture-request-1"));
             assert!(archived.contains("succeeded"));
         }
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn roster_reconciliation_enqueues_offline_member_card_and_welcome_job() {
+        let (_directory, paths) = test_paths();
+        let database = Database::open(&paths).unwrap();
+        let database = DatabaseExecutor::start(database).unwrap();
+        let fixture = Arc::new(FixtureGateway::new_default());
+        let runtime = BackendRuntime::new(
+            database.clone(),
+            fixture.clone(),
+            SecretStore::new(&paths.secrets),
+            Arc::new(ShutdownSignal::default()),
+            Logger::new(&paths.logs),
+        );
+        let now = Utc::now();
+        database
+            .upsert_account(Account {
+                id: FIXTURE_ACCOUNT.into(),
+                display_name: "Fixture 管理员".into(),
+                role: "owner".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let group = fixture
+            .list_groups()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|group| group.group_id == FIXTURE_GROUP)
+            .unwrap();
+        database.upsert_group(group).await.unwrap();
+        database
+            .set_group_features(
+                FIXTURE_ACCOUNT.into(),
+                FIXTURE_GROUP,
+                true,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        database
+            .set_setting(
+                format!("card.auto.{FIXTURE_ACCOUNT}.{FIXTURE_GROUP}"),
+                "true".into(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        runtime.sync_members(FIXTURE_ACCOUNT).await;
+        assert!(database
+            .list_card_jobs(FIXTURE_ACCOUNT.into(), FIXTURE_GROUP, 20)
+            .await
+            .unwrap()
+            .is_empty());
+
+        fixture
+            .resize_group_members(FIXTURE_GROUP, 17)
+            .await
+            .unwrap();
+        runtime.sync_members(FIXTURE_ACCOUNT).await;
+
+        let jobs = database
+            .list_card_jobs(FIXTURE_ACCOUNT.into(), FIXTURE_GROUP, 20)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].user_id, 10017);
+        assert_eq!(jobs[0].state, "queued");
+        assert!(jobs[0].welcome_pending);
+        database.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "fixture")]
+    #[tokio::test]
+    async fn calibration_waits_for_claimed_effect_and_does_not_consume_next_attempt() {
+        let (_directory, paths) = test_paths();
+        let database = Database::open(&paths).unwrap();
+        let database = DatabaseExecutor::start(database).unwrap();
+        let gateway = Arc::new(CdpGateway::new(
+            CdpClient::new("http://127.0.0.1:9222").unwrap(),
+        ));
+        let runtime = BackendRuntime::new(
+            database.clone(),
+            gateway.clone(),
+            SecretStore::new(&paths.secrets),
+            Arc::new(ShutdownSignal::default()),
+            Logger::new(&paths.logs),
+        );
+        let fixture = FixtureGateway::new_default();
+        let now = Utc::now();
+        database
+            .upsert_account(Account {
+                id: FIXTURE_ACCOUNT.into(),
+                display_name: "Fixture 管理员".into(),
+                role: "owner".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let group = fixture
+            .list_groups()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|group| group.group_id == FIXTURE_GROUP)
+            .unwrap();
+        database.upsert_group(group).await.unwrap();
+        let members = fixture.list_members(FIXTURE_GROUP).await.unwrap().members;
+        for member in members
+            .into_iter()
+            .filter(|member| matches!(member.user_id, 10006 | 10007))
+        {
+            database.upsert_member(member).await.unwrap();
+        }
+        for (user_id, dedupe_key) in [(10006, "first"), (10007, "second")] {
+            database
+                .enqueue_effect(EffectOutboxRequest {
+                    account_id: FIXTURE_ACCOUNT.into(),
+                    group_id: FIXTURE_GROUP,
+                    effect_type: "blacklist".into(),
+                    payload_json: serde_json::json!({"userId":user_id}).to_string(),
+                    dedupe_key: dedupe_key.into(),
+                })
+                .await
+                .unwrap();
+        }
+        let (permit, first) = runtime
+            .claim_effect_for_dispatch(FIXTURE_ACCOUNT.into())
+            .await
+            .unwrap()
+            .unwrap();
+        let starting_gateway = gateway.clone();
+        let starting = tokio::spawn(async move {
+            starting_gateway
+                .begin_developer_calibration(
+                    CalibrationMetadata {
+                        app_file_version: "2.7.8".into(),
+                        main_script_sha256: "a".repeat(64),
+                        page_title: "旺商聊".into(),
+                        page_url: "file:///index.html".into(),
+                    },
+                    vec!["rename".into()],
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!starting.is_finished());
+
+        runtime
+            .dispatch_effect_permitted(None, first, &permit)
+            .await;
+        drop(permit);
+        assert!(starting.await.unwrap().unwrap().active);
+        assert_eq!(
+            runtime
+                .claim_effect_for_dispatch(FIXTURE_ACCOUNT.into())
+                .await
+                .unwrap_err()
+                .code,
+            "calibration_active"
+        );
+        let rows = database
+            .execute(|database| {
+                database
+                    .with_connection(|connection| {
+                        let mut statement = connection.prepare(
+                            "SELECT dedupe_key,state,attempts FROM effect_outbox ORDER BY id",
+                        )?;
+                        let rows = statement
+                            .query_map([], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(rows)
+                    })
+                    .map_err(crate::error::InternalError::from)
+                    .map_err(AppError::from)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows[0], ("first".into(), "succeeded".into(), 1));
+        assert_eq!(rows[1], ("second".into(), "queued".into(), 0));
+        gateway.cancel_developer_calibration().unwrap();
         database.shutdown().await.unwrap();
     }
 }

@@ -13,6 +13,10 @@ export default defineConfig(({ mode }) => {
           developer ? './src/RuntimeControls.developer.tsx' : './src/RuntimeControls.production.tsx',
           import.meta.url,
         )),
+        '@calibration-controls': fileURLToPath(new URL(
+          developer ? './src/CalibrationControls.developer.tsx' : './src/CalibrationControls.production.tsx',
+          import.meta.url,
+        )),
       },
     },
     clearScreen: false,
