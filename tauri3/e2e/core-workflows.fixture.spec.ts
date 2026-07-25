@@ -112,9 +112,9 @@ test.beforeEach(async ({ page }) => {
 test('developer fixture covers navigation, data and management workflows', async ({ page }) => {
   await page.getByRole('button', { name: '群组与成员' }).click()
   await page.getByRole('button', { name: /16 人开发测试群/ }).click()
-  await expect(page.getByText('广校')).toBeVisible()
-  await expect(page.getByText('群人数').locator('..')).toContainText('16')
-  await page.getByPlaceholder('搜索名称、旺商号').fill('广校')
+  await expect(page.getByText('广校', { exact: true })).toBeVisible()
+  await expect(page.getByText('群成员').locator('..')).toContainText('16')
+  await page.getByPlaceholder('搜索群名片、原名称').fill('广校')
   await expect(page.getByRole('row').filter({ hasText: '广校' })).toBeVisible()
   await expect(page.getByRole('row').filter({ hasText: 'DH群员0001' })).toHaveCount(0)
 

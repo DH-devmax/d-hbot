@@ -221,6 +221,115 @@ struct WangStartupEvent {
     needs_confirmation: bool,
 }
 
+fn wang_startup_event(
+    status: impl Into<String>,
+    detail: impl Into<String>,
+    needs_confirmation: bool,
+) -> WangStartupEvent {
+    WangStartupEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        status: status.into(),
+        detail: detail.into(),
+        needs_confirmation,
+    }
+}
+
+fn publish_wang_startup_status(
+    app: &tauri::AppHandle,
+    pending: Option<&Arc<Mutex<Option<WangStartupEvent>>>>,
+    payload: WangStartupEvent,
+) {
+    if let Some(pending) = pending {
+        if let Ok(mut value) = pending.lock() {
+            *value = Some(payload.clone());
+        }
+    }
+    let _ = app.emit("wangshangliao-status", payload);
+}
+
+async fn persist_wang_installation(
+    database: &DatabaseExecutor,
+    candidate: &platform::InstallCandidate,
+) -> AppResult<()> {
+    for (key, value) in [
+        ("wangshangliao.path", candidate.path.clone()),
+        ("wangshangliao.path_source", candidate.source.clone()),
+        ("wangshangliao.path_version", candidate.version.clone()),
+        (
+            "wangshangliao.path_last_verified_at",
+            chrono::Utc::now().to_rfc3339(),
+        ),
+    ] {
+        database.set_setting(key.into(), value, false).await?;
+    }
+    Ok(())
+}
+
+async fn clear_wang_installation(database: &DatabaseExecutor) {
+    for key in [
+        "wangshangliao.path",
+        "wangshangliao.path_source",
+        "wangshangliao.path_version",
+        "wangshangliao.path_last_verified_at",
+    ] {
+        let _ = database.set_setting(key.into(), String::new(), false).await;
+    }
+}
+
+async fn resolve_and_persist_wang_installation(
+    app: &tauri::AppHandle,
+    database: &DatabaseExecutor,
+    requested_path: Option<String>,
+    pending: Option<&Arc<Mutex<Option<WangStartupEvent>>>>,
+) -> AppResult<platform::InstallCandidate> {
+    let progress_app = app.clone();
+    let progress_pending = pending.cloned();
+    let progress: platform::DiscoveryProgress = Arc::new(move |status, detail| {
+        publish_wang_startup_status(
+            &progress_app,
+            progress_pending.as_ref(),
+            wang_startup_event(status, detail, false),
+        );
+    });
+    match platform::resolve_installation(requested_path, Some(progress)).await {
+        Ok(candidate) => {
+            persist_wang_installation(database, &candidate).await?;
+            Ok(candidate)
+        }
+        Err(error) => {
+            clear_wang_installation(database).await;
+            Err(error)
+        }
+    }
+}
+
+async fn reconcile_wang_process_path(
+    database: &DatabaseExecutor,
+    result: &mut platform::WangStartResult,
+) {
+    let Some(process_path) = result
+        .process
+        .as_ref()
+        .map(|process| process.image_path.clone())
+    else {
+        return;
+    };
+    match platform::resolve_installation(Some(process_path), None).await {
+        Ok(candidate) => {
+            if let Err(error) = persist_wang_installation(database, &candidate).await {
+                result.detail.push_str(&format!(
+                    "本地旺商聊路径记录更新失败，但外部进程已成功：{}。",
+                    error.message
+                ));
+            }
+        }
+        Err(error) => result.detail.push_str(&format!(
+            "本地旺商聊路径记录更新失败，但外部进程已成功：{}。",
+            error.message
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BusinessAppTestInput {
@@ -492,7 +601,17 @@ async fn list_cached_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>>
 }
 
 #[tauri::command]
-async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<MemberRoster> {
+async fn list_members(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    group_id: i64,
+    refresh: Option<bool>,
+) -> AppResult<MemberRoster> {
+    let request_epoch = state.gateway.session_epoch();
+    let snapshot_started_at = Utc::now();
+    if refresh.unwrap_or(false) {
+        state.gateway.invalidate_member_cache(group_id).await;
+    }
     let mut roster = state.gateway.list_members(group_id).await?;
     let (self_id, account_id) = state.gateway.session_identity().await?;
     let existing = state
@@ -501,11 +620,12 @@ async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<Me
         .await?;
     let had_baseline = !existing.is_empty();
     let mut newly_discovered = std::collections::HashSet::new();
+    let mut present_user_ids = std::collections::HashSet::new();
     for member in &mut roster.members {
-        if let Some(saved) = existing
-            .iter()
-            .find(|value| value.user_id == member.user_id)
-        {
+        if let Some(saved) = existing.iter().find(|value| {
+            value.user_id == member.user_id
+                || (!member.nim_id.is_empty() && value.nim_id == member.nim_id)
+        }) {
             member.original_card_name = saved.original_card_name.clone();
             member.managed_card_name = saved.managed_card_name.clone();
             member.card_suffix = saved.card_suffix.clone();
@@ -514,9 +634,24 @@ async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<Me
             member.original_card_name = member.card_name.clone();
             newly_discovered.insert(member.user_id);
         }
-        state
+        let canonical_user_id = state
             .database_executor
             .upsert_member(member.clone())
+            .await?;
+        present_user_ids.insert(canonical_user_id);
+    }
+    if refresh.unwrap_or(false)
+        && roster.authority == "authoritative"
+        && request_epoch == state.gateway.session_epoch()
+    {
+        let _ = state
+            .database_executor
+            .mark_members_not_present_before(
+                account_id.clone(),
+                group_id,
+                present_user_ids.into_iter().collect(),
+                snapshot_started_at,
+            )
             .await?;
     }
     let automatic = state
@@ -531,15 +666,14 @@ async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<Me
             .get_setting(format!("card.prefix.{account_id}.{group_id}"))
             .await?
             .unwrap_or_else(|| "DH".into());
-        let preview = cardnames::preview(
-            group_id,
-            &prefix,
-            state
-                .database_executor
-                .list_members(account_id.clone(), group_id)
-                .await?,
-            self_id,
-        )?;
+        let preview_members = state
+            .database_executor
+            .list_members(account_id.clone(), group_id)
+            .await?
+            .into_iter()
+            .filter(|member| member.present)
+            .collect();
+        let preview = cardnames::preview(group_id, &prefix, preview_members, self_id)?;
         for plan in preview.items.into_iter().filter(|plan| {
             plan.status == "planned" && newly_discovered.contains(&plan.member.user_id)
         }) {
@@ -549,6 +683,22 @@ async fn list_members(state: State<'_, AppState>, group_id: i64) -> AppResult<Me
                 .await?;
         }
     }
+    let _ = app.emit(
+        "member-roster-status",
+        serde_json::json!({
+            "accountId": account_id,
+            "groupId": group_id,
+            "status": roster.status.clone(),
+            "reportedCount": roster.reported_count,
+            "resolvedCount": roster.resolved_count,
+            "complete": roster.complete,
+            "completenessReason": roster.completeness_reason.clone(),
+            "retryAt": roster.retry_at.clone(),
+            "canonicalCount": roster.canonical_count,
+            "syntheticUserIds": roster.synthetic_user_ids.clone(),
+            "sourceErrors": roster.source_errors.clone(),
+        }),
+    );
     Ok(roster)
 }
 
@@ -558,10 +708,14 @@ async fn local_members(
     account_id: String,
     group_id: i64,
 ) -> AppResult<Vec<Member>> {
-    state
+    let members = state
         .database_executor
         .list_members(account_id, group_id)
-        .await
+        .await?;
+    Ok(members
+        .into_iter()
+        .filter(|member| member.present)
+        .collect())
 }
 
 #[tauri::command]
@@ -1893,6 +2047,18 @@ async fn save_wang_startup_settings(
             false,
         )
         .await?;
+    if settings.path.trim().is_empty() {
+        for key in [
+            "wangshangliao.path_source",
+            "wangshangliao.path_version",
+            "wangshangliao.path_last_verified_at",
+        ] {
+            state
+                .database_executor
+                .set_setting(key.into(), String::new(), false)
+                .await?;
+        }
+    }
     state
         .database_executor
         .set_setting(
@@ -1922,12 +2088,68 @@ async fn start_wangshangliao(
 ) -> AppResult<platform::WangStartResult> {
     let _ = devtools_url;
     let _start_guard = state.wang_start_lock.lock().await;
-    let result = platform::start(
-        path,
+    let requested_path = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => Some(path),
+        None => state
+            .database_executor
+            .get_setting("wangshangliao.path".into())
+            .await?
+            .filter(|value| !value.trim().is_empty()),
+    };
+    let candidate = match resolve_and_persist_wang_installation(
+        &app,
+        &state.database_executor,
+        requested_path,
+        None,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            publish_wang_startup_status(
+                &app,
+                None,
+                wang_startup_event(error.code.clone(), error.message.clone(), false),
+            );
+            return Err(error);
+        }
+    };
+    publish_wang_startup_status(
+        &app,
+        None,
+        wang_startup_event(
+            "starting",
+            "正在启动旺商聊，并连接 DevTools，请稍候。",
+            false,
+        ),
+    );
+    let mut result = match platform::start(
+        Some(candidate.path),
         state.paths.default_devtools_url().to_string(),
         confirm_restart,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            publish_wang_startup_status(
+                &app,
+                None,
+                wang_startup_event(error.code.clone(), error.message.clone(), false),
+            );
+            return Err(error);
+        }
+    };
+    reconcile_wang_process_path(&state.database_executor, &mut result).await;
+    publish_wang_startup_status(
+        &app,
+        None,
+        wang_startup_event(
+            result.status.clone(),
+            result.detail.clone(),
+            result.needs_confirmation,
+        ),
+    );
     if let Some(process) = &result.process {
         let script_hash = platform::profile_status(Some(process.image_path.clone()))
             .await
@@ -1939,6 +2161,16 @@ async fn start_wangshangliao(
         let _ = app.emit("gateway-capabilities", capabilities);
     }
     Ok(result)
+}
+
+#[tauri::command]
+async fn focus_wangshangliao(state: State<'_, AppState>) -> AppResult<()> {
+    let path = state
+        .database_executor
+        .get_setting("wangshangliao.path".into())
+        .await?
+        .filter(|value| !value.trim().is_empty());
+    platform::focus(path).await
 }
 
 #[tauri::command]
@@ -2027,11 +2259,12 @@ async fn mute_member(
     user_id: i64,
     duration_seconds: i64,
 ) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let roster = require_member_manager(&state, group_id).await?;
+    let target = canonical_member(&roster, user_id)?;
     let account_id = state.gateway.session_identity().await?.1;
     let result = state
         .gateway
-        .mute(group_id, user_id, duration_seconds)
+        .mute(group_id, target.user_id, duration_seconds)
         .await;
     archive_manual_gateway_result(
         &state,
@@ -2049,9 +2282,10 @@ async fn mute_member(
 
 #[tauri::command]
 async fn unmute_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let roster = require_member_manager(&state, group_id).await?;
+    let target = canonical_member(&roster, user_id)?;
     let account_id = state.gateway.session_identity().await?.1;
-    let result = state.gateway.unmute(group_id, user_id).await;
+    let result = state.gateway.unmute(group_id, target.user_id).await;
     archive_manual_gateway_result(
         &state,
         &account_id,
@@ -2073,15 +2307,19 @@ async fn rename_member(
     member: MemberRef,
     nickname: String,
 ) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let roster = require_member_manager(&state, group_id).await?;
+    let target = canonical_member_ref(&roster, &member)?;
+    let target_ref = MemberRef {
+        user_id: Some(target.user_id),
+        nim_id: (!target.nim_id.is_empty()).then(|| target.nim_id.clone()),
+    };
     let account_id = state.gateway.session_identity().await?.1;
-    let user_id = member.user_id.unwrap_or_default();
-    let result = state.gateway.rename(group_id, &member, &nickname).await;
+    let result = state.gateway.rename(group_id, &target_ref, &nickname).await;
     archive_manual_gateway_result(
         &state,
         &account_id,
         group_id,
-        user_id,
+        target.user_id,
         "rename",
         0,
         "人工修改群名片",
@@ -2093,9 +2331,10 @@ async fn rename_member(
 
 #[tauri::command]
 async fn remove_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let roster = require_member_manager(&state, group_id).await?;
+    let target = canonical_member(&roster, user_id)?;
     let account_id = state.gateway.session_identity().await?.1;
-    let result = state.gateway.remove_member(group_id, user_id).await;
+    let result = state.gateway.remove_member(group_id, target.user_id).await;
     archive_manual_gateway_result(
         &state,
         &account_id,
@@ -2112,7 +2351,7 @@ async fn remove_member(state: State<'_, AppState>, group_id: i64, user_id: i64) 
 
 #[tauri::command]
 async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let _roster = require_member_manager(&state, group_id).await?;
     let account_id = state.gateway.session_identity().await?.1;
     let result = state.gateway.set_group_mute(group_id, muted).await;
     archive_manual_gateway_result(
@@ -2139,7 +2378,7 @@ async fn set_group_announcement(
     group_id: i64,
     text: String,
 ) -> AppResult<()> {
-    require_manager(&state, group_id).await?;
+    let _roster = require_member_manager(&state, group_id).await?;
     if text.trim().is_empty() {
         return Err(AppError::new("announcement_empty", "群公告内容不能为空"));
     }
@@ -2178,7 +2417,10 @@ async fn get_group_management_context(
     let (sender_id, _) = state.gateway.session_identity().await?;
     let roster = state.gateway.list_members(group_id).await?;
     let is_manager = roster.members.iter().any(|member| {
-        member.user_id == sender_id && matches!(member.role.as_str(), "owner" | "admin")
+        member.user_id == sender_id
+            && member.user_id > 0
+            && member.present
+            && matches!(member.role.as_str(), "owner" | "admin")
     });
     let capabilities = state.gateway.capabilities();
     let announcement_status = match capabilities.announcement {
@@ -2201,7 +2443,7 @@ async fn execute_member_batch(
     state: State<'_, AppState>,
     input: MemberBatchInput,
 ) -> AppResult<Vec<MemberBatchResult>> {
-    require_manager(&state, input.group_id).await?;
+    let roster = require_member_manager(&state, input.group_id).await?;
     let action = input.action.trim().to_ascii_lowercase();
     if !matches!(
         action.as_str(),
@@ -2215,7 +2457,12 @@ async fn execute_member_batch(
     let account_id = state.gateway.session_identity().await?.1;
     let mut results = Vec::with_capacity(input.members.len());
     for member in input.members {
-        let user_id = member.user_id.unwrap_or_default();
+        let canonical = canonical_member_ref(&roster, &member)?;
+        let user_id = canonical.user_id;
+        let canonical_ref = MemberRef {
+            user_id: Some(canonical.user_id),
+            nim_id: (!canonical.nim_id.is_empty()).then(|| canonical.nim_id.clone()),
+        };
         let nim_id = member.nim_id.clone();
         let result = if user_id <= 0 && action != "rename" {
             Err(AppError::new("member_identity", "该成员尚未解析出旺商号"))
@@ -2238,7 +2485,7 @@ async fn execute_member_batch(
                         .gateway
                         .rename(
                             input.group_id,
-                            &member,
+                            &canonical_ref,
                             input.nickname.as_deref().unwrap_or("").trim(),
                         )
                         .await
@@ -2306,13 +2553,14 @@ async fn apply_card_names(
     group_id: i64,
     plans: Vec<CardPlan>,
 ) -> AppResult<usize> {
-    require_manager(&state, group_id).await?;
+    let roster = require_member_manager(&state, group_id).await?;
     let account_id = state.gateway.session_identity().await?.1;
     let mut queued = 0;
-    for plan in plans
+    for mut plan in plans
         .into_iter()
         .filter(|plan| plan.status == "planned" && !plan.suggested_name.is_empty())
     {
+        plan.member = canonical_member(&roster, plan.member.user_id)?;
         if state
             .database_executor
             .enqueue_card_job(account_id.clone(), group_id, plan, false)
@@ -2343,7 +2591,14 @@ async fn retry_card_rename_jobs(
     account_id: String,
     group_id: i64,
 ) -> AppResult<usize> {
-    require_manager(&state, group_id).await?;
+    require_member_manager(&state, group_id).await?;
+    let current_account = state.gateway.session_identity().await?.1;
+    if current_account != account_id {
+        return Err(AppError::new(
+            "account_mismatch",
+            "只能重试当前已登录账号的名片任务",
+        ));
+    }
     state
         .database_executor
         .retry_failed_card_jobs(account_id, group_id)
@@ -2464,8 +2719,11 @@ async fn archive_manual_gateway_result(
 async fn require_manager(state: &State<'_, AppState>, group_id: i64) -> AppResult<()> {
     let (sender_id, _) = state.gateway.session_identity().await?;
     let roster = state.gateway.list_members(group_id).await?;
-    if roster.members.into_iter().any(|member| {
-        member.user_id == sender_id && matches!(member.role.as_str(), "owner" | "admin")
+    if roster.members.iter().any(|member| {
+        member.user_id == sender_id
+            && member.user_id > 0
+            && member.present
+            && matches!(member.role.as_str(), "owner" | "admin")
     }) {
         Ok(())
     } else {
@@ -2474,6 +2732,76 @@ async fn require_manager(state: &State<'_, AppState>, group_id: i64) -> AppResul
             "需要将账号权限设置为管理",
         ))
     }
+}
+
+async fn require_member_manager(
+    state: &State<'_, AppState>,
+    group_id: i64,
+) -> AppResult<MemberRoster> {
+    let (sender_id, _) = state.gateway.session_identity().await?;
+    let roster = state.gateway.list_members(group_id).await?;
+    if roster.members.iter().any(|member| {
+        member.user_id == sender_id
+            && member.user_id > 0
+            && member.present
+            && matches!(member.role.as_str(), "owner" | "admin")
+    }) {
+        Ok(roster)
+    } else {
+        Err(AppError::new(
+            "management_required",
+            "需要将账号权限设置为管理员",
+        ))
+    }
+}
+
+fn canonical_member(roster: &MemberRoster, user_id: i64) -> AppResult<Member> {
+    let member = roster
+        .members
+        .iter()
+        .find(|member| member.user_id == user_id && member.user_id > 0 && member.present)
+        .cloned()
+        .ok_or_else(|| AppError::new("member_identity", "目标成员不在当前群名单中"))?;
+    if roster.synthetic_user_ids.contains(&member.user_id) {
+        return Err(AppError::new(
+            "member_identity_synthetic",
+            "目标成员只有临时身份，不能执行群成员写操作",
+        ));
+    }
+    if matches!(member.role.as_str(), "owner" | "admin") {
+        return Err(AppError::new(
+            "member_role_protected",
+            "不能对群主或管理员执行成员写操作",
+        ));
+    }
+    Ok(member)
+}
+
+fn canonical_member_ref(roster: &MemberRoster, requested: &MemberRef) -> AppResult<Member> {
+    let requested_user_id = requested.user_id.filter(|value| *value > 0);
+    let requested_nim_id = requested
+        .nim_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if requested_user_id.is_none() && requested_nim_id.is_none() {
+        return Err(AppError::new("member_identity", "目标成员缺少有效身份"));
+    }
+    let matches = roster
+        .members
+        .iter()
+        .filter(|member| {
+            let user_matches = requested_user_id.is_none_or(|user_id| member.user_id == user_id);
+            let nim_matches = requested_nim_id.is_none_or(|nim_id| member.nim_id == nim_id);
+            user_matches && nim_matches
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(AppError::new(
+            "member_identity",
+            "目标成员身份无法唯一映射到当前名单",
+        ));
+    }
+    canonical_member(roster, matches[0].user_id)
 }
 
 async fn require_account(state: &State<'_, AppState>, account_id: &str) -> AppResult<i64> {
@@ -2554,6 +2882,7 @@ macro_rules! dh_handlers {
             save_wang_startup_settings,
             take_wang_startup_status,
             start_wangshangliao,
+            focus_wangshangliao,
             inspect_wangshangliao,
             get_gateway_capabilities,
             get_wang_maintenance_result,
@@ -2735,20 +3064,51 @@ async fn auto_start_wangshangliao(
         return;
     }
     let start_guard = start_lock.lock().await;
-    let path = database
+    let requested_path = database
         .get_setting("wangshangliao.path".into())
         .await
         .ok()
         .flatten()
         .filter(|value| !value.trim().is_empty());
-    let mut start_result =
-        platform::start(path.clone(), "http://127.0.0.1:9222".into(), false).await;
+    let mut path = None;
+    let mut start_result = match resolve_and_persist_wang_installation(
+        &app,
+        &database,
+        requested_path,
+        Some(&startup_status),
+    )
+    .await
+    {
+        Ok(candidate) => {
+            path = Some(candidate.path);
+            publish_wang_startup_status(
+                &app,
+                Some(&startup_status),
+                wang_startup_event(
+                    "starting",
+                    "已识别旺商聊，正在启动并连接 DevTools，请稍候。",
+                    false,
+                ),
+            );
+            platform::start(path.clone(), "http://127.0.0.1:9222".into(), false).await
+        }
+        Err(error) => Err(error),
+    };
     if let Ok(result) = &start_result {
         if let Some(request_id) = &result.maintenance_request_id {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
                 match platform::maintenance_result(request_id) {
                     Ok(Some(result)) if result.success => {
+                        publish_wang_startup_status(
+                            &app,
+                            Some(&startup_status),
+                            wang_startup_event(
+                                "starting",
+                                "维护已完成，正在重新启动旺商聊并连接 DevTools，请稍候。",
+                                false,
+                            ),
+                        );
                         start_result =
                             platform::start(path.clone(), "http://127.0.0.1:9222".into(), false)
                                 .await;
@@ -2779,24 +3139,14 @@ async fn auto_start_wangshangliao(
             }
         }
     }
-    let payload = match start_result {
-        Ok(result) => WangStartupEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            status: result.status,
-            detail: result.detail,
-            needs_confirmation: result.needs_confirmation,
-        },
-        Err(error) => WangStartupEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            status: error.code,
-            detail: error.message,
-            needs_confirmation: false,
-        },
-    };
-    if let Ok(mut pending) = startup_status.lock() {
-        *pending = Some(payload.clone());
+    if let Ok(result) = &mut start_result {
+        reconcile_wang_process_path(&database, result).await;
     }
-    let _ = app.emit("wangshangliao-status", payload.clone());
+    let payload = match start_result {
+        Ok(result) => wang_startup_event(result.status, result.detail, result.needs_confirmation),
+        Err(error) => wang_startup_event(error.code, error.message, false),
+    };
+    publish_wang_startup_status(&app, Some(&startup_status), payload.clone());
     let mut last_problem = if matches!(
         payload.status.as_str(),
         "ready" | "devtools-ready" | "nim-not-ready"
@@ -2809,7 +3159,7 @@ async fn auto_start_wangshangliao(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
             _ = shutdown.cancelled() => return,
         }
         let enabled = wang_auto_start_enabled(
@@ -2846,25 +3196,41 @@ async fn auto_start_wangshangliao(
             last_problem = None;
             continue;
         }
-        let path = database
+        let requested_path = database
             .get_setting("wangshangliao.path".into())
             .await
             .ok()
             .flatten()
             .filter(|value| !value.trim().is_empty());
-        let payload = match platform::start(path, "http://127.0.0.1:9222".into(), false).await {
-            Ok(result) => WangStartupEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                status: result.status,
-                detail: result.detail,
-                needs_confirmation: result.needs_confirmation,
-            },
-            Err(error) => WangStartupEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                status: error.code,
-                detail: error.message,
-                needs_confirmation: false,
-            },
+        let payload = match resolve_and_persist_wang_installation(
+            &app,
+            &database,
+            requested_path,
+            Some(&startup_status),
+        )
+        .await
+        {
+            Ok(candidate) => {
+                publish_wang_startup_status(
+                    &app,
+                    Some(&startup_status),
+                    wang_startup_event(
+                        "starting",
+                        "已识别旺商聊，正在重新连接 DevTools，请稍候。",
+                        false,
+                    ),
+                );
+                match platform::start(Some(candidate.path), "http://127.0.0.1:9222".into(), false)
+                    .await
+                {
+                    Ok(mut result) => {
+                        reconcile_wang_process_path(&database, &mut result).await;
+                        wang_startup_event(result.status, result.detail, result.needs_confirmation)
+                    }
+                    Err(error) => wang_startup_event(error.code, error.message, false),
+                }
+            }
+            Err(error) => wang_startup_event(error.code, error.message, false),
         };
         let signature = (
             payload.status.clone(),
@@ -2875,10 +3241,7 @@ async fn auto_start_wangshangliao(
             continue;
         }
         last_problem = Some(signature);
-        if let Ok(mut pending) = startup_status.lock() {
-            *pending = Some(payload.clone());
-        }
-        let _ = app.emit("wangshangliao-status", payload);
+        publish_wang_startup_status(&app, Some(&startup_status), payload);
     }
 }
 
@@ -3042,13 +3405,7 @@ pub fn run() {
                     }
                     "exit" => request_graceful_exit(app),
                     _ => {
-                        show_main_window(&app);
                         let _ = app.emit("close-requested", ());
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.eval(
-                                "window.dispatchEvent(new CustomEvent('dh-close-requested'))",
-                            );
-                        }
                     }
                 }
             }
@@ -3102,6 +3459,7 @@ mod close_behavior_tests {
             acknowledged: 0,
             remaining: 0,
             dropped: 0,
+            verification: None,
         });
         let archived = serde_json::to_string(&receipt).unwrap();
         assert!(!archived.contains(&secret));

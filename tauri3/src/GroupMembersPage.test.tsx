@@ -48,7 +48,7 @@ describe('GroupMembersPage control tabs', () => {
     await user.click(screen.getByRole('tab', { name: /规则处理/ }))
     expect(screen.getByRole('button', { name: /群管规则/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '保存群设置' })).toBeInTheDocument()
-    expect(screen.getByPlaceholderText('搜索名称、旺商号')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('搜索群名片、原名称')).toBeInTheDocument()
   })
 
   it('selects only current search results and reports partial batch announcement failures', async () => {

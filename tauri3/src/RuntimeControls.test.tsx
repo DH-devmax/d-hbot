@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 
 describe('production WangShangLiao startup settings', () => {
   beforeEach(() => {
+    window.localStorage.clear()
     invoke.mockReset().mockImplementation((command: string) => {
       if (command === 'get_wang_startup_settings') {
         return Promise.resolve({ path: 'C:\\Apps\\wangshangliao.exe', autoStart: true })
@@ -19,6 +20,14 @@ describe('production WangShangLiao startup settings', () => {
       if (command === 'locate_wangshangliao') return Promise.resolve([])
       return Promise.resolve(null)
     })
+  })
+
+  it('uses backend settings instead of a stale browser path', async () => {
+    window.localStorage.setItem('dh.wangshangliao.path', 'D:\\Stale\\wangshangliao.exe')
+    render(<RuntimeControls diagnostic={null} loading={false} refresh={vi.fn()} setError={vi.fn()} />)
+
+    expect(await screen.findByDisplayValue('C:\\Apps\\wangshangliao.exe')).toBeVisible()
+    expect(screen.queryByDisplayValue('D:\\Stale\\wangshangliao.exe')).not.toBeInTheDocument()
   })
 
   it('loads and persists the auto-start preference with the selected path', async () => {

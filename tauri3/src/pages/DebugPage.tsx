@@ -49,15 +49,19 @@ export default function DebugPage({ diagnostic, database, refresh, onError }: { 
   const [maintenance, setMaintenance] = useState<MaintenanceStatus | null>(null)
   const [capabilities, setCapabilities] = useState<GatewayCapabilities | null>(null)
   const [busy, setBusy] = useState(false)
-  const wangPath = () => window.localStorage.getItem('dh.wangshangliao.path') || null
+  const wangPath = async () => {
+    const settings = await invoke<{ path: string }>('get_wang_startup_settings')
+    return settings.path.trim() || null
+  }
   const check = async () => {
     setBusy(true)
     onError('')
     try {
       const tauriRuntime = typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
       if (tauriRuntime) {
+        const path = await wangPath()
         const [maintenanceStatus, gatewayCapabilities] = await Promise.all([
-          invoke<MaintenanceStatus>('get_wang_profile_status', { path: wangPath() }),
+          invoke<MaintenanceStatus>('get_wang_profile_status', { path }),
           invoke<GatewayCapabilities>('get_gateway_capabilities'),
         ])
         setMaintenance(maintenanceStatus)
@@ -77,7 +81,8 @@ export default function DebugPage({ diagnostic, database, refresh, onError }: { 
     setBusy(true)
     onError('')
     try {
-      let status = await invoke<MaintenanceStatus>(operation === 'apply' ? 'apply_wang_profile_patch' : 'restore_wang_profile_patch', { path: wangPath() })
+      const path = await wangPath()
+      let status = await invoke<MaintenanceStatus>(operation === 'apply' ? 'apply_wang_profile_patch' : 'restore_wang_profile_patch', { path })
       setMaintenance(status)
       if (status.requestId) {
         let completed: MaintenanceResult | null = null
@@ -87,7 +92,7 @@ export default function DebugPage({ diagnostic, database, refresh, onError }: { 
         }
         if (!completed) throw new Error('管理员维护仍未返回结果，请稍后点“立即检查”')
         if (!completed.success) throw new Error(`管理员维护失败：${completed.message}`)
-        status = await invoke<MaintenanceStatus>('get_wang_profile_status', { path: wangPath() })
+        status = await invoke<MaintenanceStatus>('get_wang_profile_status', { path })
         setMaintenance(status)
       }
       await refresh()

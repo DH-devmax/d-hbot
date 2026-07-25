@@ -14,6 +14,20 @@ struct FixtureProcess(Option<Child>);
 impl Drop for FixtureProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
+            #[cfg(windows)]
+            {
+                let process_id = child.id().to_string();
+                let status = Command::new("taskkill")
+                    .args(["/PID", &process_id, "/T", "/F"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if !status.is_ok_and(|status| status.success()) {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(windows))]
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -25,7 +39,7 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     let binary = env!("CARGO_BIN_EXE_dh-fixture");
     let http_base = "http://127.0.0.1:51301";
     let devtools_base = "http://127.0.0.1:9234";
-    let mut process = FixtureProcess(Some(
+    let _process = FixtureProcess(Some(
         Command::new(binary)
             .env("DH_FIXTURE_HTTP_PORT", "51301")
             .env("DH_FIXTURE_DEVTOOLS_PORT", "9234")
@@ -103,6 +117,19 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .unwrap()
         .error_for_status()
         .unwrap();
+    let member_batch = gateway.read_batch().await.unwrap();
+    assert_eq!(
+        gateway
+            .member_events(member_batch.records.clone())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    gateway
+        .ack(&member_batch.session, member_batch.records[0].sequence)
+        .await
+        .unwrap();
     assert_eq!(
         gateway
             .list_members(FIXTURE_GROUP)
@@ -178,20 +205,25 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let partial = gateway.list_members(FIXTURE_GROUP).await.unwrap();
-    assert!(!partial.complete);
+    assert!(partial.complete);
+    assert_eq!(partial.authority, "authoritative");
     assert_eq!(partial.resolved_count, 8);
-    assert_eq!(partial.reported_count, 17);
+    assert_eq!(partial.reported_count, 8);
 
     let unmute = gateway.unmute(FIXTURE_GROUP, 10006).await.unwrap();
-    assert_eq!(unmute.route, "/v1/group/member-mute-cancel");
+    assert_eq!(unmute.verification.as_deref(), Some("verified"));
     let recall = gateway
         .recall(FIXTURE_GROUP, 10006, "fixture-contract-recall")
         .await
         .unwrap();
     assert_eq!(recall.message_id, "fixture-contract-recall");
-    gateway.set_group_mute(FIXTURE_GROUP, true).await.unwrap();
-    gateway.set_group_mute(FIXTURE_GROUP, false).await.unwrap();
-    gateway.remove_member(FIXTURE_GROUP, 10017).await.unwrap();
+    let group_mute = gateway.set_group_mute(FIXTURE_GROUP, true).await.unwrap();
+    assert_eq!(group_mute.verification.as_deref(), Some("verified"));
+    let remove = gateway
+        .remove_member(FIXTURE_GROUP, 10017)
+        .await
+        .unwrap_err();
+    assert_eq!(remove.code, "member_not_found");
 
     client
         .post(format!("{http_base}/fixture/reset"))
@@ -324,5 +356,4 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     }
     let after_reconnect = gateway.install_message_listener().await.unwrap();
     assert_eq!(after_reconnect["ok"], true);
-    process.0.as_mut().unwrap().kill().unwrap();
 }

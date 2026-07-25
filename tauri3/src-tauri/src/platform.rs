@@ -4,7 +4,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 #[cfg(windows)]
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 #[cfg(windows)]
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
@@ -19,7 +19,25 @@ use crate::gateway::{CdpClient, ConnectionStatus};
 pub struct InstallCandidate {
     pub path: String,
     pub source: String,
+    pub version: String,
+    pub modified_at: String,
+    pub running: bool,
+    pub verified: bool,
+    pub validation: String,
+    pub priority: u32,
 }
+
+pub type DiscoveryProgress = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+#[cfg(windows)]
+const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[cfg(windows)]
+static DISCOVERY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedDiscovery>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(windows)]
+static DISCOVERY_RUN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,8 +125,38 @@ pub async fn locate() -> AppResult<Vec<InstallCandidate>> {
         .map(|path| InstallCandidate {
             path: path.display().to_string(),
             source: "macOS 常见安装目录".into(),
+            version: String::new(),
+            modified_at: String::new(),
+            running: false,
+            verified: true,
+            validation: "应用包结构有效".into(),
+            priority: 0,
         })
         .collect())
+}
+
+#[cfg(not(windows))]
+pub async fn resolve_installation(
+    saved_path: Option<String>,
+    _progress: Option<DiscoveryProgress>,
+) -> AppResult<InstallCandidate> {
+    if let Some(path) = saved_path.filter(|value| !value.trim().is_empty()) {
+        return Ok(InstallCandidate {
+            path,
+            source: "已保存路径".into(),
+            version: String::new(),
+            modified_at: String::new(),
+            running: false,
+            verified: true,
+            validation: "应用包结构有效".into(),
+            priority: 0,
+        });
+    }
+    locate()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::new("wangshangliao_not_found", "没有找到旺商聊安装路径"))
 }
 
 #[cfg(not(windows))]
@@ -166,6 +214,14 @@ pub async fn start(
         maintenance_request_id: None,
         process: None,
     })
+}
+
+#[cfg(not(windows))]
+pub async fn focus(_path: Option<String>) -> AppResult<()> {
+    Err(AppError::new(
+        "wangshangliao_focus",
+        "旺商聊窗口唤起仅在 Windows 可用。",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -325,6 +381,146 @@ fn webview2_runtime_paths() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 pub async fn locate() -> AppResult<Vec<InstallCandidate>> {
+    discover_installations(None, None).await
+}
+
+#[cfg(windows)]
+pub async fn resolve_installation(
+    saved_path: Option<String>,
+    progress: Option<DiscoveryProgress>,
+) -> AppResult<InstallCandidate> {
+    let candidates = discover_installations(saved_path, progress).await?;
+    candidates.into_iter().next().ok_or_else(|| {
+        AppError::new(
+            "not-found",
+            "已检查运行进程、快捷方式、注册表、常见目录和本地固定磁盘，但没有找到验证通过的旺商聊程序。",
+        )
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInstallCandidate {
+    path: String,
+    source: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImageVersionInfo {
+    #[serde(default)]
+    product_name: String,
+    #[serde(default)]
+    file_description: String,
+    #[serde(default)]
+    company_name: String,
+    #[serde(default)]
+    file_version: String,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct CachedDiscovery {
+    at: Instant,
+    candidates: Vec<InstallCandidate>,
+    permission_denied: bool,
+}
+
+#[cfg(windows)]
+async fn discover_installations(
+    saved_path: Option<String>,
+    progress: Option<DiscoveryProgress>,
+) -> AppResult<Vec<InstallCandidate>> {
+    tokio::task::spawn_blocking(move || discover_installations_blocking(saved_path, progress))
+        .await
+        .map_err(|error| AppError::new("wangshangliao_discovery", error.to_string()))?
+}
+
+#[cfg(windows)]
+fn discover_installations_blocking(
+    saved_path: Option<String>,
+    progress: Option<DiscoveryProgress>,
+) -> AppResult<Vec<InstallCandidate>> {
+    let _guard = DISCOVERY_RUN_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| AppError::new("wangshangliao_discovery", "旺商聊路径扫描锁已损坏"))?;
+    report_discovery(
+        &progress,
+        "discovering",
+        "正在快速检查旺商聊运行进程和已保存路径。",
+    );
+
+    let mut raw = discover_registered_installations()?;
+    if let Some(path) = saved_path.filter(|value| !value.trim().is_empty()) {
+        raw.push(RawInstallCandidate {
+            path,
+            source: "已保存路径".into(),
+        });
+    }
+    raw.extend(common_installation_candidates());
+
+    report_discovery(&progress, "validating", "正在验证找到的旺商聊程序。");
+    let mut candidates = validate_candidates(raw);
+    if candidates.is_empty() {
+        let cache = DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        let cached = cache
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+            .filter(|value: &CachedDiscovery| value.at.elapsed() < DISCOVERY_CACHE_TTL);
+        let discovery = if let Some(cached) = cached {
+            report_discovery(
+                &progress,
+                "discovering",
+                "正在使用最近一次固定磁盘扫描结果。",
+            );
+            cached
+        } else {
+            report_discovery(
+                &progress,
+                "discovering",
+                "快速来源未命中，正在扫描本地固定磁盘。",
+            );
+            let (paths, permission_denied) = scan_fixed_drives();
+            report_discovery(
+                &progress,
+                "validating",
+                "正在验证磁盘扫描找到的旺商聊程序。",
+            );
+            let value = CachedDiscovery {
+                at: Instant::now(),
+                candidates: validate_candidates(paths),
+                permission_denied,
+            };
+            if let Ok(mut cache) = cache.lock() {
+                *cache = Some(value.clone());
+            }
+            value
+        };
+        candidates.extend(discovery.candidates);
+        if candidates.is_empty() && discovery.permission_denied {
+            return Err(AppError::new(
+                "permission-denied",
+                "部分本地目录没有读取权限，且其余可读取位置未找到旺商聊程序。",
+            ));
+        }
+    }
+    sort_and_deduplicate_candidates(&mut candidates);
+    Ok(candidates)
+}
+
+#[cfg(windows)]
+fn report_discovery(progress: &Option<DiscoveryProgress>, status: &str, detail: &str) {
+    if let Some(progress) = progress {
+        progress(status, detail);
+    }
+}
+
+#[cfg(windows)]
+fn common_installation_candidates() -> Vec<RawInstallCandidate> {
     let mut candidates = Vec::new();
     for root in [
         std::env::var("ProgramFiles").ok(),
@@ -339,19 +535,170 @@ pub async fn locate() -> AppResult<Vec<InstallCandidate>> {
             "WangShangLiao/WangShangLiao.exe",
             "旺商聊/旺商聊.exe",
         ] {
-            let path = PathBuf::from(&root).join(relative);
-            if path.is_file() {
-                candidates.push(InstallCandidate {
-                    path: path.to_string_lossy().into(),
-                    source: "常见安装目录".into(),
-                });
-            }
+            candidates.push(RawInstallCandidate {
+                path: PathBuf::from(&root).join(relative).to_string_lossy().into(),
+                source: "常见安装目录".into(),
+            });
         }
     }
-    candidates.extend(discover_registered_installations()?);
-    candidates.sort_by(|left, right| left.path.cmp(&right.path));
-    candidates.dedup_by(|left, right| left.path.eq_ignore_ascii_case(&right.path));
-    Ok(candidates)
+    candidates
+}
+
+#[cfg(windows)]
+fn validate_candidates(raw: Vec<RawInstallCandidate>) -> Vec<InstallCandidate> {
+    let mut raw = raw;
+    raw.sort_by(|left, right| {
+        candidate_source_priority(&left.source)
+            .cmp(&candidate_source_priority(&right.source))
+            .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+    });
+    raw.dedup_by(|left, right| left.path.eq_ignore_ascii_case(&right.path));
+    raw.into_iter()
+        .filter_map(|candidate| validate_candidate(Path::new(&candidate.path), &candidate.source))
+        .collect()
+}
+
+#[cfg(windows)]
+fn validate_candidate(path: &Path, source: &str) -> Option<InstallCandidate> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.is_file() || !is_wang_executable_name(&canonical) {
+        return None;
+    }
+    let directory = canonical.parent()?;
+    if !["resources.pak", "icudtl.dat", "ffmpeg.dll"]
+        .into_iter()
+        .all(|name| directory.join(name).is_file())
+    {
+        return None;
+    }
+    let info = image_version_info(&canonical).ok()?;
+    let product_identity =
+        format!("{} {}", info.product_name, info.file_description).to_lowercase();
+    let company_identity = info.company_name.to_lowercase();
+    let matches_identity =
+        |value: &str| value.contains("wangshangliao") || value.contains("旺商聊");
+    if info.file_version.trim().is_empty()
+        || !matches_identity(&product_identity)
+        || !matches_identity(&company_identity)
+    {
+        return None;
+    }
+    let running = source == "正在运行";
+    let modified_at = canonical
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map(format_system_time)
+        .unwrap_or_default();
+    Some(InstallCandidate {
+        path: canonical.to_string_lossy().into(),
+        source: source.into(),
+        version: info.file_version,
+        modified_at,
+        running,
+        verified: true,
+        validation: "文件名、版本信息和 Electron 运行结构均有效".into(),
+        priority: candidate_source_priority(source),
+    })
+}
+
+#[cfg(windows)]
+fn is_wang_executable_name(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    [
+        "wangshangliao_win_online.exe",
+        "wangshangliao.exe",
+        "旺商聊.exe",
+    ]
+    .into_iter()
+    .any(|expected| name.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(windows)]
+fn candidate_source_priority(source: &str) -> u32 {
+    match source {
+        "正在运行" => 0,
+        "已保存路径" => 10,
+        "用户桌面" => 20,
+        "公共桌面" => 30,
+        "开始菜单" => 40,
+        "Windows 注册表" | "App Paths" => 50,
+        "常见安装目录" => 60,
+        "固定磁盘扫描" => 70,
+        _ => 80,
+    }
+}
+
+#[cfg(windows)]
+fn sort_and_deduplicate_candidates(candidates: &mut Vec<InstallCandidate>) {
+    candidates.sort_by(compare_install_candidates);
+    let mut unique = Vec::<InstallCandidate>::new();
+    for candidate in candidates.drain(..) {
+        if unique
+            .iter()
+            .any(|value| value.path.eq_ignore_ascii_case(&candidate.path))
+        {
+            continue;
+        }
+        unique.push(candidate);
+    }
+    *candidates = unique;
+}
+
+#[cfg(windows)]
+fn compare_install_candidates(
+    left: &InstallCandidate,
+    right: &InstallCandidate,
+) -> std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then_with(|| compare_versions(&right.version, &left.version))
+        .then_with(|| {
+            right
+                .modified_at
+                .parse::<u64>()
+                .unwrap_or_default()
+                .cmp(&left.modified_at.parse::<u64>().unwrap_or_default())
+        })
+        .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+}
+
+#[cfg(any(test, windows))]
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let parts = |value: &str| {
+        value
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<u64>().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let left = parts(left);
+    let right = parts(right);
+    for index in 0..left.len().max(right.len()) {
+        let order = left
+            .get(index)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&right.get(index).copied().unwrap_or_default());
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[cfg(windows)]
+fn select_connected_process(
+    configured: Vec<ProcessRef>,
+    discovered: Option<ProcessRef>,
+) -> Option<(ProcessRef, bool)> {
+    configured
+        .into_iter()
+        .next()
+        .map(|process| (process, false))
+        .or_else(|| discovered.map(|process| (process, true)))
 }
 
 #[cfg(windows)]
@@ -388,9 +735,15 @@ pub async fn start(
 ) -> AppResult<WangStartResult> {
     use std::os::windows::process::CommandExt;
     let image_path = if let Some(path) = path.filter(|value| !value.trim().is_empty()) {
-        PathBuf::from(path)
+        let candidate = validate_candidate(Path::new(&path), "已保存路径").ok_or_else(|| {
+            AppError::new(
+                "wangshangliao_path",
+                "指定路径不是验证通过的旺商聊 Electron 主程序。",
+            )
+        })?;
+        PathBuf::from(candidate.path)
     } else {
-        select_installation(locate().await?, "使用")?
+        PathBuf::from(resolve_installation(None, None).await?.path)
     };
     let image_path = image_path.canonicalize().map_err(|error| {
         AppError::new("wangshangliao_path", format!("旺商聊路径不可用：{error}"))
@@ -413,6 +766,40 @@ pub async fn start(
         status.as_str(),
         "ready" | "devtools-ready" | "nim-not-ready"
     ) {
+        let configured_processes = list_processes(&image_path)?;
+        let discovered_process = if configured_processes.is_empty() {
+            running_process_identity_for(None).await.ok().flatten()
+        } else {
+            None
+        };
+        let Some((process, adopted_running_path)) =
+            select_connected_process(configured_processes, discovered_process)
+        else {
+            return Err(AppError::new(
+                "devtools_process_mismatch",
+                "9222 已连接旺商聊，但无法唯一确认对应主进程，已保持所有进程不变",
+            ));
+        };
+        let image_path = if adopted_running_path {
+            let running_path =
+                PathBuf::from(&process.image_path)
+                    .canonicalize()
+                    .map_err(|error| {
+                        AppError::new(
+                            "devtools_process_mismatch",
+                            format!("无法确认当前旺商聊主进程路径：{error}"),
+                        )
+                    })?;
+            if validate_candidate(&running_path, "正在运行").is_none() {
+                return Err(AppError::new(
+                    "devtools_process_mismatch",
+                    "9222 已连接旺商聊，但当前运行主进程未通过路径和程序校验，已保持所有进程不变",
+                ));
+            }
+            running_path
+        } else {
+            image_path
+        };
         let profile_detail = match prepare_persistent_profile(&image_path) {
             Ok(detail) => detail,
             Err(error) if error.code == "profile_permission" => {
@@ -428,23 +815,21 @@ pub async fn start(
             }
             Err(error) => format!("账号登录复用待处理：{}。", error.message),
         };
-        let processes = list_processes(&image_path)?;
-        if let Some(process) = processes.first() {
-            activate(process.pid)?;
-            return Ok(WangStartResult {
-                status,
-                detail: format!(
-                    "旺商聊已打开并恢复到前台。{profile_detail}如果 NIM 尚未就绪，请在旺商聊完成登录后稍候。"
-                ),
-                needs_confirmation: false,
-                maintenance_request_id: None,
-                process: Some(process.clone()),
-            });
-        }
-        return Err(AppError::new(
-            "devtools_process_mismatch",
-            "9222 上已有旺商聊 DevTools，但与当前选择的程序路径不匹配，已保持所有进程不变",
-        ));
+        let adopted_detail = if adopted_running_path {
+            "已自动匹配正在运行的旺商聊版本。"
+        } else {
+            ""
+        };
+        activate(process.pid)?;
+        return Ok(WangStartResult {
+            status,
+            detail: format!(
+                "旺商聊已打开并恢复到前台。{adopted_detail}{profile_detail}如果 NIM 尚未就绪，请在旺商聊完成登录后稍候。"
+            ),
+            needs_confirmation: false,
+            maintenance_request_id: None,
+            process: Some(process),
+        });
     }
     let processes = list_processes(&image_path)?;
     if !processes.is_empty() && !confirm_restart {
@@ -535,6 +920,19 @@ pub async fn start(
         maintenance_request_id: None,
         process: Some(started),
     })
+}
+
+#[cfg(windows)]
+pub async fn focus(path: Option<String>) -> AppResult<()> {
+    let image_path = resolve_image_path(path).await?;
+    let processes = list_processes(&image_path)?;
+    if let Some(process) = processes.first() {
+        return activate(process.pid);
+    }
+    Err(AppError::new(
+        "wangshangliao_not_running",
+        "没有找到正在运行的旺商聊主进程。",
+    ))
 }
 
 #[cfg(windows)]
@@ -901,33 +1299,15 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
 
 #[cfg(windows)]
 async fn resolve_image_path(path: Option<String>) -> AppResult<PathBuf> {
-    let value = if let Some(path) = path.filter(|value| !value.trim().is_empty()) {
-        PathBuf::from(path)
-    } else {
-        select_installation(locate().await?, "维护")?
-    };
+    let value = resolve_installation(path, None).await?;
+    let value = PathBuf::from(value.path);
     value
         .canonicalize()
         .map_err(|error| AppError::new("wangshangliao_path", format!("旺商聊路径不可用：{error}")))
 }
 
 #[cfg(windows)]
-fn select_installation(candidates: Vec<InstallCandidate>, purpose: &str) -> AppResult<PathBuf> {
-    match candidates.as_slice() {
-        [] => Err(AppError::new(
-            "wangshangliao_not_found",
-            "没有找到旺商聊安装路径",
-        )),
-        [candidate] => Ok(PathBuf::from(&candidate.path)),
-        _ => Err(AppError::new(
-            "wangshangliao_multiple",
-            format!("找到多个旺商聊安装位置，请先选择要{purpose}的程序路径"),
-        )),
-    }
-}
-
-#[cfg(windows)]
-fn discover_registered_installations() -> AppResult<Vec<InstallCandidate>> {
+fn discover_registered_installations() -> AppResult<Vec<RawInstallCandidate>> {
     use std::os::windows::process::CommandExt;
     let script = r#"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -954,18 +1334,40 @@ foreach ($entry in Get-ItemProperty $uninstallRoots) {
     if ($entry.InstallLocation) { Add-Candidate (Join-Path $entry.InstallLocation $name) 'Windows 注册表' }
   }
 }
-$shell = New-Object -ComObject WScript.Shell
-$menus = @(
-  (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
-  (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs')
+$appPathRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths'
 )
-foreach ($menu in $menus) {
-  foreach ($shortcut in Get-ChildItem -LiteralPath $menu -Filter '*.lnk' -Recurse) {
-    if ($shortcut.BaseName -notmatch '旺商聊|wangshangliao') { continue }
-    Add-Candidate ($shell.CreateShortcut($shortcut.FullName).TargetPath) '开始菜单'
+foreach ($root in $appPathRoots) {
+  foreach ($name in @('wangshangliao_win_online.exe', 'WangShangLiao.exe', '旺商聊.exe')) {
+    $entry = Get-ItemProperty -LiteralPath (Join-Path $root $name)
+    if ($entry.'(default)') { Add-Candidate $entry.'(default)' 'App Paths' }
+    if ($entry.PSPath) {
+      $defaultValue = (Get-Item -LiteralPath (Join-Path $root $name)).GetValue('')
+      Add-Candidate $defaultValue 'App Paths'
+    }
   }
 }
-@($items) | ConvertTo-Json -Compress
+$shell = New-Object -ComObject WScript.Shell
+$menus = @(
+  [pscustomobject]@{ Path=(Join-Path $env:USERPROFILE 'Desktop'); Source='用户桌面' },
+  [pscustomobject]@{ Path=(Join-Path $env:PUBLIC 'Desktop'); Source='公共桌面' },
+  [pscustomobject]@{ Path=(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'); Source='开始菜单' },
+  [pscustomobject]@{ Path=(Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'); Source='开始菜单' }
+)
+foreach ($menu in $menus) {
+  foreach ($shortcut in Get-ChildItem -LiteralPath $menu.Path -Filter '*.lnk' -Recurse) {
+    if ($shortcut.BaseName -notmatch '旺商聊|wangshangliao') { continue }
+    Add-Candidate ($shell.CreateShortcut($shortcut.FullName).TargetPath) $menu.Source
+  }
+}
+$running = Get-CimInstance Win32_Process | Where-Object {
+  $_.ExecutablePath -and
+  $_.Name -match '^(wangshangliao_win_online|WangShangLiao|旺商聊)\.exe$' -and
+  $_.CommandLine -notmatch '--type=|--utility-sub-type=|--crashpad-handler'
+}
+foreach ($process in $running) { Add-Candidate $process.ExecutablePath '正在运行' }
+$items | ConvertTo-Json -Compress
 "#;
     let output = std::process::Command::new("powershell.exe")
         .args([
@@ -996,6 +1398,128 @@ foreach ($menu in $menus) {
     } else {
         Ok(Vec::new())
     }
+}
+
+#[cfg(windows)]
+fn scan_fixed_drives() -> (Vec<RawInstallCandidate>, bool) {
+    let mut candidates = Vec::new();
+    let mut permission_denied = false;
+    for drive in fixed_drive_roots() {
+        scan_directory(&drive, &mut candidates, &mut permission_denied);
+    }
+    (candidates, permission_denied)
+}
+
+#[cfg(windows)]
+fn fixed_drive_roots() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED_TYPE: u32 = 3;
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26)
+        .filter(|index| mask & (1 << index) != 0)
+        .filter_map(|index| {
+            let root = format!("{}:\\", (b'A' + index as u8) as char);
+            let wide = wide(&root);
+            (unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_FIXED_TYPE)
+                .then(|| PathBuf::from(root))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn scan_directory(
+    root: &Path,
+    candidates: &mut Vec<RawInstallCandidate>,
+    permission_denied: &mut bool,
+) {
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if directory == root && error.kind() == std::io::ErrorKind::PermissionDenied {
+                    *permission_denied = true;
+                }
+                continue;
+            }
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() || is_reparse_point(&path) {
+                continue;
+            }
+            if file_type.is_dir() {
+                if should_descend_into(&path) {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if file_type.is_file() && is_wang_executable_name(&path) {
+                candidates.push(RawInstallCandidate {
+                    path: path.to_string_lossy().into(),
+                    source: "固定磁盘扫描".into(),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn should_descend_into(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    ![
+        "$Recycle.Bin",
+        "System Volume Information",
+        "Recovery",
+        "WindowsApps",
+    ]
+    .into_iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+#[cfg(windows)]
+fn image_version_info(path: &Path) -> AppResult<ImageVersionInfo> {
+    use std::os::windows::process::CommandExt;
+    let escaped = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $v=(Get-Item -LiteralPath '{escaped}' -ErrorAction Stop).VersionInfo; [pscustomobject]@{{ProductName=$v.ProductName;FileDescription=$v.FileDescription;CompanyName=$v.CompanyName;FileVersion=$v.FileVersion}} | ConvertTo-Json -Compress"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|error| AppError::new("process_version", error.to_string()))?;
+    if !output.status.success() {
+        return Err(AppError::new(
+            "process_version",
+            "读取旺商聊文件版本信息失败",
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| AppError::new("process_version", error.to_string()))
 }
 
 #[cfg(windows)]
@@ -1370,54 +1894,66 @@ fn sha256_file(path: &Path) -> AppResult<String> {
 
 #[cfg(windows)]
 fn image_file_version(path: &Path) -> AppResult<String> {
-    use std::os::windows::process::CommandExt;
-    let escaped = path.to_string_lossy().replace('\'', "''");
-    let script =
-        format!("(Get-Item -LiteralPath '{escaped}' -ErrorAction Stop).VersionInfo.FileVersion");
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|error| AppError::new("process_version", error.to_string()))?;
-    if !output.status.success() {
-        return Err(AppError::new("process_version", "读取旺商聊文件版本失败"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(image_version_info(path)?.file_version)
 }
 
 #[cfg(windows)]
 fn activate(pid: u32) -> AppResult<()> {
-    use std::os::windows::process::CommandExt;
-    let script = format!(
-        r#"$sig='public delegate bool EnumWindowsProc(IntPtr hWnd,IntPtr lParam);[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback,IntPtr lParam);[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd,out uint processId);[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd,int nCmdShow);[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);';Add-Type -MemberDefinition $sig -Name Win -Namespace DH;$script:count=0;$callback={{param($h,$l)[uint32]$owner=0;[DH.Win]::GetWindowThreadProcessId($h,[ref]$owner)|Out-Null;if($owner -eq {pid}){{[DH.Win]::ShowWindowAsync($h,9)|Out-Null;[DH.Win]::SetForegroundWindow($h)|Out-Null;$script:count++}};return $true}};[DH.Win]::EnumWindows($callback,[IntPtr]::Zero)|Out-Null;if($script:count -lt 1){{exit 3}}"#
-    );
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|error| AppError::new("window_activate", error.to_string()))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(AppError::new(
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindowAsync,
+        SW_RESTORE,
+    };
+
+    struct WindowSearch {
+        pid: u32,
+        window: HWND,
+    }
+
+    unsafe extern "system" fn find_main_window(window: HWND, context: LPARAM) -> BOOL {
+        let search = &mut *(context as *mut WindowSearch);
+        let mut owner_pid = 0;
+        GetWindowThreadProcessId(window, &mut owner_pid);
+        if owner_pid != search.pid {
+            return 1;
+        }
+        let mut class_name = [0u16; 256];
+        let length = GetClassNameW(window, class_name.as_mut_ptr(), class_name.len() as i32);
+        if length > 0
+            && String::from_utf16_lossy(&class_name[..length as usize]) == "Chrome_WidgetWin_1"
+        {
+            search.window = window;
+            return 0;
+        }
+        1
+    }
+
+    let mut search = WindowSearch {
+        pid,
+        window: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(find_main_window),
+            &mut search as *mut WindowSearch as LPARAM,
+        );
+    }
+    if search.window.is_null() {
+        return Err(AppError::new(
             "window_activate",
             "未找到旺商聊主窗口，进程仍在运行，请从旺商聊托盘图标打开",
-        ))
+        ));
     }
+    unsafe {
+        ShowWindowAsync(search.window, SW_RESTORE);
+        if SetForegroundWindow(search.window) == 0 {
+            return Err(AppError::new(
+                "window_activate",
+                "旺商聊主窗口已恢复，但 Windows 拒绝将它切换到前台",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1432,12 +1968,113 @@ fn format_system_time(value: SystemTime) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn candidate(path: &str, source: &str, version: &str, modified_at: &str) -> InstallCandidate {
+        InstallCandidate {
+            path: path.into(),
+            source: source.into(),
+            version: version.into(),
+            modified_at: modified_at.into(),
+            running: source == "正在运行",
+            verified: true,
+            validation: "validated".into(),
+            priority: candidate_source_priority(source),
+        }
+    }
+
+    #[cfg(windows)]
+    fn process(pid: u32, path: &str) -> ProcessRef {
+        ProcessRef {
+            pid,
+            image_path: path.into(),
+            started_at: String::new(),
+            creation_time: String::new(),
+            file_version: "2.7.8".into(),
+            sha256: "hash".into(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn connected_process_prefers_configured_path() {
+        let selected = process(10, "D:/wangshangliao.exe");
+        let running = process(20, "C:/wangshangliao.exe");
+        let result = select_connected_process(vec![selected.clone()], Some(running));
+        assert_eq!(result.as_ref().map(|value| value.0.pid), Some(selected.pid));
+        assert!(!result.expect("configured process").1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn connected_process_adopts_unique_running_path() {
+        let running = process(20, "C:/wangshangliao.exe");
+        let result = select_connected_process(Vec::new(), Some(running.clone()));
+        assert_eq!(result.as_ref().map(|value| value.0.pid), Some(running.pid));
+        assert!(result.expect("running process").1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn connected_process_rejects_ambiguous_running_paths() {
+        assert!(select_connected_process(Vec::new(), None).is_none());
+    }
+
     #[test]
     fn process_paths_are_case_insensitive_on_windows() {
         assert!(Path::new("C:/WangShangLiao.exe")
             .to_string_lossy()
             .to_lowercase()
             .ends_with("wangshangliao.exe"));
+    }
+
+    #[test]
+    fn version_comparison_handles_numeric_segments() {
+        assert_eq!(
+            compare_versions("2.7.10", "2.7.8"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("3.0", "3.0.0"), std::cmp::Ordering::Equal);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installation_order_prefers_current_use_then_saved_then_desktop() {
+        let mut candidates = vec![
+            candidate("D:/registry.exe", "Windows 注册表", "9.0.0", "9"),
+            candidate("D:/desktop.exe", "用户桌面", "1.0.0", "1"),
+            candidate("D:/saved.exe", "已保存路径", "1.0.0", "1"),
+            candidate("D:/running.exe", "正在运行", "1.0.0", "1"),
+        ];
+        sort_and_deduplicate_candidates(&mut candidates);
+        assert_eq!(candidates[0].source, "正在运行");
+        assert_eq!(candidates[1].source, "已保存路径");
+        assert_eq!(candidates[2].source, "用户桌面");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installation_order_uses_version_and_modified_time_for_equal_sources() {
+        let mut candidates = vec![
+            candidate("D:/old.exe", "固定磁盘扫描", "2.7.8", "100"),
+            candidate("D:/newer.exe", "固定磁盘扫描", "2.7.10", "50"),
+            candidate("D:/newest.exe", "固定磁盘扫描", "2.7.10", "200"),
+        ];
+        sort_and_deduplicate_candidates(&mut candidates);
+        assert_eq!(candidates[0].path, "D:/newest.exe");
+        assert_eq!(candidates[1].path, "D:/newer.exe");
+        assert_eq!(candidates[2].path, "D:/old.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_installations_keep_the_highest_priority_source() {
+        let mut candidates = vec![
+            candidate("D:/Wang.exe", "Windows 注册表", "2.7.8", "1"),
+            candidate("d:/wang.exe", "正在运行", "2.7.8", "1"),
+        ];
+        sort_and_deduplicate_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, "正在运行");
     }
 
     #[test]

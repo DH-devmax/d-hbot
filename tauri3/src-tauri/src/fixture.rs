@@ -217,7 +217,13 @@ impl FixtureGateway {
             );
         }
         for user_id in 10001..=10004 {
-            let role = if user_id == 10001 { "owner" } else if user_id == 10002 { "admin" } else { "member" };
+            let role = if user_id == 10001 {
+                "owner"
+            } else if user_id == 10002 {
+                "admin"
+            } else {
+                "member"
+            };
             let name = format!("第二群成员{}", user_id - 10000);
             members.insert(
                 (FIXTURE_SECOND_GROUP, user_id),
@@ -606,7 +612,8 @@ impl FixtureGateway {
                     "groupCloudId": format!("fixture-cloud-{}", group.group_id),
                     "groupName": group.name,
                     "ownerUserId": group.owner_user_id,
-                    "memberCount": snapshot.members.iter().filter(|member| member.group_id == group.group_id && member.present).count()
+                    "memberCount": snapshot.members.iter().filter(|member| member.group_id == group.group_id && member.present).count(),
+                    "muteMode": if snapshot.group_mutes.contains(&group.group_id) { "MUTE_MEMBER" } else { "MUTE_NO" }
                 })
             })
             .collect::<Vec<_>>();
@@ -620,6 +627,16 @@ impl FixtureGateway {
             .into_iter()
             .filter(|member| member.group_id == group_id && member.present)
             .map(|member| {
+                let account_state =
+                    if snapshot.member_mutes.iter().any(|mute| {
+                        mute.group_id == member.group_id && mute.user_id == member.user_id
+                    }) {
+                        "ACCOUNT_STATE_MUTE"
+                    } else if member.account_state.is_empty() {
+                        "ACCOUNT_STATE_GOOD"
+                    } else {
+                        member.account_state.as_str()
+                    };
                 json!({
                     "groupId": member.group_id,
                     "userId": member.user_id,
@@ -627,7 +644,7 @@ impl FixtureGateway {
                     "userNick": member.nickname,
                     "groupMemberNick": member.card_name,
                     "groupRole": member.role,
-                    "accountState": member.account_state
+                    "accountState": account_state
                 })
             })
             .collect::<Vec<_>>();
@@ -876,38 +893,47 @@ impl GroupGateway for FixtureGateway {
             .filter(|member| member.group_id == group_id && member.present)
             .cloned()
             .collect::<Vec<_>>();
-        let reported_count = members.len();
-        if state.faults.partial_members {
+        let source_reported_count = members.len();
+        let partial_members = state.faults.partial_members;
+        if partial_members {
             members.truncate(members.len().min(8));
         }
+        let reported_count = members.len();
         Ok(MemberRoster {
+            status: if partial_members { "partial" } else { "ready" }.into(),
             resolved_count: members.len(),
             reported_count,
-            complete: members.len() == reported_count,
-            completeness: if members.len() == reported_count {
-                RosterCompleteness::Complete
-            } else {
+            complete: !partial_members,
+            completeness: if partial_members {
                 RosterCompleteness::Partial
+            } else {
+                RosterCompleteness::Complete
             },
-            completeness_reason: if members.len() == reported_count {
+            completeness_reason: if !partial_members {
                 "Fixture 权威完整名单".into()
             } else {
                 "Fixture 注入了部分成员名单".into()
             },
             http_returned_count: members.len(),
-            http_reported_count: reported_count,
+            http_reported_count: source_reported_count,
             http_cursor: None,
             nim_returned_count: members.len(),
-            nim_reported_count: reported_count,
+            nim_reported_count: source_reported_count,
             nim_cursor: None,
-            authority: if members.len() == reported_count {
-                "authoritative"
-            } else {
+            authority: if partial_members {
                 "partial"
+            } else {
+                "authoritative"
             }
             .into(),
             members,
             sources: vec!["fixture-http".into(), "fixture-nim".into()],
+            source_errors: Vec::new(),
+            retry_at: None,
+            canonical_count: reported_count,
+            synthetic_user_ids: Vec::new(),
+            http_pages: 1,
+            nim_pages: 1,
         })
     }
 
@@ -1285,6 +1311,7 @@ impl RuntimeGateway for FixtureGateway {
             acknowledged: value.get("acked").and_then(Value::as_u64).unwrap_or(0) as usize,
             remaining: value.get("remaining").and_then(Value::as_u64).unwrap_or(0) as usize,
             dropped: 0,
+            verification: Some("not-applicable".into()),
         })
     }
 
@@ -1401,11 +1428,17 @@ mod tests {
     #[tokio::test]
     async fn two_fixture_groups_track_batch_mute_and_unmute_state_independently() {
         let fixture = FixtureGateway::new_default();
-        assert_eq!(fixture.capabilities().group_mute, CapabilityStatus::Supported);
+        assert_eq!(
+            fixture.capabilities().group_mute,
+            CapabilityStatus::Supported
+        );
         for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
             fixture.set_group_mute(group_id, true).await.unwrap();
         }
-        assert_eq!(fixture.snapshot().await.group_mutes, vec![FIXTURE_GROUP, FIXTURE_SECOND_GROUP]);
+        assert_eq!(
+            fixture.snapshot().await.group_mutes,
+            vec![FIXTURE_GROUP, FIXTURE_SECOND_GROUP]
+        );
         for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
             fixture.set_group_mute(group_id, false).await.unwrap();
         }
@@ -1555,7 +1588,7 @@ mod tests {
             })
             .await;
         let roster = fixture.list_members(FIXTURE_GROUP).await.unwrap();
-        assert_eq!(roster.reported_count, 16);
+        assert_eq!(roster.reported_count, 8);
         assert_eq!(roster.resolved_count, 8);
         assert_eq!(roster.completeness, RosterCompleteness::Partial);
         assert_eq!(roster.authority, "partial");

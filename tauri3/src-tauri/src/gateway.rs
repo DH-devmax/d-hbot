@@ -1,23 +1,27 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock as SyncRwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::{
+    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::contracts::{runtime_capabilities, unverified_production_capabilities};
 use crate::error::{
     AppError, AppResult, GatewayErrorKind, GatewayErrorLayer, GatewayErrorMetadata,
 };
 use crate::models::{
-    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, Message, RosterCompleteness,
+    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, MemberSourceError, Message,
+    RosterCompleteness,
 };
 
 const GROUP_LIST_ROUTE: &str = "/v1/group/get-group-list";
@@ -124,6 +128,8 @@ pub struct GatewayReceipt {
     pub remaining: usize,
     #[serde(default)]
     pub dropped: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
 }
 
 impl GatewayReceipt {
@@ -143,6 +149,7 @@ impl GatewayReceipt {
             acknowledged: 0,
             remaining: 0,
             dropped: 0,
+            verification: Some("not-applicable".into()),
         }
     }
 
@@ -166,6 +173,7 @@ impl GatewayReceipt {
             acknowledged: 0,
             remaining: 0,
             dropped: 0,
+            verification: Some("not-applicable".into()),
         }
     }
 }
@@ -190,6 +198,84 @@ pub struct CdpClient {
     base_url: String,
     http: reqwest::Client,
     next_id: Arc<AtomicU64>,
+    request_gate: Arc<GatewayRequestGate>,
+    page_cache: Arc<RwLock<Option<(Instant, DevToolsPage)>>>,
+    diagnostic_cache: Arc<RwLock<Option<(Instant, DiagnosticSnapshot)>>>,
+    session: Arc<tokio::sync::Mutex<Option<CdpSession>>>,
+}
+
+struct CdpSession {
+    websocket_url: String,
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+}
+
+const GATE_MIN_INTERVAL: Duration = Duration::from_millis(150);
+const GATE_MAX_WAITERS: usize = 64;
+const GATE_MAX_WAIT: Duration = Duration::from_secs(10);
+
+struct GatewayRequestGate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    state: SyncMutex<GatewayRequestGateState>,
+}
+
+#[derive(Debug)]
+struct GatewayRequestGateState {
+    waiters: usize,
+    last_started: Option<Instant>,
+}
+
+impl GatewayRequestGate {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            state: SyncMutex::new(GatewayRequestGateState {
+                waiters: 0,
+                last_started: None,
+            }),
+        }
+    }
+
+    async fn acquire(&self, route: &str) -> AppResult<tokio::sync::OwnedMutexGuard<()>> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppError::new("gateway_busy", "网关请求闸门状态不可用"))?;
+            if state.waiters >= GATE_MAX_WAITERS {
+                return Err(
+                    AppError::new("gateway_busy", format!("网关请求排队已满：{route}")).retryable(),
+                );
+            }
+            state.waiters += 1;
+        }
+
+        let guard = match timeout(GATE_MAX_WAIT, self.lock.clone().lock_owned()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.waiters = state.waiters.saturating_sub(1);
+                }
+                return Err(
+                    AppError::new("gateway_busy", format!("网关请求排队超时：{route}")).retryable(),
+                );
+            }
+        };
+
+        let delay = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_started)
+            .and_then(|started| GATE_MIN_INTERVAL.checked_sub(started.elapsed()));
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.waiters = state.waiters.saturating_sub(1);
+            state.last_started = Some(Instant::now());
+        }
+        Ok(guard)
+    }
 }
 
 impl CdpClient {
@@ -215,6 +301,10 @@ impl CdpClient {
                 .build()
                 .map_err(|error| AppError::new("devtools_client", error.to_string()))?,
             next_id: Arc::new(AtomicU64::new(1)),
+            request_gate: Arc::new(GatewayRequestGate::new()),
+            page_cache: Arc::new(RwLock::new(None)),
+            diagnostic_cache: Arc::new(RwLock::new(None)),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -254,6 +344,11 @@ impl CdpClient {
     }
 
     async fn page(&self) -> AppResult<DevToolsPage> {
+        if let Some((checked_at, page)) = self.page_cache.read().await.clone() {
+            if checked_at.elapsed() < Duration::from_secs(1) {
+                return Ok(page);
+            }
+        }
         let pages = self.pages().await?;
         let candidates = pages
             .into_iter()
@@ -269,7 +364,9 @@ impl CdpClient {
                     + usize::from(identity.contains("wangshangliao"))
             })
         {
-            return Ok(page.clone());
+            let page = page.clone();
+            *self.page_cache.write().await = Some((Instant::now(), page.clone()));
+            return Ok(page);
         }
         if candidates.is_empty() {
             Err(AppError::new("devtools_page", "DevTools 中没有可用的页面").retryable())
@@ -281,7 +378,10 @@ impl CdpClient {
         }
     }
 
+    #[allow(unreachable_code)]
     pub async fn evaluate(&self, expression: &str) -> AppResult<Value> {
+        return self.evaluate_persistent(expression).await;
+        let _gate = self.request_gate.acquire("Runtime.evaluate").await?;
         let page = self.page().await?;
         let websocket = page
             .web_socket_debugger_url
@@ -343,7 +443,61 @@ impl CdpClient {
         Ok(result)
     }
 
+    async fn evaluate_persistent(&self, expression: &str) -> AppResult<Value> {
+        let _gate = self.request_gate.acquire("Runtime.evaluate").await?;
+        let page = self.page().await?;
+        let websocket = page
+            .web_socket_debugger_url
+            .ok_or_else(|| AppError::new("devtools_page", "DevTools 页面缺少 WebSocket 地址"))?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut session = self.session.lock().await;
+        if session
+            .as_ref()
+            .is_none_or(|current| current.websocket_url != websocket)
+        {
+            let (stream, _) = timeout(Duration::from_secs(8), connect_async(websocket.as_str()))
+                .await
+                .map_err(|_| {
+                    AppError::new("cdp_timeout", "连接 DevTools WebSocket 超时").retryable()
+                })?
+                .map_err(|error| {
+                    AppError::new(
+                        "cdp_connect",
+                        format!("连接 DevTools WebSocket 失败：{error}"),
+                    )
+                    .retryable()
+                })?;
+            *session = Some(CdpSession {
+                websocket_url: websocket,
+                stream,
+            });
+        }
+        let result = evaluate_cdp_session(
+            session.as_mut().expect("CDP session initialized"),
+            id,
+            expression,
+        )
+        .await;
+        if result.is_err() {
+            *session = None;
+            *self.page_cache.write().await = None;
+            *self.diagnostic_cache.write().await = None;
+        }
+        result
+    }
+
     pub async fn diagnose(&self) -> DiagnosticSnapshot {
+        if let Some((checked_at, snapshot)) = self.diagnostic_cache.read().await.clone() {
+            if checked_at.elapsed() < Duration::from_secs(2) {
+                return snapshot;
+            }
+        }
+        let snapshot = self.diagnose_uncached().await;
+        *self.diagnostic_cache.write().await = Some((Instant::now(), snapshot.clone()));
+        snapshot
+    }
+
+    async fn diagnose_uncached(&self) -> DiagnosticSnapshot {
         let mut snapshot = DiagnosticSnapshot {
             status: ConnectionStatus::Unavailable,
             devtools_url: self.base_url.clone(),
@@ -376,22 +530,69 @@ impl CdpClient {
                 snapshot.nim_account = value.get("nimAccount").and_then(Value::as_str).unwrap_or_default().to_string();
                 if snapshot.nim_account.is_empty() {
                     snapshot.status = ConnectionStatus::NimNotReady;
-                    snapshot.detail = "DevTools 已连接，NIM 尚未初始化".into();
+                    snapshot.detail = "需要您登录账号，等待登录".into();
                 } else {
                     snapshot.status = ConnectionStatus::Ready;
                     snapshot.detail = "旺商聊协议会话已就绪".into();
                 }
             }
-            Err(error) => snapshot.detail = error.message,
+            Err(error) => {
+                snapshot.status = ConnectionStatus::NimNotReady;
+                snapshot.detail = error.message;
+            }
         }
         snapshot
     }
+}
+
+async fn evaluate_cdp_session(
+    session: &mut CdpSession,
+    id: u64,
+    expression: &str,
+) -> AppResult<Value> {
+    let request = json!({
+        "id": id,
+        "method": "Runtime.evaluate",
+        "params": { "expression": expression, "awaitPromise": true, "returnByValue": true }
+    });
+    session
+        .stream
+        .send(WsMessage::Text(request.to_string().into()))
+        .await
+        .map_err(|error| AppError::new("cdp_write", format!("CDP 写入失败：{error}")))?;
+    timeout(Duration::from_secs(25), async {
+        while let Some(item) = session.stream.next().await {
+            let item = item.map_err(|error| AppError::new("cdp_read", error.to_string()))?;
+            if !item.is_text() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(item.to_text().unwrap_or_default())
+                .map_err(|error| AppError::new("cdp_response", error.to_string()))?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(exception) = value
+                .pointer("/result/exceptionDetails/text")
+                .and_then(Value::as_str)
+            {
+                return Err(AppError::new("cdp_exception", exception.to_string()));
+            }
+            return Ok(value
+                .pointer("/result/result/value")
+                .cloned()
+                .unwrap_or(Value::Null));
+        }
+        Err(AppError::new("cdp_closed", "DevTools WebSocket 已关闭").retryable())
+    })
+    .await
+    .map_err(|_| AppError::new("cdp_timeout", "DevTools 执行超时").retryable())?
 }
 
 #[async_trait]
 pub trait GroupGateway: Send + Sync {
     async fn list_groups(&self) -> AppResult<Vec<Group>>;
     async fn list_members(&self, group_id: i64) -> AppResult<MemberRoster>;
+    async fn invalidate_member_cache(&self, _group_id: i64) {}
     async fn send_text(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt>;
     async fn recall(
         &self,
@@ -476,6 +677,12 @@ pub trait RuntimeGateway: GroupGateway {
     async fn poll_events(&self) -> AppResult<Vec<GatewayEvent>> {
         Ok(Vec::new())
     }
+    async fn member_events(&self, _records: Vec<GatewayRecord>) -> AppResult<Vec<GatewayEvent>> {
+        Ok(Vec::new())
+    }
+    fn session_epoch(&self) -> u64 {
+        0
+    }
     fn calibrate_capabilities(
         &self,
         _app_file_version: &str,
@@ -484,6 +691,9 @@ pub trait RuntimeGateway: GroupGateway {
         self.capabilities()
     }
     fn capabilities(&self) -> GatewayCapabilities;
+    fn member_sync_paused(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -492,8 +702,28 @@ pub struct CdpGateway {
     account_id: Arc<RwLock<String>>,
     sender_id: Arc<RwLock<i64>>,
     listener_session: Arc<RwLock<String>>,
+    session_epoch: Arc<AtomicU64>,
     delivered_event_sequences: Arc<RwLock<BTreeMap<String, u64>>>,
     capabilities: Arc<SyncRwLock<GatewayCapabilities>>,
+    member_requests: Arc<RwLock<BTreeMap<i64, Arc<MemberRequest>>>>,
+    member_transport_gate: Arc<tokio::sync::Mutex<()>>,
+    member_throttle: Arc<SyncMutex<MemberThrottle>>,
+    identity_checked_at: Arc<SyncMutex<Option<Instant>>>,
+    identity_gate: Arc<tokio::sync::Mutex<()>>,
+    group_cache: Arc<RwLock<GroupCache>>,
+    group_refresh_gate: Arc<tokio::sync::Mutex<()>>,
+    member_cache: Arc<RwLock<BTreeMap<i64, (Instant, MemberRoster)>>>,
+}
+
+#[derive(Debug, Default)]
+struct MemberThrottle {
+    consecutive_rate_limits: u32,
+    cooldown_until: Option<Instant>,
+}
+
+struct MemberRequest {
+    result: tokio::sync::OnceCell<AppResult<MemberRoster>>,
+    notify: tokio::sync::Notify,
 }
 
 impl CdpGateway {
@@ -503,13 +733,69 @@ impl CdpGateway {
             account_id: Arc::new(RwLock::new(String::new())),
             sender_id: Arc::new(RwLock::new(0)),
             listener_session: Arc::new(RwLock::new(String::new())),
+            session_epoch: Arc::new(AtomicU64::new(0)),
             delivered_event_sequences: Arc::new(RwLock::new(BTreeMap::new())),
             capabilities: Arc::new(SyncRwLock::new(unverified_production_capabilities())),
+            member_requests: Arc::new(RwLock::new(BTreeMap::new())),
+            member_transport_gate: Arc::new(tokio::sync::Mutex::new(())),
+            member_throttle: Arc::new(SyncMutex::new(MemberThrottle::default())),
+            identity_checked_at: Arc::new(SyncMutex::new(None)),
+            identity_gate: Arc::new(tokio::sync::Mutex::new(())),
+            group_cache: Arc::new(RwLock::new(None)),
+            group_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
+            member_cache: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     pub fn cdp(&self) -> &CdpClient {
         &self.cdp
+    }
+
+    pub fn member_sync_paused(&self) -> bool {
+        self.member_throttle
+            .lock()
+            .ok()
+            .and_then(|state| state.cooldown_until)
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    pub async fn invalidate_member_cache(&self, group_id: i64) {
+        self.member_cache.write().await.remove(&group_id);
+    }
+
+    async fn reset_session_state(&self) {
+        let had_session = !self.account_id.read().await.is_empty()
+            || *self.sender_id.read().await > 0
+            || self
+                .identity_checked_at
+                .lock()
+                .ok()
+                .and_then(|checked| *checked)
+                .is_some();
+        if !had_session {
+            return;
+        }
+        *self.account_id.write().await = String::new();
+        *self.sender_id.write().await = 0;
+        if let Ok(mut checked) = self.identity_checked_at.lock() {
+            *checked = None;
+        }
+        self.group_cache.write().await.take();
+        self.member_cache.write().await.clear();
+        self.member_requests.write().await.clear();
+        self.delivered_event_sequences.write().await.clear();
+        if let Ok(mut throttle) = self.member_throttle.lock() {
+            *throttle = MemberThrottle::default();
+        }
+        self.session_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn member_retry_after(&self) -> Option<Duration> {
+        self.member_throttle
+            .lock()
+            .ok()
+            .and_then(|state| state.cooldown_until)
+            .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
     fn require_capability(&self, status: CapabilityStatus, capability: &str) -> AppResult<()> {
@@ -535,8 +821,19 @@ impl CdpGateway {
     }
 
     async fn group_infos(&self) -> AppResult<Vec<GroupInfo>> {
+        if let Some((checked_at, groups)) = self.group_cache.read().await.clone() {
+            if checked_at.elapsed() < Duration::from_secs(10) {
+                return Ok(groups);
+            }
+        }
+        let _refresh = self.group_refresh_gate.lock().await;
+        if let Some((checked_at, groups)) = self.group_cache.read().await.clone() {
+            if checked_at.elapsed() < Duration::from_secs(10) {
+                return Ok(groups);
+            }
+        }
         let data = self.xclient(GROUP_LIST_ROUTE, json!({"v":"0"})).await?;
-        let mut groups = Vec::new();
+        let mut groups: BTreeMap<i64, GroupInfo> = BTreeMap::new();
         for (key, relation) in [("owner", "owner"), ("member", "member")] {
             for value in data
                 .get(key)
@@ -548,32 +845,56 @@ impl CdpGateway {
                 if group_id <= 0 {
                     continue;
                 }
-                groups.push(GroupInfo {
+                let candidate = GroupInfo {
                     group_id,
                     cloud_id: text_field(value, &["groupCloudId"]),
                     name: human_name_field(value, &["groupName", "name", "remarkName", "nick"]),
                     owner_user_id: int_field(value, &["ownerUserId", "groupOwnerId", "ownerId"]),
                     member_count: int_field(
                         value,
-                        &[
-                            "memberCount",
-                            "groupMemberCount",
-                            "groupMemberNum",
-                            "memberNum",
-                            "userCount",
-                        ],
+                        &["memberCount", "groupMemberCount", "userCount"],
                     )
                     .max(0) as usize,
                     relation: relation.into(),
-                });
+                    mute_mode: text_field(value, &["muteMode", "groupMuteMode", "muteState"]),
+                };
+                if let Some(existing) = groups.get_mut(&group_id) {
+                    if candidate.relation == "owner" {
+                        existing.relation = "owner".into();
+                    }
+                    if existing.cloud_id.is_empty() {
+                        existing.cloud_id = candidate.cloud_id;
+                    }
+                    if existing.name.is_empty() {
+                        existing.name = candidate.name;
+                    }
+                    if existing.owner_user_id <= 0 {
+                        existing.owner_user_id = candidate.owner_user_id;
+                    }
+                    existing.member_count = existing.member_count.max(candidate.member_count);
+                } else {
+                    groups.insert(group_id, candidate);
+                }
             }
         }
+        let groups = groups.into_values().collect::<Vec<_>>();
+        *self.group_cache.write().await = Some((Instant::now(), groups.clone()));
         Ok(groups)
     }
 
+    async fn cached_group_infos(&self) -> Vec<GroupInfo> {
+        self.group_cache
+            .read()
+            .await
+            .as_ref()
+            .filter(|(checked_at, _)| checked_at.elapsed() < Duration::from_secs(10))
+            .map(|(_, groups)| groups.clone())
+            .unwrap_or_default()
+    }
+
     async fn resolve_cloud_id(&self, group_id: i64) -> AppResult<String> {
-        self.group_infos()
-            .await?
+        self.cached_group_infos()
+            .await
             .into_iter()
             .find(|group| group.group_id == group_id)
             .map(|group| group.cloud_id)
@@ -582,6 +903,80 @@ impl CdpGateway {
     }
 
     pub async fn session_identity(&self) -> AppResult<(i64, String)> {
+        let _identity_gate = self.identity_gate.lock().await;
+        let cached_account = self.account_id.read().await.clone();
+        let cached_sender = *self.sender_id.read().await;
+        let identity_fresh = self
+            .identity_checked_at
+            .lock()
+            .ok()
+            .and_then(|checked| *checked)
+            .is_some_and(|checked| checked.elapsed() < Duration::from_secs(30));
+        if cached_sender > 0 && !cached_account.is_empty() && identity_fresh {
+            return Ok((cached_sender, cached_account));
+        }
+        let runtime_probe = self.cdp.evaluate(r#"({nimAccount:String((window.nim&&(window.nim.account||window.nim.options&&window.nim.options.account||window.nim.config&&window.nim.config.account))||"")})"#).await?;
+        let nim_account_probe = runtime_probe
+            .get("nimAccount")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if nim_account_probe.is_empty() {
+            return Err(AppError::new("nim_not_ready", "需要您登录账号，等待登录").retryable());
+        }
+        let cached_account = self.account_id.read().await.clone();
+        let cached_sender = *self.sender_id.read().await;
+        let identity_fresh = self
+            .identity_checked_at
+            .lock()
+            .ok()
+            .and_then(|checked| *checked)
+            .is_some_and(|checked| checked.elapsed() < Duration::from_secs(30));
+        if cached_account == nim_account_probe && cached_sender > 0 && identity_fresh {
+            return Ok((cached_sender, cached_account));
+        }
+        let nim_account = nim_account_probe.to_string();
+        if nim_account.is_empty() {
+            return Err(AppError::new(
+                "nim_not_ready",
+                "NIM 灏氭湭鍒濆鍖栵紝璇峰厛鐧诲綍鏃哄晢鑱婂苟绛夊緟浼氳瘽鍒濆鍖?",
+            )
+            .retryable());
+        }
+        if cached_account != nim_account_probe {
+            *self.sender_id.write().await = 0;
+            *self.group_cache.write().await = None;
+            self.member_requests.write().await.clear();
+            self.member_cache.write().await.clear();
+            self.delivered_event_sequences.write().await.clear();
+            self.session_epoch.fetch_add(1, Ordering::AcqRel);
+            if let Ok(mut checked) = self.identity_checked_at.lock() {
+                *checked = None;
+            }
+        }
+        *self.account_id.write().await = nim_account.clone();
+        let groups = self.group_infos().await?;
+        let mut sender = 0;
+        for group in groups {
+            let (members, _, _) = self.list_http_members(group.group_id).await?;
+            if let Some(member) = members.iter().find(|member| member.nim_id == nim_account) {
+                sender = member.user_id;
+                break;
+            }
+        }
+        if sender <= 0 {
+            return Err(
+                AppError::new("account_identity", "褰撳墠璐﹀彿鏈槧灏勫埌缇ゆ垚鍛?").retryable(),
+            );
+        }
+        *self.sender_id.write().await = sender;
+        if let Ok(mut checked) = self.identity_checked_at.lock() {
+            *checked = Some(Instant::now());
+        }
+        Ok((sender, nim_account))
+    }
+
+    #[allow(dead_code)]
+    async fn legacy_session_identity_removed(&self) -> AppResult<(i64, String)> {
         let runtime = self.cdp.evaluate(r#"({nimAccount:String((window.nim&&(window.nim.account||window.nim.options&&window.nim.options.account||window.nim.config&&window.nim.config.account))||"")})"#).await?;
         let nim_account = runtime
             .get("nimAccount")
@@ -595,11 +990,11 @@ impl CdpGateway {
             )
             .retryable());
         }
-        let groups = self.group_infos().await?;
+        let groups = self.cached_group_infos().await;
         let first = groups
             .first()
             .ok_or_else(|| AppError::new("no_groups", "当前账号没有可用群"))?;
-        let members = self.list_http_members(first.group_id).await?;
+        let (members, _, _) = self.list_http_members(first.group_id).await?;
         let sender = members
             .iter()
             .find(|member| member.nim_id == nim_account)
@@ -610,13 +1005,54 @@ impl CdpGateway {
         }
         *self.account_id.write().await = nim_account.clone();
         *self.sender_id.write().await = sender;
+        if let Ok(mut checked) = self.identity_checked_at.lock() {
+            *checked = Some(Instant::now());
+        }
         Ok((sender, nim_account))
     }
 
-    async fn list_http_members(&self, group_id: i64) -> AppResult<Vec<Member>> {
-        let data = self
-            .xclient(GROUP_MEMBERS_ROUTE, json!({"groupId":group_id,"v":"0"}))
-            .await?;
+    async fn list_http_members(
+        &self,
+        group_id: i64,
+    ) -> AppResult<(Vec<Member>, usize, Option<String>)> {
+        let mut cursor = None;
+        let mut members = BTreeMap::new();
+        for page_index in 0..100 {
+            let (page, next) = self
+                .list_http_members_page(group_id, cursor.as_deref())
+                .await?;
+            for member in page {
+                members
+                    .entry((member.user_id, member.nim_id.clone()))
+                    .or_insert(member);
+            }
+            let Some(next) = next else {
+                return Ok((members.into_values().collect(), page_index + 1, None));
+            };
+            if cursor.as_deref() == Some(next.as_str()) {
+                return Err(AppError::new(
+                    "member_pagination",
+                    "旺商聊 HTTP 成员分页返回了重复 cursor",
+                ));
+            }
+            cursor = Some(next);
+        }
+        Err(AppError::new(
+            "member_pagination",
+            "旺商聊 HTTP 成员分页超过 100 页",
+        ))
+    }
+
+    async fn list_http_members_page(
+        &self,
+        group_id: i64,
+        cursor: Option<&str>,
+    ) -> AppResult<(Vec<Member>, Option<String>)> {
+        let mut payload = json!({"groupId":group_id,"v":"0"});
+        if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
+            payload["cursor"] = Value::String(cursor.to_string());
+        }
+        let data = self.xclient(GROUP_MEMBERS_ROUTE, payload).await?;
         let account_id = self.account_id.read().await.clone();
         let now = Utc::now();
         let mut members = Vec::new();
@@ -655,7 +1091,16 @@ impl CdpGateway {
                     value,
                     &["groupRole", "role", "identity", "memberRole", "type"],
                 )),
-                account_state: text_field(value, &["accountState", "accountStatus"]),
+                account_state: text_field(
+                    value,
+                    &[
+                        "accountState",
+                        "accountStatus",
+                        "muteStatus",
+                        "muteState",
+                        "muteMode",
+                    ],
+                ),
                 blacklisted: false,
                 present: true,
                 join_source: "baseline".into(),
@@ -668,7 +1113,7 @@ impl CdpGateway {
                 updated_at: now,
             });
         }
-        Ok(members)
+        Ok((members, next_cursor(&data)))
     }
 
     async fn action(&self, route: &str, payload: Value) -> AppResult<GatewayReceipt> {
@@ -685,7 +1130,7 @@ impl CdpGateway {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let groups = self.group_infos().await?;
+        let groups = self.cached_group_infos().await;
         let account_id = self.account_id.read().await.clone();
         let now = Utc::now();
         let mut events = Vec::new();
@@ -704,6 +1149,8 @@ impl CdpGateway {
             if group_id <= 0 {
                 continue;
             }
+            self.member_cache.write().await.remove(&group_id);
+            self.group_cache.write().await.take();
             for value in record
                 .payload
                 .get("members")
@@ -764,7 +1211,21 @@ impl CdpGateway {
     pub async fn install_message_listener(&self) -> AppResult<Value> {
         let value = self.cdp.evaluate(LISTENER_EXPRESSION).await?;
         if let Some(session) = value.get("session").and_then(Value::as_str) {
-            *self.listener_session.write().await = session.to_string();
+            let mut current = self.listener_session.write().await;
+            if *current != session {
+                *current = session.to_string();
+                *self.account_id.write().await = String::new();
+                *self.sender_id.write().await = 0;
+                *self
+                    .identity_checked_at
+                    .lock()
+                    .expect("identity mutex poisoned") = None;
+                self.group_cache.write().await.take();
+                self.member_cache.write().await.clear();
+                self.member_requests.write().await.clear();
+                self.delivered_event_sequences.write().await.clear();
+                self.session_epoch.fetch_add(1, Ordering::AcqRel);
+            }
         }
         Ok(value)
     }
@@ -772,7 +1233,7 @@ impl CdpGateway {
     pub async fn read_batch(&self) -> AppResult<GatewayBatch> {
         let value = self.cdp.evaluate(READ_BATCH_EXPRESSION).await?;
         let mut batch = parse_gateway_batch(value)?;
-        let groups = self.group_infos().await.unwrap_or_default();
+        let groups = self.cached_group_infos().await;
         for record in &mut batch.records {
             if record.kind != GatewayRecordKind::Message
                 || int_field(&record.payload, &["groupId"]) > 0
@@ -841,7 +1302,11 @@ impl CdpGateway {
 #[async_trait]
 impl RuntimeGateway for CdpGateway {
     async fn diagnose(&self) -> DiagnosticSnapshot {
-        self.cdp.diagnose().await
+        let snapshot = self.cdp.diagnose().await;
+        if snapshot.status != ConnectionStatus::Ready {
+            self.reset_session_state().await;
+        }
+        snapshot
     }
 
     async fn session_identity(&self) -> AppResult<(i64, String)> {
@@ -869,33 +1334,14 @@ impl RuntimeGateway for CdpGateway {
     }
 
     async fn poll_events(&self) -> AppResult<Vec<GatewayEvent>> {
-        let batch = self.read_batch().await?;
-        let cursor = self
-            .delivered_event_sequences
-            .read()
-            .await
-            .get(&batch.session)
-            .copied()
-            .unwrap_or(0);
-        let records = batch
-            .records
-            .iter()
-            .filter(|record| {
-                record.kind != GatewayRecordKind::Message
-                    && record.kind != GatewayRecordKind::ConnectionChanged
-                    && record.sequence > cursor
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let events = self.team_member_events(records.clone()).await?;
-        if let Some(sequence) = records.iter().map(|record| record.sequence).max() {
-            let mut delivered = self.delivered_event_sequences.write().await;
-            if !delivered.contains_key(&batch.session) {
-                delivered.clear();
-            }
-            delivered.insert(batch.session, sequence);
-        }
-        Ok(events)
+        Err(AppError::new(
+            "event_poll_requires_batch",
+            "成员事件必须从已读取的消息批次中处理",
+        ))
+    }
+
+    async fn member_events(&self, records: Vec<GatewayRecord>) -> AppResult<Vec<GatewayEvent>> {
+        self.team_member_events(records).await
     }
 
     fn capabilities(&self) -> GatewayCapabilities {
@@ -903,6 +1349,14 @@ impl RuntimeGateway for CdpGateway {
             .read()
             .map(|value| value.clone())
             .unwrap_or_else(|_| unverified_production_capabilities())
+    }
+
+    fn member_sync_paused(&self) -> bool {
+        CdpGateway::member_sync_paused(self)
+    }
+
+    fn session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::Acquire)
     }
 
     fn calibrate_capabilities(
@@ -918,8 +1372,172 @@ impl RuntimeGateway for CdpGateway {
     }
 }
 
-#[async_trait]
-impl GroupGateway for CdpGateway {
+impl CdpGateway {
+    async fn writable_member(&self, group_id: i64, user_id: i64) -> AppResult<Member> {
+        require_positive("groupId", group_id)?;
+        require_positive("userId", user_id)?;
+        let roster = self.list_members(group_id).await?;
+        let sender_id = if *self.sender_id.read().await > 0 {
+            *self.sender_id.read().await
+        } else {
+            self.session_identity().await?.0
+        };
+        let manager = roster.members.iter().any(|member| {
+            member.user_id == sender_id
+                && member.user_id > 0
+                && member.present
+                && matches!(member.role.to_ascii_lowercase().as_str(), "owner" | "admin")
+        });
+        if !manager {
+            return Err(AppError::new(
+                "management_required",
+                "需要当前账号具备群管理权限",
+            ));
+        }
+        let member = roster
+            .members
+            .iter()
+            .find(|member| member.user_id == user_id && member.present)
+            .cloned()
+            .ok_or_else(|| AppError::new("member_not_found", "目标成员不属于当前群或已不在线"))?;
+        if matches!(member.role.to_ascii_lowercase().as_str(), "owner" | "admin") {
+            return Err(AppError::new(
+                "member_protected",
+                "群主和管理员不能执行成员写操作",
+            ));
+        }
+        if member.user_id <= 0 || member.user_id == synthetic_nim_user_id(&member.nim_id) {
+            return Err(AppError::new(
+                "member_identity_incomplete",
+                "目标成员只有临时身份，不能执行成员写操作",
+            )
+            .retryable());
+        }
+        Ok(member)
+    }
+
+    async fn manager_roster(&self, group_id: i64) -> AppResult<MemberRoster> {
+        let roster = self.list_members(group_id).await?;
+        let sender_id = if *self.sender_id.read().await > 0 {
+            *self.sender_id.read().await
+        } else {
+            self.session_identity().await?.0
+        };
+        if roster.members.iter().any(|member| {
+            member.user_id == sender_id
+                && member.present
+                && matches!(member.role.to_ascii_lowercase().as_str(), "owner" | "admin")
+        }) {
+            Ok(roster)
+        } else {
+            Err(AppError::new(
+                "management_required",
+                "需要当前账号具备群管理权限",
+            ))
+        }
+    }
+
+    async fn verify_renamed_member(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        nickname: &str,
+        receipt: GatewayReceipt,
+    ) -> AppResult<GatewayReceipt> {
+        self.member_cache.write().await.remove(&group_id);
+        let roster = self.list_members_with_backoff(group_id).await?;
+        let matches = roster.members.iter().any(|member| {
+            member.user_id == user_id
+                && (member.card_name == nickname || member.nickname == nickname)
+        });
+        if matches {
+            Ok(receipt)
+        } else {
+            Err(AppError::new(
+                "write_verify_failed",
+                "旺商聊已返回改名成功，但回读的群名片不一致",
+            ))
+        }
+    }
+
+    async fn verify_removed_member(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        mut receipt: GatewayReceipt,
+    ) -> AppResult<GatewayReceipt> {
+        self.member_cache.write().await.remove(&group_id);
+        let roster = self.list_members_with_backoff(group_id).await?;
+        if roster.authority != "authoritative" {
+            receipt.status = "unknown".into();
+            receipt.verification = Some("unknown".into());
+            return Ok(receipt);
+        }
+        if roster
+            .members
+            .iter()
+            .any(|member| member.user_id == user_id)
+        {
+            return Err(AppError::new(
+                "write_verify_failed",
+                "旺商聊已返回移除成功，但回读仍存在该成员",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn verify_member_mute(
+        &self,
+        group_id: i64,
+        user_id: i64,
+        muted: bool,
+        mut receipt: GatewayReceipt,
+    ) -> AppResult<GatewayReceipt> {
+        self.member_cache.write().await.remove(&group_id);
+        let roster = self.list_members_with_backoff(group_id).await?;
+        let Some(member) = roster
+            .members
+            .iter()
+            .find(|member| member.user_id == user_id)
+        else {
+            receipt.status = "unknown".into();
+            receipt.verification = Some("unknown".into());
+            return Ok(receipt);
+        };
+        let raw_state = member.account_state.to_ascii_lowercase();
+        let state = if raw_state.contains("unmute")
+            || raw_state.contains("not_mute")
+            || raw_state.contains("normal")
+            || raw_state.contains("good")
+            || raw_state.contains("active")
+            || raw_state.contains("ok")
+        {
+            "mute_none".to_string()
+        } else {
+            raw_state
+        };
+        let observed = if state.contains("mute") || state.contains("禁言") {
+            Some(!state.contains("no") && !state.contains("cancel") && !state.contains("none"))
+        } else {
+            None
+        };
+        match observed {
+            Some(value) if value == muted => {
+                receipt.verification = Some("verified".into());
+                Ok(receipt)
+            }
+            Some(_) => Err(AppError::new(
+                "write_verify_failed",
+                "旺商聊回读的成员禁言状态与请求不一致",
+            )),
+            None => {
+                receipt.status = "unknown".into();
+                receipt.verification = Some("unknown".into());
+                Ok(receipt)
+            }
+        }
+    }
+
     async fn list_groups(&self) -> AppResult<Vec<Group>> {
         let infos = self.group_infos().await?;
         let account_id = self.account_id.read().await.clone();
@@ -943,76 +1561,295 @@ impl GroupGateway for CdpGateway {
 
     async fn list_members(&self, group_id: i64) -> AppResult<MemberRoster> {
         require_positive("groupId", group_id)?;
+        if let Some((checked_at, roster)) = self.member_cache.read().await.get(&group_id) {
+            if checked_at.elapsed() < Duration::from_secs(5) {
+                return Ok(roster.clone());
+            }
+        }
+        if let Some(delay) = self.member_retry_after() {
+            if let Some((_, cached)) = self.member_cache.read().await.get(&group_id) {
+                let mut cached = cached.clone();
+                cached.status = "rate-limited".into();
+                cached.retry_at = Some(
+                    Utc::now()
+                        + chrono::Duration::from_std(delay)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(120)),
+                );
+                return Ok(cached);
+            }
+            return Err(AppError::new(
+                "gateway_rate_limited",
+                "旺商聊成员请求过于频繁，正在等待后重试",
+            )
+            .retryable());
+        }
+        let request = {
+            let mut requests = self.member_requests.write().await;
+            if let Some(existing) = requests.get(&group_id) {
+                (existing.clone(), false)
+            } else {
+                let request = Arc::new(MemberRequest {
+                    result: tokio::sync::OnceCell::new(),
+                    notify: tokio::sync::Notify::new(),
+                });
+                requests.insert(group_id, request.clone());
+                (request, true)
+            }
+        };
+        if !request.1 {
+            loop {
+                let notified = request.0.notify.notified();
+                if let Some(result) = request.0.result.get() {
+                    return result.clone();
+                }
+                notified.await;
+            }
+        }
+        let request_epoch = self.session_epoch.load(Ordering::Acquire);
+        let result = self.list_members_with_backoff(group_id).await;
+        if request_epoch == self.session_epoch.load(Ordering::Acquire) {
+            if let Ok(roster) = &result {
+                self.member_cache
+                    .write()
+                    .await
+                    .insert(group_id, (Instant::now(), roster.clone()));
+            }
+        }
+        let _ = request.0.result.set(result.clone());
+        request.0.notify.notify_waiters();
+        let mut requests = self.member_requests.write().await;
+        if requests
+            .get(&group_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &request.0))
+        {
+            requests.remove(&group_id);
+        }
+        result
+    }
+}
+
+#[async_trait]
+trait MemberRequestGateway {
+    async fn list_members_with_backoff(&self, group_id: i64) -> AppResult<MemberRoster>;
+    async fn wait_for_member_cooldown(&self);
+    fn member_request_rate_limited(&self);
+    fn member_request_succeeded(&self);
+    async fn list_members_impl(&self, group_id: i64) -> AppResult<MemberRoster>;
+}
+
+#[async_trait]
+impl MemberRequestGateway for CdpGateway {
+    async fn list_members_with_backoff(&self, group_id: i64) -> AppResult<MemberRoster> {
+        for attempt in 0..5_u32 {
+            self.wait_for_member_cooldown().await;
+            let result = {
+                let _gate = self.member_transport_gate.lock().await;
+                self.list_members_impl(group_id).await
+            };
+            match result {
+                Ok(mut roster) => {
+                    roster.status = if roster.complete { "ready" } else { "partial" }.into();
+                    self.member_request_succeeded();
+                    return Ok(roster);
+                }
+                Err(error) if is_member_rate_limited(&error) && attempt < 3 => {
+                    self.member_request_rate_limited();
+                }
+                Err(error) if is_member_rate_limited(&error) => {
+                    self.member_request_rate_limited();
+                    return Err(rate_limited_error(error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AppError::new("gateway_rate_limited", "旺商聊成员请求过于频繁，请稍后重试").retryable())
+    }
+
+    async fn wait_for_member_cooldown(&self) {
+        let delay = self
+            .member_throttle
+            .lock()
+            .ok()
+            .and_then(|state| state.cooldown_until)
+            .and_then(|until| until.checked_duration_since(Instant::now()));
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn member_request_rate_limited(&self) {
+        let mut state = self
+            .member_throttle
+            .lock()
+            .expect("member throttle mutex poisoned");
+        state.consecutive_rate_limits = state.consecutive_rate_limits.saturating_add(1);
+        let seconds = member_backoff_seconds(state.consecutive_rate_limits);
+        state.cooldown_until = Some(Instant::now() + Duration::from_secs(seconds));
+    }
+
+    fn member_request_succeeded(&self) {
+        if let Ok(mut state) = self.member_throttle.lock() {
+            state.consecutive_rate_limits = 0;
+            state.cooldown_until = None;
+        }
+    }
+
+    async fn list_members_impl(&self, group_id: i64) -> AppResult<MemberRoster> {
+        require_positive("groupId", group_id)?;
         if self.account_id.read().await.is_empty() {
             let _ = self.session_identity().await?;
         }
-        let mut members = self.list_http_members(group_id).await?;
+        let (mut members, http_pages, http_cursor) = self.list_http_members(group_id).await?;
         let http_returned_count = members.len();
-        let infos = self.group_infos().await?;
-        let mut reported = infos
+        let mut infos = self.cached_group_infos().await;
+        if !infos.iter().any(|group| group.group_id == group_id) {
+            infos = self.group_infos().await?;
+        }
+        if infos.is_empty() {
+            return Err(AppError::new(
+                "group_cache_miss",
+                "group cache is missing; refresh groups first",
+            )
+            .retryable());
+        }
+        let reported_hint = infos
             .iter()
             .find(|group| group.group_id == group_id)
             .map(|group| group.member_count)
             .unwrap_or(0);
-        let cloud_id = self.resolve_cloud_id(group_id).await?;
-        let expression = nim_team_members_expression(&cloud_id);
-        let nim = self.cdp.evaluate(&expression).await.unwrap_or(Value::Null);
-        let mut used_nim = false;
-        let mut nim_returned_count = 0;
-        if nim.get("ok").and_then(Value::as_bool) == Some(true) {
-            used_nim = true;
-            nim_returned_count = nim
-                .get("members")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            for value in nim
-                .get("members")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let nim_id = text_field(value, &["nimId"]);
-                let card = human_name_field(value, &["cardName"]);
-                if let Some(member) = members.iter_mut().find(|member| member.nim_id == nim_id) {
-                    if wire_name_missing(&member.card_name) && !wire_name_missing(&card) {
-                        member.card_name = card;
-                    }
-                    continue;
+        let cloud_id = infos
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .map(|group| group.cloud_id.clone())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::new("group_not_found", "群 ID 未映射到 NIM 群"))?;
+        let mut nim_cursor = None;
+        let mut nim_values = Vec::new();
+        let mut nim_complete = false;
+        let mut nim_pages = 0usize;
+        let mut source_errors = Vec::new();
+        for page_index in 0..100 {
+            nim_pages = page_index + 1;
+            let expression = nim_team_members_expression(&cloud_id, nim_cursor.as_deref());
+            let nim = match self.cdp.evaluate(&expression).await {
+                Ok(value) => value,
+                Err(error) => {
+                    source_errors.push(MemberSourceError {
+                        source: "nim".into(),
+                        route: "nim.getTeamMembers".into(),
+                        page: nim_pages,
+                        cursor: nim_cursor.clone(),
+                        reason: error.message,
+                    });
+                    break;
                 }
-                if nim_id.is_empty() {
-                    continue;
+            };
+            if nim.get("ok").and_then(Value::as_bool) != Some(true) {
+                let reason = nim
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("NIM member request failed")
+                    .to_string();
+                let rate_error = AppError::new("nim_members", reason.clone()).retryable();
+                if is_member_rate_limited(&rate_error) {
+                    return Err(rate_error);
                 }
-                let account_id = self.account_id.read().await.clone();
-                members.push(Member {
-                    account_id,
-                    group_id,
-                    user_id: synthetic_nim_user_id(&nim_id),
-                    nim_id,
-                    nickname: card.clone(),
-                    card_name: card,
-                    original_card_name: String::new(),
-                    managed_card_name: String::new(),
-                    card_suffix: String::new(),
-                    role: member_role(&text_field(value, &["type"])),
-                    account_state: String::new(),
-                    blacklisted: false,
-                    present: true,
-                    join_source: "baseline".into(),
-                    prompt_read: true,
-                    locked_card_name: String::new(),
-                    violation_count: 0,
-                    discovered_at: Utc::now(),
-                    joined_at: None,
-                    last_seen_at: Utc::now(),
-                    updated_at: Utc::now(),
+                source_errors.push(MemberSourceError {
+                    source: "nim".into(),
+                    route: "nim.getTeamMembers".into(),
+                    page: nim_pages,
+                    cursor: nim_cursor.clone(),
+                    reason,
                 });
+                break;
+                #[allow(unreachable_code)]
+                return Err(AppError::new(
+                    "nim_members",
+                    format!(
+                        "NIM 成员请求失败：{}",
+                        nim.get("errorMessage")
+                            .and_then(Value::as_str)
+                            .unwrap_or("未知错误")
+                    ),
+                )
+                .retryable());
             }
+            nim_values.extend(
+                nim.get("members")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            let Some(next) = next_cursor(&nim) else {
+                nim_cursor = None;
+                nim_complete = true;
+                break;
+            };
+            if nim_cursor.as_deref() == Some(next.as_str()) {
+                return Err(AppError::new(
+                    "member_pagination",
+                    "NIM 成员分页返回了重复 cursor",
+                ));
+            }
+            nim_cursor = Some(next);
         }
-        reported = reported.max(members.len());
+        if !nim_complete {
+            return Err(AppError::new(
+                "member_pagination",
+                "NIM 成员分页超过 100 页",
+            ));
+        }
+        let used_nim = true;
+        let nim_returned_count = nim_values.len();
+        for value in nim_values.iter() {
+            let nim_id = text_field(value, &["nimId"]);
+            let card = human_name_field(value, &["cardName"]);
+            if let Some(member) = members.iter_mut().find(|member| member.nim_id == nim_id) {
+                if wire_name_missing(&member.card_name) && !wire_name_missing(&card) {
+                    member.card_name = card;
+                }
+                continue;
+            }
+            if nim_id.is_empty() {
+                continue;
+            }
+            let account_id = self.account_id.read().await.clone();
+            members.push(Member {
+                account_id,
+                group_id,
+                user_id: synthetic_nim_user_id(&nim_id),
+                nim_id,
+                nickname: card.clone(),
+                card_name: card,
+                original_card_name: String::new(),
+                managed_card_name: String::new(),
+                card_suffix: String::new(),
+                role: member_role(&text_field(value, &["type"])),
+                account_state: String::new(),
+                blacklisted: false,
+                present: true,
+                join_source: "baseline".into(),
+                prompt_read: true,
+                locked_card_name: String::new(),
+                violation_count: 0,
+                discovered_at: Utc::now(),
+                joined_at: None,
+                last_seen_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+        let synthetic_user_ids = members
+            .iter()
+            .filter(|member| member.user_id == synthetic_nim_user_id(&member.nim_id))
+            .map(|member| member.user_id)
+            .collect::<Vec<_>>();
+        let canonical_count = members.len().saturating_sub(synthetic_user_ids.len());
         let resolved = members.len();
-        let complete = reported == resolved && reported > 0;
+        let reported = resolved;
+        let complete = nim_complete && source_errors.is_empty() && http_cursor.is_none();
         Ok(MemberRoster {
+            status: if complete { "ready" } else { "partial" }.into(),
             members,
             reported_count: reported,
             resolved_count: resolved,
@@ -1025,25 +1862,46 @@ impl GroupGateway for CdpGateway {
                 RosterCompleteness::Unknown
             },
             completeness_reason: if complete {
-                "HTTP 与 NIM 合并数量达到旺商聊报告人数".into()
+                "旺商聊 HTTP 与 NIM 当前成员快照已完成".into()
             } else if resolved > 0 {
-                format!("旺商聊报告 {reported} 人，当前解析 {resolved} 人")
+                format!("当前已获取 {resolved} 名成员，等待来源完成")
             } else {
                 "旺商聊未返回可识别成员".into()
             },
             http_returned_count,
-            http_reported_count: reported,
-            http_cursor: None,
+            http_reported_count: http_returned_count.max(reported_hint),
+            http_cursor,
             nim_returned_count,
             nim_reported_count: nim_returned_count,
-            nim_cursor: None,
+            nim_cursor,
             authority: if complete { "authoritative" } else { "partial" }.into(),
             sources: if used_nim {
                 vec!["wangshangliao-http".into(), "nim-team-members".into()]
             } else {
                 vec!["wangshangliao-http".into()]
             },
+            source_errors,
+            retry_at: None,
+            canonical_count,
+            synthetic_user_ids,
+            http_pages,
+            nim_pages,
         })
+    }
+}
+
+#[async_trait]
+impl GroupGateway for CdpGateway {
+    async fn list_groups(&self) -> AppResult<Vec<Group>> {
+        CdpGateway::list_groups(self).await
+    }
+
+    async fn list_members(&self, group_id: i64) -> AppResult<MemberRoster> {
+        CdpGateway::list_members(self, group_id).await
+    }
+
+    async fn invalidate_member_cache(&self, group_id: i64) {
+        CdpGateway::invalidate_member_cache(self, group_id).await;
     }
 
     async fn send_text(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
@@ -1106,6 +1964,7 @@ impl GroupGateway for CdpGateway {
             acknowledged: 0,
             remaining: 0,
             dropped: 0,
+            verification: Some("not-applicable".into()),
         })
     }
 
@@ -1120,11 +1979,30 @@ impl GroupGateway for CdpGateway {
         require_positive("userId", sender_user_id)?;
         require_non_empty("messageId", message_id)?;
         let cloud = self.resolve_cloud_id(group_id).await?;
-        self.action(
-            MESSAGE_RECALL_ROUTE,
-            json!({"groupCloudId":cloud,"userId":sender_user_id,"msgId":message_id}),
-        )
-        .await
+        let mut receipt = self
+            .action(
+                MESSAGE_RECALL_ROUTE,
+                json!({"groupCloudId":cloud,"userId":sender_user_id,"msgId":message_id}),
+            )
+            .await?;
+        if !receipt.message_id.is_empty() && receipt.message_id != message_id {
+            return Err(AppError::new(
+                "write_verify_failed",
+                "旺商聊撤回回执中的消息 ID 与目标不一致",
+            ));
+        }
+        receipt.verification = Some(
+            if receipt.message_id.is_empty() {
+                "unknown"
+            } else {
+                "verified"
+            }
+            .into(),
+        );
+        if receipt.message_id.is_empty() {
+            receipt.status = "unknown".into();
+        }
+        Ok(receipt)
     }
     async fn mute(
         &self,
@@ -1136,21 +2014,29 @@ impl GroupGateway for CdpGateway {
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
         require_positive("durationSeconds", duration_seconds)?;
-        self.action(
-            MEMBER_MUTE_ROUTE,
-            json!({"groupId":group_id,"userId":user_id,"min":(duration_seconds+59)/60}),
-        )
-        .await
+        self.writable_member(group_id, user_id).await?;
+        let receipt = self
+            .action(
+                MEMBER_MUTE_ROUTE,
+                json!({"groupId":group_id,"userId":user_id,"min":(duration_seconds+59)/60}),
+            )
+            .await?;
+        self.verify_member_mute(group_id, user_id, true, receipt)
+            .await
     }
     async fn unmute(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt> {
         self.require_capability(self.capabilities().mute, "成员解禁")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
-        self.action(
-            MEMBER_UNMUTE_ROUTE,
-            json!({"groupId":group_id,"userId":user_id}),
-        )
-        .await
+        self.writable_member(group_id, user_id).await?;
+        let receipt = self
+            .action(
+                MEMBER_UNMUTE_ROUTE,
+                json!({"groupId":group_id,"userId":user_id}),
+            )
+            .await?;
+        self.verify_member_mute(group_id, user_id, false, receipt)
+            .await
     }
     async fn rename(
         &self,
@@ -1161,29 +2047,44 @@ impl GroupGateway for CdpGateway {
         self.require_capability(self.capabilities().rename, "修改群名片")?;
         require_positive("groupId", group_id)?;
         require_non_empty("nickname", nickname)?;
+        let requested_user_id = member.user_id.ok_or_else(|| {
+            AppError::new("member_identity", "成员写操作必须使用 canonical userId")
+        })?;
+        require_positive("userId", requested_user_id)?;
+        let target = self.writable_member(group_id, requested_user_id).await?;
+        if member
+            .nim_id
+            .as_deref()
+            .is_some_and(|nim_id| !nim_id.trim().is_empty() && nim_id != target.nim_id)
+        {
+            return Err(AppError::new(
+                "member_identity",
+                "提交的成员身份与当前群成员名单不匹配",
+            ));
+        }
         let mut http_error = None;
-        if let Some(user_id) = member.user_id.filter(|value| *value > 0) {
+        if target.user_id > 0 {
             match self
                 .action(
                     MEMBER_RENAME_ROUTE,
-                    json!({"groupId":group_id,"userId":user_id,"nick":nickname}),
+                    json!({"groupId":group_id,"userId":target.user_id,"nick":nickname}),
                 )
                 .await
             {
-                Ok(receipt) => return Ok(receipt),
+                Ok(receipt) => {
+                    return self
+                        .verify_renamed_member(group_id, target.user_id, nickname, receipt)
+                        .await;
+                }
                 Err(error) if rename_fallback_allowed(&error) => http_error = Some(error),
                 Err(error) => return Err(error),
             }
         }
-        let Some(nim_id) = member
-            .nim_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+        let nim_id = target.nim_id.trim();
+        if nim_id.is_empty() {
             return Err(http_error
                 .unwrap_or_else(|| AppError::new("member_identity", "成员缺少 userId 和 nimId")));
-        };
+        }
         let cloud = match self.resolve_cloud_id(group_id).await {
             Ok(cloud) => cloud,
             Err(fallback_error) => {
@@ -1205,7 +2106,7 @@ impl GroupGateway for CdpGateway {
             }
         };
         if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(GatewayReceipt {
+            let receipt = GatewayReceipt {
                 route: "nim.updateNickInTeam".into(),
                 status: "succeeded".into(),
                 transport_code: None,
@@ -1220,7 +2121,10 @@ impl GroupGateway for CdpGateway {
                 acknowledged: 0,
                 remaining: 0,
                 dropped: 0,
-            })
+                verification: None,
+            };
+            self.verify_renamed_member(group_id, requested_user_id, nickname, receipt)
+                .await
         } else if let Some(error) = http_error {
             Err(error.with_detail(
                 result
@@ -1242,20 +2146,43 @@ impl GroupGateway for CdpGateway {
         self.require_capability(self.capabilities().remove_member, "移出成员")?;
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
-        self.action(
-            MEMBER_REMOVE_ROUTE,
-            json!({"groupId":group_id,"groupMemberIds":[user_id]}),
-        )
-        .await
+        self.writable_member(group_id, user_id).await?;
+        let receipt = self
+            .action(
+                MEMBER_REMOVE_ROUTE,
+                json!({"groupId":group_id,"groupMemberIds":[user_id]}),
+            )
+            .await?;
+        self.verify_removed_member(group_id, user_id, receipt).await
     }
     async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt> {
         self.require_capability(self.capabilities().group_mute, "全群发言控制")?;
         require_positive("groupId", group_id)?;
-        self.action(
-            GROUP_MUTE_ROUTE,
-            json!({"groupId":group_id,"muteMode":if muted {"MUTE_MEMBER"} else {"MUTE_NO"}}),
-        )
-        .await
+        self.manager_roster(group_id).await?;
+        let mut receipt = self
+            .action(
+                GROUP_MUTE_ROUTE,
+                json!({"groupId":group_id,"muteMode":if muted {"MUTE_MEMBER"} else {"MUTE_NO"}}),
+            )
+            .await?;
+        *self.group_cache.write().await = None;
+        let expected = if muted { "MUTE_MEMBER" } else { "MUTE_NO" };
+        match self
+            .group_infos()
+            .await
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|group| group.group_id == group_id))
+            .map(|group| group.mute_mode)
+        {
+            Some(mode) if !mode.is_empty() && mode.eq_ignore_ascii_case(expected) => {
+                receipt.verification = Some("verified".into());
+            }
+            Some(_) | None => {
+                receipt.status = "unknown".into();
+                receipt.verification = Some("unknown".into());
+            }
+        }
+        Ok(receipt)
     }
 
     async fn get_group_announcement(&self, group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
@@ -1266,23 +2193,46 @@ impl GroupGateway for CdpGateway {
                 json!({"groupId": group_id, "v": "0"}),
             )
             .await?;
-        Ok(data
+        let items = data
             .get("noticeInfoList")
             .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .map(|value| GroupAnnouncement {
-                group_id,
-                notice_id: text_field(value, &["noticeId", "id"]),
-                content: human_name_field(value, &["noticeContent", "content"]),
-                mode: text_field(value, &["noticeMode", "mode"]),
-                author_user_id: int_field(value, &["userId", "authorUserId"]),
-            }))
+            .cloned()
+            .unwrap_or_default();
+        let sender = *self.sender_id.read().await;
+        let owned = if sender > 0 {
+            items
+                .iter()
+                .filter(|value| int_field(value, &["userId", "authorUserId"]) == sender)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let selected = if owned.len() == 1 {
+            Some(owned[0])
+        } else if items.len() == 1 {
+            Some(&items[0])
+        } else if items.is_empty() {
+            None
+        } else {
+            return Err(AppError::new(
+                "notice_ambiguous",
+                "群公告存在多个候选，无法安全确定目标公告",
+            ));
+        };
+        Ok(selected.map(|value| GroupAnnouncement {
+            group_id,
+            notice_id: text_field(value, &["noticeId", "id"]),
+            content: human_name_field(value, &["noticeContent", "content"]),
+            mode: text_field(value, &["noticeMode", "mode"]),
+            author_user_id: int_field(value, &["userId", "authorUserId"]),
+        }))
     }
 
     async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
         self.require_capability(self.capabilities().announcement, "群公告")?;
         require_positive("groupId", group_id)?;
         require_non_empty("noticeContent", text)?;
+        self.manager_roster(group_id).await?;
         let sender = if *self.sender_id.read().await > 0 {
             *self.sender_id.read().await
         } else {
@@ -1296,12 +2246,23 @@ impl GroupGateway for CdpGateway {
                 json!({"groupId": group_id, "v": "0"}),
             )
             .await?;
-        let notice = current
+        let notices = current
             .get("noticeInfoList")
             .and_then(Value::as_array)
-            .and_then(|items| items.first());
-        let own_notice_id = notice
-            .filter(|value| int_field(value, &["userId"]) == sender)
+            .cloned()
+            .unwrap_or_default();
+        let own_notices = notices
+            .iter()
+            .filter(|value| int_field(value, &["userId", "authorUserId"]) == sender)
+            .collect::<Vec<_>>();
+        if own_notices.len() > 1 {
+            return Err(AppError::new(
+                "notice_ambiguous",
+                "当前账号存在多个群公告，拒绝更新不确定的公告",
+            ));
+        }
+        let own_notice_id = own_notices
+            .first()
             .map(|value| text_field(value, &["noticeId", "id"]));
         let (route, payload, notice_id) =
             if let Some(notice_id) = own_notice_id.filter(|value| !value.is_empty()) {
@@ -1336,6 +2297,16 @@ impl GroupGateway for CdpGateway {
             return Err(AppError::new(
                 "notice_receipt_missing",
                 "群公告保存成功但未返回公告 ID",
+            ));
+        }
+        let confirmed = self
+            .get_group_announcement(group_id)
+            .await?
+            .ok_or_else(|| AppError::new("notice_verify", "群公告保存后读取不到公告"))?;
+        if confirmed.notice_id != notice_id || confirmed.content != text {
+            return Err(AppError::new(
+                "notice_verify",
+                "群公告保存后的公告 ID 或内容与请求不一致",
             ));
         }
 
@@ -1383,6 +2354,7 @@ impl GroupGateway for CdpGateway {
         let mut receipt = GatewayReceipt::succeeded(route);
         receipt.message_id = delivery_message_id(&delivery)?;
         receipt.request_id = receipt_identifier(&delivery, &["requestId", "idClient", "traceId"]);
+        receipt.verification = Some("verified".into());
         Ok(receipt)
     }
 }
@@ -1405,7 +2377,7 @@ fn delivery_message_id(delivery: &Value) -> AppResult<String> {
     Ok(message_id)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GroupInfo {
     group_id: i64,
     cloud_id: String,
@@ -1414,30 +2386,77 @@ struct GroupInfo {
     member_count: usize,
     #[allow(dead_code)]
     relation: String,
+    mute_mode: String,
 }
 
-fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
+type GroupCache = Option<(Instant, Vec<GroupInfo>)>;
+
+#[allow(dead_code)]
+fn ipc_expression_legacy(kind: &str, route: &str, payload: Value) -> String {
     let input = json!({"type":kind,"route":route,"payload":payload});
     format!(
         r#"(async()=>{{const input={input};const ipc=globalThis.__dhIpc||(typeof require==="function"?require("electron").ipcRenderer:null);if(!ipc)return{{transportCode:503,errno:1,error:"Electron IPC 未就绪",requestId:""}};return new Promise(resolve=>{{const channel="dh-rust-"+Date.now()+"-"+Math.random();const timer=setTimeout(()=>resolve({{transportCode:504,errno:1,error:"IPC timeout",requestId:channel}}),15000);ipc.once(channel,(event,value)=>{{clearTimeout(timer);resolve({{transportCode:value&&value.code,errno:value&&value.errno,response:value&&value.response,error:value&&value.message,requestId:value&&value.requestId||channel}});}});if(input.type==="request")ipc.send("xclient",{{type:"request",requestId:channel,url:input.route,excuteType:0,params:JSON.stringify(input.payload),key:channel}});else ipc.send("xclient",{{type:"encode",params:JSON.stringify(input.payload),key:channel}});}});}})()"#
     )
 }
 
-fn nim_send_expression(target: &str, content: &str) -> String {
+fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
+    let input = json!({"type":kind,"route":route,"payload":payload});
+    format!(
+        r#"(async()=>{{const input={input};const ipc=globalThis.__dhIpc||(typeof require==="function"?require("electron").ipcRenderer:null);if(!ipc)return{{transportCode:503,errno:1,error:"Electron IPC unavailable",requestId:""}};return new Promise(resolve=>{{const channel="dh-rust-"+Date.now()+"-"+Math.random();let settled=false;let handler;const cleanup=()=>{{if(ipc.removeListener&&handler)ipc.removeListener(channel,handler);}};const finish=value=>{{if(settled)return;settled=true;cleanup();resolve(value);}};const timer=setTimeout(()=>finish({{transportCode:504,errno:1,error:"IPC timeout",requestId:channel,timedOut:true}}),15000);handler=(event,value)=>{{clearTimeout(timer);finish({{transportCode:value&&value.code,errno:value&&value.errno,response:value&&value.response,error:value&&value.message,requestId:value&&value.requestId||channel}});}};ipc.once(channel,handler);if(input.type==="request")ipc.send("xclient",{{type:"request",requestId:channel,url:input.route,excuteType:0,params:JSON.stringify(input.payload),key:channel}});else ipc.send("xclient",{{type:"encode",params:JSON.stringify(input.payload),key:channel}});}});}})()"#
+    )
+}
+
+#[allow(dead_code)]
+fn nim_send_expression_legacy(target: &str, content: &str) -> String {
     let input = json!({"target":target,"content":content});
     format!(
         r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪"}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM send timeout"}}),15000);window.nim.sendCustomMsg({{scene:"team",to:input.target,content:input.content,isLocal:false,done:(error,message)=>{{clearTimeout(timer);resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),idClient:message&&message.idClient,idServer:message&&message.idServer}});}}}});}});}})()"#
     )
 }
 
-fn nim_team_members_expression(team_id: &str) -> String {
-    let input = json!({"teamId":team_id});
+fn nim_send_expression(target: &str, content: &str) -> String {
+    let input = json!({"target":target,"content":content});
     format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪",members:[]}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM team members timeout",members:[]}}),15000);window.nim.getTeamMembers({{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const source=Array.isArray(value)?value:value&&Array.isArray(value.members)?value.members:[];resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}});}});}})()"#
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable"}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",timedOut:true}}),15000);window.nim.sendCustomMsg({{scene:"team",to:input.target,content:input.content,isLocal:false,done:(error,message)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),idClient:message&&message.idClient,idServer:message&&message.idServer}});}}}});}});}})()"#
     )
 }
 
-fn nim_update_nick_expression(team_id: &str, nim_id: &str, nickname: &str) -> String {
+#[allow(dead_code)]
+fn nim_team_members_expression_legacy(team_id: &str, cursor: Option<&str>) -> String {
+    let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
+    format!(
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪",members:[]}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM team members timeout",members:[]}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+    )
+}
+
+fn nim_team_members_expression(team_id: &str, cursor: Option<&str>) -> String {
+    let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
+    format!(
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+    )
+}
+
+fn next_cursor(value: &Value) -> Option<String> {
+    [
+        value.get("nextCursor"),
+        value.get("next_cursor"),
+        value.get("nextPageToken"),
+        value.pointer("/pageInfo/nextCursor"),
+        value.pointer("/pageInfo/nextPageToken"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
+    .map(ToOwned::to_owned)
+}
+
+#[allow(dead_code)]
+fn nim_update_nick_expression_legacy(team_id: &str, nim_id: &str, nickname: &str) -> String {
     let input = json!({"teamId":team_id,"account":nim_id,"nickInTeam":nickname});
     format!(
         r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪"}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM update nick timeout"}}),15000);window.nim.updateNickInTeam({{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam,done:(error,value)=>{{clearTimeout(timer);resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),member:value||null}});}}}});}});}})()"#
@@ -1558,7 +2577,13 @@ fn decode_transport_response<'a>(route: &str, value: &'a Value) -> AppResult<&'a
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("旺商聊传输请求失败");
-        let error = AppError::new("gateway_transport", message).with_gateway(transport_metadata());
+        let error_message = if message.eq_ignore_ascii_case("ipc timeout") {
+            format!("IPC timeout: {route} after 15000ms")
+        } else {
+            message.to_string()
+        };
+        let error =
+            AppError::new("gateway_transport", error_message).with_gateway(transport_metadata());
         return Err(if code >= 500 {
             error.retryable()
         } else {
@@ -1631,6 +2656,40 @@ fn decode_business_response(route: &str, response: &str) -> AppResult<Value> {
     Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
 }
 
+fn is_member_rate_limited(error: &AppError) -> bool {
+    if error.code == "gateway_rate_limited" {
+        return true;
+    }
+    let text = format!("{} {}", error.code, error.message).to_ascii_lowercase();
+    text.contains("too frequent")
+        || text.contains("rate limit")
+        || text.contains("network busy")
+        || text.contains("频繁")
+        || text.contains("网络繁忙")
+        || text.contains("稍后重试")
+}
+
+fn nim_update_nick_expression(team_id: &str, nim_id: &str, nickname: &str) -> String {
+    let input = json!({"teamId":team_id,"account":nim_id,"nickInTeam":nickname});
+    format!(
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable"}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",timedOut:true}}),15000);window.nim.updateNickInTeam({{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam,done:(error,value)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),member:value||null}});}}}});}});}})()"#
+    )
+}
+
+fn member_backoff_seconds(level: u32) -> u64 {
+    12_u64
+        .checked_mul(2_u64.saturating_pow(level.saturating_sub(1)))
+        .unwrap_or(120)
+        .min(120)
+}
+
+fn rate_limited_error(mut error: AppError) -> AppError {
+    error.code = "gateway_rate_limited".into();
+    error.message = "旺商聊成员请求过于频繁，请稍后重试".into();
+    error.retryable = true;
+    error
+}
+
 fn decode_action_receipt(route: &str, value: &Value) -> AppResult<GatewayReceipt> {
     let response = decode_transport_response(route, value)?;
     let envelope: Value = serde_json::from_str(response).map_err(|error| {
@@ -1675,6 +2734,7 @@ fn decode_action_receipt(route: &str, value: &Value) -> AppResult<GatewayReceipt
         acknowledged: 0,
         remaining: 0,
         dropped: 0,
+        verification: Some("not-applicable".into()),
     })
 }
 
@@ -1923,12 +2983,25 @@ fn legacy_gateway_receipt(session: &str, sequence: u64, value: Value) -> AppResu
         acknowledged: value.get("acked").and_then(Value::as_u64).unwrap_or(0) as usize,
         remaining: value.get("remaining").and_then(Value::as_u64).unwrap_or(0) as usize,
         dropped: value.get("dropped").and_then(Value::as_u64).unwrap_or(0),
+        verification: Some("not-applicable".into()),
     })
 }
 
 fn parse_gateway_receipt(session: &str, sequence: u64, value: Value) -> AppResult<GatewayReceipt> {
+    let response_session = value
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new("listener_ack_protocol", "监听 ACK 缺少 session"))?;
+    let acknowledged_through = value
+        .get("acknowledgedThrough")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AppError::new("listener_ack_protocol", "监听 ACK 缺少 acknowledgedThrough")
+        })?;
+    let dropped = value.get("dropped").and_then(Value::as_u64).unwrap_or(0);
     let receipt = legacy_gateway_receipt(session, sequence, value)?;
-    if receipt.session != session || receipt.acknowledged_through != sequence {
+    if response_session != session || acknowledged_through != sequence || dropped > 0 {
         return Err(AppError::new(
             "listener_ack_mismatch",
             "消息确认收据与请求不匹配",
@@ -1973,6 +3046,25 @@ mod tests {
         assert_eq!(member_role("MSG_ADMIN"), "admin");
         assert_eq!(member_role("owner"), "owner");
         assert_eq!(member_role("unknown"), "member");
+    }
+
+    #[test]
+    fn member_rate_limit_errors_are_detected_and_labeled() {
+        let error = AppError::new("gateway_business", "请求太频繁，请稍后重试");
+        assert!(is_member_rate_limited(&error));
+        let labeled = rate_limited_error(error);
+        assert_eq!(labeled.code, "gateway_rate_limited");
+        assert!(labeled.retryable);
+        assert!(labeled.message.contains("过于频繁"));
+    }
+
+    #[test]
+    fn member_backoff_is_bounded_and_exponential() {
+        assert_eq!(member_backoff_seconds(1), 12);
+        assert_eq!(member_backoff_seconds(2), 24);
+        assert_eq!(member_backoff_seconds(3), 48);
+        assert_eq!(member_backoff_seconds(4), 96);
+        assert_eq!(member_backoff_seconds(5), 120);
     }
     #[test]
     fn synthetic_nim_ids_are_stable_and_negative() {

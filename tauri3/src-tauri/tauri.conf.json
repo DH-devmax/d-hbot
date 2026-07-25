@@ -5,7 +5,7 @@
   "identifier": "cloud.daha6.dhbot",
   "build": { "beforeDevCommand": "pnpm dev", "beforeBuildCommand": "pnpm build", "devUrl": "http://127.0.0.1:5173", "frontendDist": "../dist" },
   "app": {
-    "windows": [{ "label": "main", "title": "DH BOT", "width": 1320, "height": 840, "minWidth": 1180, "minHeight": 760, "resizable": true }],
+    "windows": [{ "label": "main", "title": "DH BOT", "width": 1320, "height": 840, "minWidth": 1180, "minHeight": 760, "resizable": true, "decorations": false }],
     "security": { "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://ipc.localhost" },
     "trayIcon": { "iconPath": "icons/tray.ico", "tooltip": "DH BOT" }
   },
