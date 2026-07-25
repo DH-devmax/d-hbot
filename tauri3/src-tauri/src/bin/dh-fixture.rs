@@ -69,6 +69,14 @@ struct BurstInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RosterInput {
+    version: Option<u8>,
+    group_id: Option<i64>,
+    count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IpcInput {
     #[serde(rename = "type")]
     kind: String,
@@ -90,6 +98,7 @@ struct NimTeamInput {
 #[serde(rename_all = "camelCase")]
 struct TeamQuery {
     team_id: Option<String>,
+    cursor: Option<String>,
 }
 
 async fn snapshot(State(state): State<HostState>) -> Json<FixtureSnapshot> {
@@ -100,6 +109,27 @@ async fn snapshot(State(state): State<HostState>) -> Json<FixtureSnapshot> {
 async fn actions(State(state): State<HostState>) -> Json<Vec<dh_bot_lib::fixture::FixtureAction>> {
     let gateway = state.gateway.read().await.clone();
     Json(gateway.snapshot().await.actions)
+}
+
+async fn resize_members(
+    State(state): State<HostState>,
+    Json(input): Json<RosterInput>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    validate_version(input.version)?;
+    let group_id = input.group_id.unwrap_or(FIXTURE_GROUP);
+    let gateway = state.gateway.read().await.clone();
+    gateway
+        .resize_group_members(group_id, input.count)
+        .await
+        .map_err(|error| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"ok":false,"error":error.message})),
+            )
+        })?;
+    Ok(Json(
+        json!({"ok":true,"groupId":group_id,"count":input.count}),
+    ))
 }
 
 async fn reset(State(state): State<HostState>) -> Json<serde_json::Value> {
@@ -421,7 +451,10 @@ async fn nim_members(
     let gateway = state.gateway.read().await.clone();
     Json(
         gateway
-            .wire_nim_members(fixture_group_from_team_id(query.team_id.as_deref()))
+            .wire_nim_members_page(
+                fixture_group_from_team_id(query.team_id.as_deref()),
+                query.cursor.as_deref(),
+            )
             .await,
     )
 }
@@ -433,12 +466,24 @@ async fn nim_send(State(state): State<HostState>, Json(input): Json<NimTeamInput
         .send_text(group_id, input.content.as_deref().unwrap_or_default())
         .await
     {
-        Ok(receipt) => Json(json!({
-            "ok":true,
-            "idServer":receipt.message_id,
-            "idClient":receipt.request_id,
-            "requestId":receipt.request_id,
-        })),
+        Ok(receipt) => {
+            let faults = gateway.snapshot().await.faults;
+            if faults.nim_send_timeout_after_effect {
+                Json(json!({
+                    "ok":false,
+                    "errorCode":504,
+                    "errorMessage":"Fixture NIM callback timeout after delivery",
+                    "timedOut":true
+                }))
+            } else {
+                Json(json!({
+                    "ok":true,
+                    "idServer":receipt.message_id,
+                    "idClient":receipt.request_id,
+                    "requestId":receipt.request_id,
+                }))
+            }
+        }
         Err(error) => Json(json!({"ok":false,"errorMessage":error.message})),
     }
 }
@@ -634,6 +679,7 @@ async fn main() {
         .route("/", get(index))
         .route("/fixture/state", get(snapshot))
         .route("/fixture/actions", get(actions))
+        .route("/fixture/members/resize", post(resize_members))
         .route("/fixture/reset", post(reset))
         .route("/fixture/events/message", post(emit_message))
         .route("/fixture/events/burst", post(emit_burst))
@@ -697,9 +743,10 @@ const nimCore={
   get account(){return fixtureState.nimReady?'fixture-nim-10001':''},
   async getTeamMembers(input){
     try{
-      const value=await json(`/fixture/nim/members?teamId=${encodeURIComponent(input.teamId||'')}`);
+      const value=await json(`/fixture/nim/members?teamId=${encodeURIComponent(input.teamId||'')}&cursor=${encodeURIComponent(input.cursor||'')}`);
       const members=(value.members||[]).map(item=>({account:item.nimId,nickInTeam:item.cardName,type:item.type}));
-      input.done(value.ok?null:new Error(value.errorMessage||'NIM members error'),members);
+      const error=value.ok?null:Object.assign(new Error(value.errorMessage||'NIM members error'),{code:value.errorCode||0,status:value.errorCode||0,timedOut:Boolean(value.timedOut)});
+      input.done(error,{members,nextCursor:value.nextCursor||''});
     }catch(error){input.done(error,[])}
   },
   async updateNickInTeam(input){
@@ -711,7 +758,8 @@ const nimCore={
   async sendCustomMsg(input){
     try{
       const value=await post('/fixture/nim/send',{teamId:input.to,content:input.content});
-      input.done(value.ok?null:new Error(value.errorMessage||'NIM send error'),value);
+      const error=value.ok?null:Object.assign(new Error(value.errorMessage||'NIM send error'),{code:value.errorCode||0,status:value.errorCode||0,timedOut:Boolean(value.timedOut)});
+      input.done(error,value);
     }catch(error){input.done(error,null)}
   }
 };

@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)]
   [string]$Artifact,
   [string]$ExpectedSha256 = '',
@@ -177,10 +177,12 @@ namespace DhBotRealMachine {
     public static IntPtr FindMainWindow(int processId) {
       var bestHandle = IntPtr.Zero;
       long bestScore = long.MinValue;
-      EnumWindows((handle, _) => {
-        GetWindowThreadProcessId(handle, out var ownerProcessId);
+      EnumWindows(delegate(IntPtr handle, IntPtr lParam) {
+        uint ownerProcessId;
+        GetWindowThreadProcessId(handle, out ownerProcessId);
         if (ownerProcessId != processId) return true;
-        GetWindowRect(handle, out var rect);
+        Rect rect;
+        GetWindowRect(handle, out rect);
         var width = Math.Max(rect.Right - rect.Left, 0);
         var height = Math.Max(rect.Bottom - rect.Top, 0);
         var title = GetWindowTitle(handle);

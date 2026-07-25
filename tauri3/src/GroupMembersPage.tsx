@@ -93,6 +93,12 @@ type GroupAnnouncement = {
   authorUserId: number
 }
 
+type GatewayReceipt = {
+  status: string
+  businessMessage?: string
+  verification?: string
+}
+
 type GroupBatchMode = 'announcement' | 'mute' | 'unmute' | null
 
 type GroupBatchResult = {
@@ -392,12 +398,16 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
 
   const saveAnnouncement = async () => {
     if (!activeGroup || !announcementText.trim()) return
-    if (!window.confirm('确认发布或更新当前群公告？保存后群内会出现一条新的公告消息。')) return
+    if (!window.confirm('确认发布或更新当前群公告？内容变化并成功广播时，群内会出现一条公告消息。')) return
     setActiveAction('announcement')
     onError('')
     try {
-      await invoke('set_group_announcement', { groupId: activeGroup.groupId, text: announcementText.trim() })
-      onError('群公告已保存并发送到当前群')
+      const receipt = await invoke<GatewayReceipt | null>('set_group_announcement', { groupId: activeGroup.groupId, text: announcementText.trim() })
+      onError(receipt?.status === 'unknown'
+        ? (receipt.businessMessage || '群公告已保存，但广播结果未知；相同内容不会重复广播')
+        : receipt?.verification === 'not-applicable'
+          ? (receipt.businessMessage || '群公告内容未变化，本次没有重复广播')
+          : '群公告已保存并发送到当前群')
       const latest = await invoke<GroupAnnouncement | null>('get_group_announcement', { groupId: activeGroup.groupId })
       setAnnouncementText(latest?.content || announcementText.trim())
     } catch (reason) {

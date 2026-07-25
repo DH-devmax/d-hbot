@@ -2377,7 +2377,7 @@ async fn set_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
     text: String,
-) -> AppResult<()> {
+) -> AppResult<GatewayReceipt> {
     let _roster = require_member_manager(&state, group_id).await?;
     if text.trim().is_empty() {
         return Err(AppError::new("announcement_empty", "群公告内容不能为空"));
@@ -2398,7 +2398,6 @@ async fn set_group_announcement(
         result,
     )
     .await
-    .map(|_| ())
 }
 
 #[tauri::command]

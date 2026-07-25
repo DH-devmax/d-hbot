@@ -84,6 +84,155 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert_eq!(groups.len(), 2);
     let roster = gateway.list_members(FIXTURE_GROUP).await.unwrap();
     assert_eq!(roster.reported_count, 16);
+
+    let cold_gateway = CdpGateway::new(CdpClient::new(devtools_base).unwrap());
+    cold_gateway.calibrate_capabilities(
+        "3.0.0-fixture",
+        "20fd7fecb2ec4573a7c225ecc45a14185ee3400b1097d166aa3a42984d8613ec",
+    );
+    cold_gateway.session_identity().await.unwrap();
+    cold_gateway.invalidate_group_cache().await;
+    let cold_send = cold_gateway
+        .send_text(FIXTURE_GROUP, "冷启动缓存缺失直写测试")
+        .await
+        .unwrap();
+    assert_eq!(cold_send.status, "succeeded");
+
+    let client = reqwest::Client::new();
+    for (member_count, expected_pages) in [(50_usize, 1_usize), (51, 2), (1_000, 20)] {
+        client
+            .post(format!("{http_base}/fixture/members/resize"))
+            .json(&json!({"version":1,"groupId":FIXTURE_GROUP,"count":member_count}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        gateway.invalidate_member_cache(FIXTURE_GROUP).await;
+        gateway.invalidate_group_cache().await;
+        let paged = gateway.list_members(FIXTURE_GROUP).await.unwrap();
+        assert_eq!(paged.members.len(), member_count);
+        assert_eq!(paged.http_pages, expected_pages);
+        assert_eq!(paged.nim_pages, expected_pages);
+        assert!(paged.complete);
+    }
+    client
+        .post(format!("{http_base}/fixture/members/resize"))
+        .json(&json!({"version":1,"groupId":FIXTURE_GROUP,"count":16}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    gateway.invalidate_member_cache(FIXTURE_GROUP).await;
+    gateway.invalidate_group_cache().await;
+
+    for (code, message) in [
+        (503_i64, "NIM service unavailable"),
+        (409_i64, "NIM business rejected"),
+    ] {
+        client
+            .post(format!("{http_base}/fixture/faults"))
+            .json(&json!({
+                "devtoolsReady":true,
+                "nimReady":true,
+                "nimMembersErrorCode":code,
+                "nimMembersErrorMessage":message
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        gateway.invalidate_member_cache(FIXTURE_GROUP).await;
+        let partial = gateway.list_members(FIXTURE_GROUP).await.unwrap();
+        assert!(!partial.complete);
+        assert_eq!(partial.status, "partial");
+        assert_eq!(partial.members.len(), 16);
+        assert_eq!(partial.source_errors.len(), 1);
+        assert!(partial.source_errors[0].reason.contains(&code.to_string()));
+        assert_ne!(partial.completeness_reason, "NIM 成员分页超过 100 页");
+    }
+    client
+        .post(format!("{http_base}/fixture/faults"))
+        .json(&json!({"devtoolsReady":true,"nimReady":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    gateway.invalidate_member_cache(FIXTURE_GROUP).await;
+
+    client
+        .post(format!("{http_base}/fixture/faults"))
+        .json(&json!({
+            "devtoolsReady":true,
+            "nimReady":true,
+            "nimSendTimeoutAfterEffect":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let announcement = gateway
+        .set_group_announcement(FIXTURE_GROUP, "公告广播幂等测试")
+        .await
+        .unwrap();
+    assert_eq!(announcement.status, "unknown");
+    assert_eq!(announcement.verification.as_deref(), Some("unknown"));
+    let actions_after_timeout = client
+        .get(format!("{http_base}/fixture/actions"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .unwrap();
+    let announcement_writes = actions_after_timeout
+        .iter()
+        .filter(|action| action["kind"] == "group_announcement")
+        .count();
+    let announcement_broadcasts = actions_after_timeout
+        .iter()
+        .filter(|action| action["kind"] == "send_text")
+        .count();
+    let repeated = gateway
+        .set_group_announcement(FIXTURE_GROUP, "公告广播幂等测试")
+        .await
+        .unwrap();
+    assert_eq!(repeated.verification.as_deref(), Some("not-applicable"));
+    let actions_after_retry = client
+        .get(format!("{http_base}/fixture/actions"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        actions_after_retry
+            .iter()
+            .filter(|action| action["kind"] == "group_announcement")
+            .count(),
+        announcement_writes
+    );
+    assert_eq!(
+        actions_after_retry
+            .iter()
+            .filter(|action| action["kind"] == "send_text")
+            .count(),
+        announcement_broadcasts
+    );
+    client
+        .post(format!("{http_base}/fixture/faults"))
+        .json(&json!({"devtoolsReady":true,"nimReady":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
     let rename_receipt = gateway
         .rename(
             FIXTURE_GROUP,
@@ -108,7 +257,6 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     assert_eq!(gateway.capabilities().rename, CapabilityStatus::Supported);
     assert_eq!(gateway.capabilities().mute, CapabilityStatus::Supported);
 
-    let client = reqwest::Client::new();
     client
         .post(format!("{http_base}/fixture/events/member-joined"))
         .json(&json!({"version":1,"userId":10017,"name":"新成员17"}))

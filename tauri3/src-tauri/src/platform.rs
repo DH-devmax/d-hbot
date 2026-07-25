@@ -638,7 +638,7 @@ fn sort_and_deduplicate_candidates(candidates: &mut Vec<InstallCandidate>) {
     for candidate in candidates.drain(..) {
         if unique
             .iter()
-            .any(|value| value.path.eq_ignore_ascii_case(&candidate.path))
+            .any(|value| windows_paths_equal(&value.path, &candidate.path))
         {
             continue;
         }
@@ -689,16 +689,44 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+#[cfg(any(test, windows))]
+fn normalize_windows_path_for_compare(value: &str) -> String {
+    let normalized = value.trim().replace('/', "\\").to_ascii_lowercase();
+    let normalized = if let Some(path) = normalized.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = normalized.strip_prefix(r"\\?\") {
+        path.to_string()
+    } else {
+        normalized
+    };
+    normalized.trim_end_matches('\\').to_string()
+}
+
+#[cfg(any(test, windows))]
+fn windows_paths_equal(left: &str, right: &str) -> bool {
+    normalize_windows_path_for_compare(left) == normalize_windows_path_for_compare(right)
+}
+
 #[cfg(windows)]
 fn select_connected_process(
     configured: Vec<ProcessRef>,
     discovered: Option<ProcessRef>,
-) -> Option<(ProcessRef, bool)> {
-    configured
-        .into_iter()
-        .next()
-        .map(|process| (process, false))
-        .or_else(|| discovered.map(|process| (process, true)))
+) -> AppResult<Option<(ProcessRef, bool)>> {
+    match configured.as_slice() {
+        [] => Ok(discovered.map(|process| (process, true))),
+        [process] => Ok(Some((process.clone(), false))),
+        processes => Err(AppError::new(
+            "devtools_process_ambiguous",
+            format!(
+                "检测到多个相同路径的旺商聊主进程（PID：{}），无法确认 9222 所属实例；请保留一个实例后重试，已保持所有进程不变",
+                processes
+                    .iter()
+                    .map(|process| process.pid.to_string())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -773,7 +801,7 @@ pub async fn start(
             None
         };
         let Some((process, adopted_running_path)) =
-            select_connected_process(configured_processes, discovered_process)
+            select_connected_process(configured_processes, discovered_process)?
         else {
             return Err(AppError::new(
                 "devtools_process_mismatch",
@@ -1758,14 +1786,14 @@ fn list_processes(image_path: &Path) -> AppResult<Vec<ProcessRef>> {
             .map(|value| vec![value])
             .unwrap_or_default()
     };
-    let want = image_path.to_string_lossy().to_lowercase();
+    let want = normalize_windows_path_for_compare(&image_path.to_string_lossy());
     let file_version = image_file_version(image_path).unwrap_or_default();
     let image_sha256 = sha256_file(image_path).unwrap_or_default();
     Ok(values
         .into_iter()
         .filter_map(|value| {
             let path = value.get("ExecutablePath")?.as_str()?.to_string();
-            if path.to_lowercase() != want {
+            if normalize_windows_path_for_compare(&path) != want {
                 return None;
             }
             if !is_main_wang_process_commandline(
@@ -1999,7 +2027,7 @@ mod tests {
     fn connected_process_prefers_configured_path() {
         let selected = process(10, "D:/wangshangliao.exe");
         let running = process(20, "C:/wangshangliao.exe");
-        let result = select_connected_process(vec![selected.clone()], Some(running));
+        let result = select_connected_process(vec![selected.clone()], Some(running)).unwrap();
         assert_eq!(result.as_ref().map(|value| value.0.pid), Some(selected.pid));
         assert!(!result.expect("configured process").1);
     }
@@ -2008,7 +2036,7 @@ mod tests {
     #[test]
     fn connected_process_adopts_unique_running_path() {
         let running = process(20, "C:/wangshangliao.exe");
-        let result = select_connected_process(Vec::new(), Some(running.clone()));
+        let result = select_connected_process(Vec::new(), Some(running.clone())).unwrap();
         assert_eq!(result.as_ref().map(|value| value.0.pid), Some(running.pid));
         assert!(result.expect("running process").1);
     }
@@ -2016,15 +2044,28 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn connected_process_rejects_ambiguous_running_paths() {
-        assert!(select_connected_process(Vec::new(), None).is_none());
+        let error = select_connected_process(
+            vec![
+                process(20, "D:/wangshangliao.exe"),
+                process(30, "D:/wangshangliao.exe"),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "devtools_process_ambiguous");
+        assert!(error.message.contains("20、30"));
     }
 
     #[test]
     fn process_paths_are_case_insensitive_on_windows() {
-        assert!(Path::new("C:/WangShangLiao.exe")
-            .to_string_lossy()
-            .to_lowercase()
-            .ends_with("wangshangliao.exe"));
+        assert!(windows_paths_equal(
+            r"\\?\C:\Program Files\WangShangLiao.exe",
+            r"c:/program files/wangshangliao.exe"
+        ));
+        assert!(windows_paths_equal(
+            r"\\?\UNC\server\share\WangShangLiao.exe",
+            r"\\server\share\wangshangliao.exe"
+        ));
     }
 
     #[test]

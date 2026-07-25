@@ -378,69 +378,8 @@ impl CdpClient {
         }
     }
 
-    #[allow(unreachable_code)]
     pub async fn evaluate(&self, expression: &str) -> AppResult<Value> {
-        return self.evaluate_persistent(expression).await;
-        let _gate = self.request_gate.acquire("Runtime.evaluate").await?;
-        let page = self.page().await?;
-        let websocket = page
-            .web_socket_debugger_url
-            .ok_or_else(|| AppError::new("devtools_page", "页面缺少 WebSocket 地址"))?;
-        let (mut stream, _) = timeout(Duration::from_secs(8), connect_async(websocket.as_str()))
-            .await
-            .map_err(|_| AppError::new("cdp_timeout", "连接 DevTools WebSocket 超时").retryable())?
-            .map_err(|error| {
-                AppError::new(
-                    "cdp_connect",
-                    format!("连接 DevTools WebSocket 失败：{error}"),
-                )
-                .retryable()
-            })?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = json!({
-            "id": id,
-            "method": "Runtime.evaluate",
-            "params": { "expression": expression, "awaitPromise": true, "returnByValue": true }
-        });
-        stream
-            .send(WsMessage::Text(request.to_string().into()))
-            .await
-            .map_err(|error| {
-                AppError::new("cdp_write", format!("写入 DevTools 请求失败：{error}")).retryable()
-            })?;
-        let result = timeout(Duration::from_secs(25), async {
-            while let Some(item) = stream.next().await {
-                let item = item.map_err(|error| {
-                    AppError::new("cdp_read", format!("读取 DevTools 响应失败：{error}"))
-                })?;
-                if !item.is_text() {
-                    continue;
-                }
-                let value: Value = serde_json::from_str(item.to_text().unwrap_or_default())
-                    .map_err(|error| AppError::new("cdp_response", error.to_string()))?;
-                if value.get("id").and_then(Value::as_u64) != Some(id) {
-                    continue;
-                }
-                if let Some(exception) = value
-                    .pointer("/result/exceptionDetails/text")
-                    .and_then(Value::as_str)
-                {
-                    return Err(AppError::new(
-                        "cdp_exception",
-                        format!("旺商聊页面执行失败：{exception}"),
-                    ));
-                }
-                return Ok(value
-                    .pointer("/result/result/value")
-                    .cloned()
-                    .unwrap_or(Value::Null));
-            }
-            Err(AppError::new("cdp_closed", "DevTools WebSocket 已关闭").retryable())
-        })
-        .await
-        .map_err(|_| AppError::new("cdp_timeout", "DevTools 执行超时").retryable())??;
-        let _ = stream.close(None).await;
-        Ok(result)
+        self.evaluate_persistent(expression).await
     }
 
     async fn evaluate_persistent(&self, expression: &str) -> AppResult<Value> {
@@ -763,6 +702,10 @@ impl CdpGateway {
         self.member_cache.write().await.remove(&group_id);
     }
 
+    pub async fn invalidate_group_cache(&self) {
+        self.group_cache.write().await.take();
+    }
+
     async fn reset_session_state(&self) {
         let had_session = !self.account_id.read().await.is_empty()
             || *self.sender_id.read().await > 0
@@ -893,8 +836,18 @@ impl CdpGateway {
     }
 
     async fn resolve_cloud_id(&self, group_id: i64) -> AppResult<String> {
-        self.cached_group_infos()
+        if let Some(cloud_id) = self
+            .cached_group_infos()
             .await
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .map(|group| group.cloud_id)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(cloud_id);
+        }
+        self.group_infos()
+            .await?
             .into_iter()
             .find(|group| group.group_id == group_id)
             .map(|group| group.cloud_id)
@@ -938,7 +891,7 @@ impl CdpGateway {
         if nim_account.is_empty() {
             return Err(AppError::new(
                 "nim_not_ready",
-                "NIM 灏氭湭鍒濆鍖栵紝璇峰厛鐧诲綍鏃哄晢鑱婂苟绛夊緟浼氳瘽鍒濆鍖?",
+                "NIM 尚未初始化，请先登录旺商聊并等待会话初始化",
             )
             .retryable());
         }
@@ -964,46 +917,8 @@ impl CdpGateway {
             }
         }
         if sender <= 0 {
-            return Err(
-                AppError::new("account_identity", "褰撳墠璐﹀彿鏈槧灏勫埌缇ゆ垚鍛?").retryable(),
-            );
+            return Err(AppError::new("account_identity", "当前账号未映射到群成员").retryable());
         }
-        *self.sender_id.write().await = sender;
-        if let Ok(mut checked) = self.identity_checked_at.lock() {
-            *checked = Some(Instant::now());
-        }
-        Ok((sender, nim_account))
-    }
-
-    #[allow(dead_code)]
-    async fn legacy_session_identity_removed(&self) -> AppResult<(i64, String)> {
-        let runtime = self.cdp.evaluate(r#"({nimAccount:String((window.nim&&(window.nim.account||window.nim.options&&window.nim.options.account||window.nim.config&&window.nim.config.account))||"")})"#).await?;
-        let nim_account = runtime
-            .get("nimAccount")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if nim_account.is_empty() {
-            return Err(AppError::new(
-                "nim_not_ready",
-                "NIM 尚未初始化，请先登录旺商聊并等待会话初始化",
-            )
-            .retryable());
-        }
-        let groups = self.cached_group_infos().await;
-        let first = groups
-            .first()
-            .ok_or_else(|| AppError::new("no_groups", "当前账号没有可用群"))?;
-        let (members, _, _) = self.list_http_members(first.group_id).await?;
-        let sender = members
-            .iter()
-            .find(|member| member.nim_id == nim_account)
-            .map(|member| member.user_id)
-            .unwrap_or(0);
-        if sender <= 0 {
-            return Err(AppError::new("account_identity", "当前账号未映射到群成员"));
-        }
-        *self.account_id.write().await = nim_account.clone();
         *self.sender_id.write().await = sender;
         if let Ok(mut checked) = self.identity_checked_at.lock() {
             *checked = Some(Instant::now());
@@ -1726,6 +1641,7 @@ impl MemberRequestGateway for CdpGateway {
         let mut nim_cursor = None;
         let mut nim_values = Vec::new();
         let mut nim_complete = false;
+        let mut nim_failed = false;
         let mut nim_pages = 0usize;
         let mut source_errors = Vec::new();
         for page_index in 0..100 {
@@ -1739,8 +1655,9 @@ impl MemberRequestGateway for CdpGateway {
                         route: "nim.getTeamMembers".into(),
                         page: nim_pages,
                         cursor: nim_cursor.clone(),
-                        reason: error.message,
+                        reason: format!("{}: {}", error.code, error.message),
                     });
+                    nim_failed = true;
                     break;
                 }
             };
@@ -1750,29 +1667,31 @@ impl MemberRequestGateway for CdpGateway {
                     .and_then(Value::as_str)
                     .unwrap_or("NIM member request failed")
                     .to_string();
-                let rate_error = AppError::new("nim_members", reason.clone()).retryable();
-                if is_member_rate_limited(&rate_error) {
-                    return Err(rate_error);
+                let source_error = nim_response_error("nim.getTeamMembers", &nim, &reason);
+                if is_member_rate_limited(&source_error) {
+                    return Err(source_error);
                 }
+                let structured_code = source_error.gateway.as_deref().and_then(|metadata| {
+                    metadata
+                        .business_code
+                        .or(metadata.business_errno)
+                        .or(metadata.transport_code)
+                        .or(metadata.transport_errno)
+                });
                 source_errors.push(MemberSourceError {
                     source: "nim".into(),
                     route: "nim.getTeamMembers".into(),
                     page: nim_pages,
                     cursor: nim_cursor.clone(),
-                    reason,
+                    reason: match structured_code {
+                        Some(code) => {
+                            format!("{}({code}): {}", source_error.code, source_error.message)
+                        }
+                        None => format!("{}: {}", source_error.code, source_error.message),
+                    },
                 });
+                nim_failed = true;
                 break;
-                #[allow(unreachable_code)]
-                return Err(AppError::new(
-                    "nim_members",
-                    format!(
-                        "NIM 成员请求失败：{}",
-                        nim.get("errorMessage")
-                            .and_then(Value::as_str)
-                            .unwrap_or("未知错误")
-                    ),
-                )
-                .retryable());
             }
             nim_values.extend(
                 nim.get("members")
@@ -1794,7 +1713,7 @@ impl MemberRequestGateway for CdpGateway {
             }
             nim_cursor = Some(next);
         }
-        if !nim_complete {
+        if !nim_complete && !nim_failed {
             return Err(AppError::new(
                 "member_pagination",
                 "NIM 成员分页超过 100 页",
@@ -2261,6 +2180,17 @@ impl GroupGateway for CdpGateway {
                 "当前账号存在多个群公告，拒绝更新不确定的公告",
             ));
         }
+        if let Some(existing) = own_notices.first() {
+            let notice_id = text_field(existing, &["noticeId", "id"]);
+            let content = human_name_field(existing, &["noticeContent", "content"]);
+            if !notice_id.is_empty() && content == text {
+                let mut receipt = GatewayReceipt::succeeded(GROUP_NOTICE_UPDATE_ROUTE);
+                receipt.request_id = notice_id;
+                receipt.business_message = "群公告内容已经保存，本次未重复广播".into();
+                receipt.verification = Some("not-applicable".into());
+                return Ok(receipt);
+            }
+        }
         let own_notice_id = own_notices
             .first()
             .map(|value| text_field(value, &["noticeId", "id"]));
@@ -2310,53 +2240,84 @@ impl GroupGateway for CdpGateway {
             ));
         }
 
-        let cloud = self.resolve_cloud_id(group_id).await?;
-        let group_name = self
-            .group_infos()
-            .await?
-            .into_iter()
-            .find(|group| group.group_id == group_id)
-            .map(|group| group.name)
-            .unwrap_or_default();
-        let notice_payload = json!({
-            "msgFormat": 8,
-            "msgSession": 2,
-            "from": {"id": sender, "name": "", "avatar": ""},
-            "to": {"id": group_id, "groupCloudId": cloud, "groupName": group_name},
-            "groupNotice": {"content": text, "noticeId": notice_id}
-        });
-        let encoded = self
-            .cdp
-            .evaluate(&ipc_expression(
-                "encode",
-                "/v1/plugins/encode-msg",
-                notice_payload,
-            ))
-            .await?;
-        let content = decode_transport_response("/v1/plugins/encode-msg", &encoded)?;
-        if content.is_empty() {
-            return Err(AppError::new("encode_failed", "群公告消息编码失败"));
+        let broadcast = async {
+            let cloud = self.resolve_cloud_id(group_id).await?;
+            let group_name = self
+                .group_infos()
+                .await?
+                .into_iter()
+                .find(|group| group.group_id == group_id)
+                .map(|group| group.name)
+                .unwrap_or_default();
+            let notice_payload = json!({
+                "msgFormat": 8,
+                "msgSession": 2,
+                "from": {"id": sender, "name": "", "avatar": ""},
+                "to": {"id": group_id, "groupCloudId": cloud, "groupName": group_name},
+                "groupNotice": {"content": text, "noticeId": notice_id}
+            });
+            let encoded = self
+                .cdp
+                .evaluate(&ipc_expression(
+                    "encode",
+                    "/v1/plugins/encode-msg",
+                    notice_payload,
+                ))
+                .await?;
+            let content = decode_transport_response("/v1/plugins/encode-msg", &encoded)?;
+            if content.is_empty() {
+                return Err(AppError::new("encode_failed", "群公告消息编码失败"));
+            }
+            self.cdp
+                .evaluate(&nim_send_expression(&cloud, content))
+                .await
         }
-        let delivery = self
-            .cdp
-            .evaluate(&nim_send_expression(&cloud, content))
-            .await?;
+        .await;
+        let delivery = match broadcast {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                return Ok(announcement_delivery_unknown(
+                    route,
+                    &notice_id,
+                    &error.message,
+                ));
+            }
+        };
         if delivery.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(AppError::new(
-                "send_failed",
+            return Ok(announcement_delivery_unknown(
+                route,
+                &notice_id,
                 delivery
                     .get("errorMessage")
                     .and_then(Value::as_str)
                     .unwrap_or("群公告消息投递失败"),
-            )
-            .retryable());
+            ));
         }
         let mut receipt = GatewayReceipt::succeeded(route);
-        receipt.message_id = delivery_message_id(&delivery)?;
+        receipt.message_id = match delivery_message_id(&delivery) {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                return Ok(announcement_delivery_unknown(
+                    route,
+                    &notice_id,
+                    &error.message,
+                ));
+            }
+        };
         receipt.request_id = receipt_identifier(&delivery, &["requestId", "idClient", "traceId"]);
         receipt.verification = Some("verified".into());
         Ok(receipt)
     }
+}
+
+fn announcement_delivery_unknown(route: &str, notice_id: &str, detail: &str) -> GatewayReceipt {
+    let mut receipt = GatewayReceipt::succeeded(route);
+    receipt.status = "unknown".into();
+    receipt.request_id = notice_id.into();
+    receipt.business_message =
+        format!("群公告已保存，但广播结果未知：{detail}；相同内容不会重复广播");
+    receipt.verification = Some("unknown".into());
+    receipt
 }
 
 fn delivery_message_id(delivery: &Value) -> AppResult<String> {
@@ -2391,14 +2352,6 @@ struct GroupInfo {
 
 type GroupCache = Option<(Instant, Vec<GroupInfo>)>;
 
-#[allow(dead_code)]
-fn ipc_expression_legacy(kind: &str, route: &str, payload: Value) -> String {
-    let input = json!({"type":kind,"route":route,"payload":payload});
-    format!(
-        r#"(async()=>{{const input={input};const ipc=globalThis.__dhIpc||(typeof require==="function"?require("electron").ipcRenderer:null);if(!ipc)return{{transportCode:503,errno:1,error:"Electron IPC 未就绪",requestId:""}};return new Promise(resolve=>{{const channel="dh-rust-"+Date.now()+"-"+Math.random();const timer=setTimeout(()=>resolve({{transportCode:504,errno:1,error:"IPC timeout",requestId:channel}}),15000);ipc.once(channel,(event,value)=>{{clearTimeout(timer);resolve({{transportCode:value&&value.code,errno:value&&value.errno,response:value&&value.response,error:value&&value.message,requestId:value&&value.requestId||channel}});}});if(input.type==="request")ipc.send("xclient",{{type:"request",requestId:channel,url:input.route,excuteType:0,params:JSON.stringify(input.payload),key:channel}});else ipc.send("xclient",{{type:"encode",params:JSON.stringify(input.payload),key:channel}});}});}})()"#
-    )
-}
-
 fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
     let input = json!({"type":kind,"route":route,"payload":payload});
     format!(
@@ -2406,33 +2359,17 @@ fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
     )
 }
 
-#[allow(dead_code)]
-fn nim_send_expression_legacy(target: &str, content: &str) -> String {
-    let input = json!({"target":target,"content":content});
-    format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪"}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM send timeout"}}),15000);window.nim.sendCustomMsg({{scene:"team",to:input.target,content:input.content,isLocal:false,done:(error,message)=>{{clearTimeout(timer);resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),idClient:message&&message.idClient,idServer:message&&message.idServer}});}}}});}});}})()"#
-    )
-}
-
 fn nim_send_expression(target: &str, content: &str) -> String {
     let input = json!({"target":target,"content":content});
     format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable"}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",timedOut:true}}),15000);window.nim.sendCustomMsg({{scene:"team",to:input.target,content:input.content,isLocal:false,done:(error,message)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),idClient:message&&message.idClient,idServer:message&&message.idServer}});}}}});}});}})()"#
-    )
-}
-
-#[allow(dead_code)]
-fn nim_team_members_expression_legacy(team_id: &str, cursor: Option<&str>) -> String {
-    let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
-    format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪",members:[]}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM team members timeout",members:[]}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,timedOut:true}}),15000);window.nim.sendCustomMsg({{scene:"team",to:input.target,content:input.content,isLocal:false,done:(error,message)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),timedOut:Boolean(error&&error.timedOut),idClient:message&&message.idClient,idServer:message&&message.idServer}});}}}});}});}})()"#
     )
 }
 
 fn nim_team_members_expression(team_id: &str, cursor: Option<&str>) -> String {
     let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
     format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503,members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),timedOut:Boolean(error&&error.timedOut),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
     )
 }
 
@@ -2453,14 +2390,6 @@ fn next_cursor(value: &Value) -> Option<String> {
             .filter(|text| !text.is_empty())
     })
     .map(ToOwned::to_owned)
-}
-
-#[allow(dead_code)]
-fn nim_update_nick_expression_legacy(team_id: &str, nim_id: &str, nickname: &str) -> String {
-    let input = json!({"teamId":team_id,"account":nim_id,"nickInTeam":nickname});
-    format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim){{resolve({{ok:false,errorMessage:"NIM 未就绪"}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM update nick timeout"}}),15000);window.nim.updateNickInTeam({{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam,done:(error,value)=>{{clearTimeout(timer);resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),member:value||null}});}}}});}});}})()"#
-    )
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -2584,7 +2513,7 @@ fn decode_transport_response<'a>(route: &str, value: &'a Value) -> AppResult<&'a
         };
         let error =
             AppError::new("gateway_transport", error_message).with_gateway(transport_metadata());
-        return Err(if code >= 500 {
+        return Err(if code == 429 || code >= 500 {
             error.retryable()
         } else {
             error
@@ -2651,13 +2580,52 @@ fn decode_business_response(route: &str, response: &str) -> AppResult<Value> {
         {
             gateway.kind = GatewayErrorKind::NimNotReady;
         }
-        return Err(AppError::new("gateway_business", message).with_gateway(gateway));
+        let error = AppError::new("gateway_business", message).with_gateway(gateway);
+        return Err(
+            if matches!(code, 429 | 502 | 503 | 504) || matches!(errno, 429 | 502 | 503 | 504) {
+                error.retryable()
+            } else {
+                error
+            },
+        );
     }
     Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
 }
 
+fn nim_response_error(route: &str, value: &Value, message: &str) -> AppError {
+    let code = int_field(value, &["errorCode", "status", "code"]);
+    let mut metadata = gateway_metadata(
+        route,
+        GatewayErrorLayer::Business,
+        Some(200),
+        Some(0),
+        (code != 0).then_some(code),
+        None,
+    );
+    if code == 503 || message.to_ascii_lowercase().contains("nim unavailable") {
+        metadata.kind = GatewayErrorKind::NimNotReady;
+    }
+    let error =
+        AppError::new("nim_members", format!("NIM 成员请求失败：{message}")).with_gateway(metadata);
+    if matches!(code, 429 | 502 | 503 | 504)
+        || value.get("timedOut").and_then(Value::as_bool) == Some(true)
+    {
+        error.retryable()
+    } else {
+        error
+    }
+}
+
 fn is_member_rate_limited(error: &AppError) -> bool {
     if error.code == "gateway_rate_limited" {
+        return true;
+    }
+    if error.gateway.as_deref().is_some_and(|metadata| {
+        metadata.transport_code == Some(429)
+            || metadata.transport_errno == Some(429)
+            || metadata.business_code == Some(429)
+            || metadata.business_errno == Some(429)
+    }) {
         return true;
     }
     let text = format!("{} {}", error.code, error.message).to_ascii_lowercase();
@@ -3052,10 +3020,45 @@ mod tests {
     fn member_rate_limit_errors_are_detected_and_labeled() {
         let error = AppError::new("gateway_business", "请求太频繁，请稍后重试");
         assert!(is_member_rate_limited(&error));
+        let transport_429 = decode_transport_response(
+            "/v1/group/get-group-members",
+            &json!({"transportCode":429,"errno":0,"error":"busy"}),
+        )
+        .unwrap_err();
+        assert!(transport_429.retryable);
+        assert!(is_member_rate_limited(&transport_429));
+        let business_429 = decode_business_response(
+            "/v1/group/get-group-members",
+            r#"{"code":429,"errno":429,"msg":"busy","data":null}"#,
+        )
+        .unwrap_err();
+        assert!(business_429.retryable);
+        assert!(is_member_rate_limited(&business_429));
         let labeled = rate_limited_error(error);
         assert_eq!(labeled.code, "gateway_rate_limited");
         assert!(labeled.retryable);
         assert!(labeled.message.contains("过于频繁"));
+    }
+
+    #[test]
+    fn structured_gateway_5xx_errors_are_retryable_but_not_rate_limited() {
+        for code in [502_i64, 503, 504] {
+            let transport = decode_transport_response(
+                "/v1/group/get-group-members",
+                &json!({"transportCode":code,"errno":1,"error":"upstream unavailable"}),
+            )
+            .unwrap_err();
+            assert!(transport.retryable);
+            assert!(!is_member_rate_limited(&transport));
+
+            let response = format!(
+                r#"{{"code":{code},"errno":{code},"msg":"upstream unavailable","data":null}}"#
+            );
+            let business =
+                decode_business_response("/v1/group/get-group-members", &response).unwrap_err();
+            assert!(business.retryable);
+            assert!(!is_member_rate_limited(&business));
+        }
     }
 
     #[test]
