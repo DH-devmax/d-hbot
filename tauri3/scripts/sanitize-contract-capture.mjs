@@ -23,6 +23,7 @@ function kindForKey(key) {
   if (normalized.endsWith('userid') || normalized === 'senderid' || normalized === 'from') return 'USER'
   if (normalized === 'groupid' || normalized === 'groupcloudid' || normalized === 'teamid' || normalized === 'to') return 'GROUP'
   if (normalized === 'groupname' || normalized === 'nickname' || normalized === 'cardname' || normalized === 'usernick' || normalized === 'groupmembernick') return 'NAME'
+  if (normalized === 'noticecontent' || normalized === 'text' || normalized === 'content' || normalized === 'data') return 'TEXT'
   return null
 }
 

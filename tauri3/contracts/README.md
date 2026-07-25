@@ -36,10 +36,12 @@ announcement read/add/update/broadcast is calibrated. Whole-group mute and
 unmute remain `Unverified` until a sanitized two-managed-group trace verifies
 both the `MUTE_MEMBER` and `MUTE_NO` state transitions and restoration.
 
-Raw traces belong in `contracts/raw/`, whose contents are ignored by Git. A
-developer first records actual IPC/NIM request, response, callback and resulting
-state JSON files from the developer build. The collector reads the running local
-DevTools page and the installed main script to pin the exact page fingerprint:
+Raw traces created by `DH-BOT-Dev.exe` belong in
+`%APPDATA%\DH\developer\contracts\raw` and never enter Git or a release bundle.
+The developer calibration panel records actual IPC/NIM requests, responses,
+callbacks and resulting state while enforcing real mode, `127.0.0.1:9222` and a
+ready NIM session. The legacy assembler remains available for manually prepared
+inputs and pins the running DevTools page plus installed main script:
 
 ```text
 node scripts/assemble-contract-capture.mjs \
@@ -59,8 +61,9 @@ ignored raw directory. Before adding or updating a frozen trace, run:
 
 ```text
 node scripts/sanitize-contract-capture.mjs contracts/raw/TRACE.json contracts/TRACE.sanitized.json
+pnpm verify:calibration-capture -- contracts/TRACE.sanitized.json
 node scripts/sanitize-contract-capture.mjs --self-test
-node --test scripts/sanitize-contract-capture.test.mjs scripts/assemble-contract-capture.test.mjs
+node --test scripts/sanitize-contract-capture.test.mjs scripts/assemble-contract-capture.test.mjs scripts/verify-calibration-capture.test.mjs
 ```
 
 The sanitizer sorts object keys, assigns stable

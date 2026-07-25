@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@runtime-controls': fileURLToPath(new URL('./src/RuntimeControls.developer.tsx', import.meta.url)),
+      '@calibration-controls': fileURLToPath(new URL('./src/CalibrationControls.developer.tsx', import.meta.url)),
     },
   },
   test: {

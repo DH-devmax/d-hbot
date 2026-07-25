@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1014,241 +1013,6 @@ impl BackendRuntime {
             .unwrap_or(false)
     }
 
-    async fn sync_members(&self, account_id: &str, sender_id: i64, session_epoch: u64) {
-        if self.gateway.session_epoch() != session_epoch {
-            return;
-        }
-        if self.gateway.member_sync_paused() {
-            self.logger
-                .write("WARN", "旺商聊成员同步已暂停，等待限流退避结束");
-            return;
-        }
-        let groups = match self.gateway.list_groups().await {
-            Ok(groups) => groups,
-            Err(_) => return,
-        };
-        for group in groups {
-            if self.gateway.session_epoch() != session_epoch {
-                break;
-            }
-            if self.gateway.member_sync_paused() {
-                self.logger
-                    .write("WARN", "旺商聊成员同步触发限流，后台同步进入退避");
-                break;
-            }
-            let snapshot_started_at = Utc::now();
-            let roster = match self.gateway.list_members(group.group_id).await {
-                Ok(roster) => roster,
-                Err(error) => {
-                    self.events.emit(
-                        "member-roster-status",
-                        serde_json::json!({
-                            "accountId": account_id,
-                            "groupId": group.group_id,
-                            "status": if error.code == "gateway_rate_limited" { "rate-limited" } else { "error" },
-                            "reportedCount": 0,
-                            "resolvedCount": 0,
-                            "complete": false,
-                            "completenessReason": error.message.clone(),
-                        }),
-                    );
-                    self.logger.write(
-                        "WARN",
-                        &format!(
-                            "群 {} 成员同步失败：{}{}",
-                            group.group_id,
-                            error.message,
-                            if self.gateway.member_sync_paused() {
-                                "；后台同步已暂停"
-                            } else {
-                                ""
-                            }
-                        ),
-                    );
-                    if self.gateway.member_sync_paused() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            if self.gateway.session_epoch() != session_epoch {
-                break;
-            }
-            self.events.emit(
-                "member-roster-status",
-                serde_json::json!({
-                    "accountId": account_id,
-                    "groupId": group.group_id,
-                    "status": roster.status.clone(),
-                    "reportedCount": roster.reported_count,
-                    "resolvedCount": roster.resolved_count,
-                    "complete": roster.complete,
-                    "completenessReason": roster.completeness_reason.clone(),
-                    "retryAt": roster.retry_at.clone(),
-                    "canonicalCount": roster.canonical_count,
-                    "syntheticUserIds": roster.synthetic_user_ids.clone(),
-                    "sourceErrors": roster.source_errors.clone(),
-                }),
-            );
-            let existing = self
-                .database
-                .list_members(account_id.to_string(), group.group_id)
-                .await
-                .unwrap_or_default();
-            let baseline = existing.is_empty();
-            let mut present_ids = HashSet::new();
-            let mut newly_discovered = HashSet::new();
-            for mut member in roster.members {
-                member.account_id = account_id.to_string();
-                if let Some(saved) = existing.iter().find(|saved| {
-                    saved.user_id == member.user_id
-                        || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
-                }) {
-                    member.original_card_name = saved.original_card_name.clone();
-                    member.managed_card_name = saved.managed_card_name.clone();
-                    member.card_suffix = saved.card_suffix.clone();
-                    member.locked_card_name = saved.locked_card_name.clone();
-                    member.violation_count = saved.violation_count;
-                    member.blacklisted = saved.blacklisted;
-                    member.join_source = saved.join_source.clone();
-                    member.prompt_read = saved.prompt_read;
-                    member.discovered_at = saved.discovered_at;
-                    member.joined_at = saved.joined_at;
-                } else {
-                    let now = Utc::now();
-                    member.original_card_name = member.card_name.clone();
-                    member.join_source = if baseline {
-                        "baseline"
-                    } else {
-                        "offline-discovered"
-                    }
-                    .into();
-                    member.prompt_read = baseline;
-                    member.discovered_at = now;
-                    member.joined_at = (!baseline).then_some(now);
-                    newly_discovered.insert(member.user_id);
-                }
-                member.present = true;
-                member.last_seen_at = Utc::now();
-                member.updated_at = member.last_seen_at;
-                if let Ok(canonical_user_id) = self.database.upsert_member(member.clone()).await {
-                    present_ids.insert(canonical_user_id);
-                }
-                if !baseline && newly_discovered.contains(&member.user_id) && member.blacklisted {
-                    let queued = self
-                        .enqueue_effect(
-                            account_id,
-                            group.group_id,
-                            "remove",
-                            serde_json::json!({
-                                "userId": member.user_id,
-                                "recordAction": true,
-                                "actionKind": "remove",
-                                "mode": "automatic",
-                                "reason": "blacklisted_member_rejoined",
-                            }),
-                            format!(
-                                "blacklist-roster-rejoin:{account_id}:{}:{}:{}",
-                                group.group_id,
-                                member.user_id,
-                                member.discovered_at.timestamp_millis()
-                            ),
-                        )
-                        .await
-                        .is_ok();
-                    let _ = self
-                        .database
-                        .record_audit(AuditEvent {
-                            id: 0,
-                            account_id: account_id.into(),
-                            group_id: group.group_id,
-                            user_id: member.user_id,
-                            actor: "DH BOT".into(),
-                            event: "blacklisted_member_rejoined".into(),
-                            level: if queued { "info" } else { "error" }.into(),
-                            details: if queued {
-                                "黑名单成员重新入群，已进入自动移出队列"
-                            } else {
-                                "黑名单成员重新入群，自动移出入队失败"
-                            }
-                            .into(),
-                            created_at: Utc::now(),
-                        })
-                        .await;
-                }
-            }
-            let automatic = self
-                .database
-                .get_setting(format!("card.auto.{account_id}.{}", group.group_id))
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("true");
-            if !baseline && automatic && !newly_discovered.is_empty() {
-                let prefix = self
-                    .database
-                    .get_setting(format!("card.prefix.{account_id}.{}", group.group_id))
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "DH".into());
-                if let Ok(preview) = crate::cardnames::preview(
-                    group.group_id,
-                    &prefix,
-                    self.database
-                        .list_members(account_id.to_string(), group.group_id)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|member| member.present)
-                        .collect(),
-                    sender_id,
-                ) {
-                    for plan in preview.items.into_iter().filter(|plan| {
-                        plan.status == "planned" && newly_discovered.contains(&plan.member.user_id)
-                    }) {
-                        let _ = self
-                            .database
-                            .enqueue_card_job(account_id.to_string(), group.group_id, plan, false)
-                            .await;
-                    }
-                }
-            }
-            if roster.authority == "authoritative"
-                && !baseline
-                && self.gateway.session_epoch() == session_epoch
-            {
-                let missing = self
-                    .database
-                    .mark_members_not_present_before(
-                        account_id.to_string(),
-                        group.group_id,
-                        present_ids.iter().copied().collect::<Vec<_>>(),
-                        snapshot_started_at,
-                    )
-                    .await
-                    .unwrap_or_default();
-                for member in missing {
-                    let _ = self
-                        .database
-                        .record_audit(AuditEvent {
-                            id: 0,
-                            account_id: account_id.into(),
-                            group_id: group.group_id,
-                            user_id: member.user_id,
-                            actor: "DH BOT".into(),
-                            event: "member_left".into(),
-                            level: "info".into(),
-                            details: "成员同步确认已离群".into(),
-                            created_at: Utc::now(),
-                        })
-                        .await;
-                }
-            }
-        }
-    }
-
     async fn schedule_loop(&self, app: AppHandle) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
@@ -1368,10 +1132,8 @@ impl BackendRuntime {
         let mut workers: HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>> = HashMap::new();
         let mut worker_tasks = JoinSet::new();
         let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
-        let member_sync_running = Arc::new(AtomicBool::new(false));
         let mut active_account = String::new();
         let mut session_epoch = 0u64;
-        let mut last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
         'connection: loop {
             let diagnostic = self.gateway.diagnose().await;
@@ -1404,7 +1166,6 @@ impl BackendRuntime {
                 member_event_cache.clear();
                 active_account = account_id.clone();
                 session_epoch = gateway_epoch;
-                last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
                 last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             }
             let now = Utc::now();
@@ -1462,24 +1223,6 @@ impl BackendRuntime {
             let mut last_batch_session: Option<String> = None;
             let mut last_ack_sequence: Option<u64> = None;
             'batch: loop {
-                if Utc::now()
-                    .signed_duration_since(last_roster_sync)
-                    .num_seconds()
-                    >= 60
-                {
-                    if !member_sync_running.swap(true, Ordering::AcqRel) {
-                        let runtime = self.clone();
-                        let sync_account = account_id.clone();
-                        let running = member_sync_running.clone();
-                        tauri::async_runtime::spawn(async move {
-                            runtime
-                                .sync_members(&sync_account, sender_id, session_epoch)
-                                .await;
-                            running.store(false, Ordering::Release);
-                        });
-                    }
-                    last_roster_sync = Utc::now();
-                }
                 if Utc::now()
                     .signed_duration_since(last_retry_scan)
                     .num_seconds()
@@ -2088,7 +1831,6 @@ impl BackendRuntime {
                 tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
             }
             member_event_cache.clear();
-            last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
             last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
         }
@@ -3576,6 +3318,20 @@ mod tests {
             runtime_mode_file: root.join("runtime-mode"),
         };
         (directory, paths)
+    }
+
+    #[test]
+    fn connection_loop_never_schedules_member_roster_refreshes() {
+        let source = include_str!("runtime.rs");
+        let connection_loop = source
+            .split_once("    async fn connection_loop")
+            .and_then(|(_, remainder)| remainder.split_once("    async fn handle_gateway_event"))
+            .map(|(body, _)| body)
+            .expect("connection loop source must remain inspectable");
+
+        assert!(!connection_loop.contains("list_members("));
+        assert!(!connection_loop.contains("last_roster_sync"));
+        assert!(!connection_loop.contains("sync_members("));
     }
 
     #[test]

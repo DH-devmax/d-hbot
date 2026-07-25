@@ -20,6 +20,8 @@ function capture(overrides = {}) {
             userId: 10006,
             nimId: 'nim-real-6',
             msgId: 'message-real-1',
+            noticeContent: '真实公告内容',
+            content: { data: '真实测试消息' },
             groupRole: 'member',
             accountState: 'ACCOUNT_STATE_GOOD',
           },
@@ -38,6 +40,8 @@ test('sanitizer is deterministic and preserves non-identifier business fields', 
   assert.equal(first.operations[0].request.params.userId, 'USER_001')
   assert.equal(first.operations[0].request.params.nimId, 'NIM_001')
   assert.equal(first.operations[0].request.params.msgId, 'MESSAGE_001')
+  assert.equal(first.operations[0].request.params.noticeContent, 'TEXT_002')
+  assert.equal(first.operations[0].request.params.content.data, 'TEXT_001')
   assert.equal(first.operations[0].request.params.groupRole, 'member')
   assert.equal(first.operations[0].request.params.accountState, 'ACCOUNT_STATE_GOOD')
   assert.equal(first.metadata.mainScriptSha256, 'a'.repeat(64))
