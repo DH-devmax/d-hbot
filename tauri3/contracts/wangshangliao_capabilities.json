@@ -11,7 +11,7 @@
         "mute": "unverified",
         "recall": "unverified",
         "rename": "unverified",
-        "removeMember": "unverified",
+        "removeMember": "unsupported",
         "groupMute": "unverified",
         "memberEvents": "unverified"
       }
@@ -26,7 +26,7 @@
         "mute": "unverified",
         "recall": "unverified",
         "rename": "unverified",
-        "removeMember": "unverified",
+        "removeMember": "unsupported",
         "groupMute": "unverified",
         "memberEvents": "unverified"
       }

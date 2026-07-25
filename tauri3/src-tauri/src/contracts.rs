@@ -81,7 +81,11 @@ fn capabilities_from_registry(
                     .main_script_sha256
                     .eq_ignore_ascii_case(main_script_sha256)
         })
-        .map(|entry| entry.capabilities)
+        .map(|entry| {
+            let mut capabilities = entry.capabilities;
+            capabilities.remove_member = CapabilityStatus::Unsupported;
+            capabilities
+        })
         .unwrap_or_else(unverified_production_capabilities)
 }
 
@@ -92,7 +96,7 @@ pub(crate) fn unverified_production_capabilities() -> GatewayCapabilities {
         mute: CapabilityStatus::Unverified,
         recall: CapabilityStatus::Unverified,
         rename: CapabilityStatus::Unverified,
-        remove_member: CapabilityStatus::Unverified,
+        remove_member: CapabilityStatus::Unsupported,
         group_mute: CapabilityStatus::Unverified,
         member_events: CapabilityStatus::Unverified,
     }
@@ -599,6 +603,7 @@ mod tests {
         assert_eq!(unknown.announcement, CapabilityStatus::Unverified);
         assert_eq!(unknown.send_text, CapabilityStatus::Unverified);
         assert_eq!(unknown.rename, CapabilityStatus::Unverified);
+        assert_eq!(unknown.remove_member, CapabilityStatus::Unsupported);
 
         let expected = GatewayCapabilities {
             announcement: CapabilityStatus::Unsupported,
@@ -620,9 +625,11 @@ mod tests {
             }]
         })
         .to_string();
+        let mut hardened = expected;
+        hardened.remove_member = CapabilityStatus::Unsupported;
         assert_eq!(
             capabilities_from_registry(&raw, "2.6.3", &"a".repeat(64)),
-            expected
+            hardened
         );
     }
 
@@ -636,6 +643,7 @@ mod tests {
             assert_eq!(capabilities.announcement, CapabilityStatus::Supported);
             assert_eq!(capabilities.send_text, CapabilityStatus::Unverified);
             assert_eq!(capabilities.rename, CapabilityStatus::Unverified);
+            assert_eq!(capabilities.remove_member, CapabilityStatus::Unsupported);
         }
     }
 
