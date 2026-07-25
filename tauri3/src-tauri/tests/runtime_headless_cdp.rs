@@ -22,6 +22,20 @@ struct FixtureProcess(Option<Child>);
 impl Drop for FixtureProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
+            #[cfg(windows)]
+            {
+                let process_id = child.id().to_string();
+                let status = Command::new("taskkill")
+                    .args(["/PID", &process_id, "/T", "/F"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if !status.is_ok_and(|status| status.success()) {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(windows))]
             let _ = child.kill();
             let _ = child.wait();
         }

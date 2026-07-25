@@ -1,0 +1,112 @@
+:root {
+  scrollbar-color: #c8ced8 transparent;
+  scrollbar-width: thin;
+}
+
+* {
+  scrollbar-color: #c8ced8 transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  min-height: 34px;
+  border: 3px solid transparent;
+  border-radius: 10px;
+  background: #c8ced8;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #969fac;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+#root,
+.app-window {
+  min-height: 100vh;
+}
+
+.app-window {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--dh-window-chrome, #fff);
+}
+
+.window-titlebar {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  flex: 0 0 36px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  height: 36px;
+  background: var(--dh-window-chrome, #fff);
+  color: #111827;
+  user-select: none;
+}
+
+.window-titlebar__drag {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+
+.window-titlebar__controls {
+  display: flex;
+  align-self: stretch;
+  align-items: stretch;
+  margin-left: auto;
+}
+
+.window-control {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #667085;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.window-control:hover {
+  background: #f1f3f6;
+  color: #111827;
+}
+
+.window-control:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid #111827;
+  outline-offset: -5px;
+}
+
+.window-control--close:hover {
+  background: #e5484d;
+  color: #fff;
+}
+
+.window-titlebar + .shell {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}

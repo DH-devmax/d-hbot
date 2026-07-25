@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -516,7 +517,28 @@ impl DatabaseExecutor {
             self.inner
                 .sender
                 .send(DatabaseCommand::Run(Box::new(move |database| {
-                    let _ = result_sender.send(operation(database));
+                    let mut result = operation(database);
+                    if let Err(error) = &mut result {
+                        if is_disk_io_error(error) {
+                            match database.protect_snapshot_after_io_error() {
+                                Ok(path) => {
+                                    error.detail_ref = Some(path.display().to_string());
+                                    error.message = format!(
+                                        "{}；原始数据库未修改，已创建保护备份：{}",
+                                        error.message,
+                                        path.display()
+                                    );
+                                }
+                                Err(snapshot_error) => {
+                                    error.message = format!(
+                                        "{}；保护备份失败：{}",
+                                        error.message, snapshot_error.message
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let _ = result_sender.send(result);
                 })))
                 .await
                 .map_err(|_| {
@@ -831,7 +853,7 @@ impl DatabaseExecutor {
             .await
     }
 
-    pub async fn upsert_member(&self, member: Member) -> AppResult<()> {
+    pub async fn upsert_member(&self, member: Member) -> AppResult<i64> {
         self.execute(move |database| database.upsert_member(&member))
             .await
     }
@@ -874,6 +896,24 @@ impl DatabaseExecutor {
     ) -> AppResult<Vec<Member>> {
         self.execute(move |database| {
             database.mark_members_not_present(&account_id, group_id, &present_user_ids)
+        })
+        .await
+    }
+
+    pub async fn mark_members_not_present_before(
+        &self,
+        account_id: String,
+        group_id: i64,
+        present_user_ids: Vec<i64>,
+        before: DateTime<Utc>,
+    ) -> AppResult<Vec<Member>> {
+        self.execute(move |database| {
+            database.mark_members_not_present_before(
+                &account_id,
+                group_id,
+                &present_user_ids,
+                &before,
+            )
         })
         .await
     }
@@ -1163,6 +1203,41 @@ impl DatabaseExecutor {
     }
 }
 
+fn is_disk_io_error(error: &AppError) -> bool {
+    let text = error.message.to_ascii_lowercase();
+    text.contains("disk i/o error")
+        || text.contains("database disk image is malformed")
+        || text.contains("database or disk is full")
+}
+
+fn protect_database_files(path: &Path, root: &Path) -> AppResult<PathBuf> {
+    let directory = root
+        .join("backups")
+        .join(format!("dh-io-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f")));
+    fs::create_dir_all(&directory)
+        .map_err(|error| AppError::new("database_backup", error.to_string()))?;
+    let mut copied = 0_u8;
+    for suffix in ["", "-wal", "-shm"] {
+        let source = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if !source.exists() {
+            continue;
+        }
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| AppError::new("database_backup", "SQLite 文件名不可用"))?;
+        fs::copy(&source, directory.join(file_name))
+            .map_err(|error| AppError::new("database_backup", error.to_string()))?;
+        copied = copied.saturating_add(1);
+    }
+    if copied == 0 {
+        return Err(AppError::new(
+            "database_backup",
+            "未找到可复制的 SQLite 文件",
+        ));
+    }
+    Ok(directory)
+}
+
 fn snapshot_before_migration(
     paths: &AppPaths,
     connection: &Connection,
@@ -1436,7 +1511,27 @@ impl Database {
             AppError::new("database_open", format!("打开 3.0 数据库失败：{error}"))
         })?;
         if database_existed {
-            quick_check_connection(&connection)?;
+            if let Err(mut error) = quick_check_connection(&connection) {
+                if is_disk_io_error(&error) {
+                    match protect_database_files(&paths.database, &paths.v3) {
+                        Ok(path) => {
+                            error.detail_ref = Some(path.display().to_string());
+                            error.message = format!(
+                                "{}；原始数据库未修改，已创建保护备份：{}",
+                                error.message,
+                                path.display()
+                            );
+                        }
+                        Err(snapshot_error) => {
+                            error.message = format!(
+                                "{}；保护备份失败：{}",
+                                error.message, snapshot_error.message
+                            );
+                        }
+                    }
+                }
+                return Err(error);
+            }
         }
         let old_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1544,6 +1639,40 @@ impl Database {
             })
             .map_err(InternalError::from)?;
         Ok(status)
+    }
+
+    fn protect_snapshot_after_io_error(&self) -> AppResult<PathBuf> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| AppError::new("database_backup", "SQLite 数据库目录不可用"))?;
+        let directory = parent
+            .join("backups")
+            .join(format!("dh-io-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f")));
+        fs::create_dir_all(&directory)
+            .map_err(|error| AppError::new("database_backup", error.to_string()))?;
+        let mut copied = 0_u8;
+        for suffix in ["", "-wal", "-shm"] {
+            let source = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+            if !source.exists() {
+                continue;
+            }
+            let target = directory.join(
+                source
+                    .file_name()
+                    .ok_or_else(|| AppError::new("database_backup", "SQLite 文件名不可用"))?,
+            );
+            fs::copy(&source, &target)
+                .map_err(|error| AppError::new("database_backup", error.to_string()))?;
+            copied = copied.saturating_add(1);
+        }
+        if copied == 0 {
+            return Err(AppError::new(
+                "database_backup",
+                "未找到可复制的 SQLite 文件",
+            ));
+        }
+        Ok(directory)
     }
 
     fn ensure_defaults(&self) -> AppResult<()> {
@@ -1844,11 +1973,11 @@ impl Database {
         }).map_err(|error| AppError::new("groups_read", error.to_string()))
     }
 
-    pub fn upsert_member(&self, member: &Member) -> AppResult<()> {
+    pub fn upsert_member(&self, member: &Member) -> AppResult<i64> {
         self.upsert_member_from_wire(member)
     }
 
-    pub fn upsert_member_from_wire(&self, member: &Member) -> AppResult<()> {
+    pub fn upsert_member_from_wire(&self, member: &Member) -> AppResult<i64> {
         self.with_connection(|connection| {
             let transaction = connection.transaction()?;
             let effective_user_id = resolve_member_identity(&transaction, member)?;
@@ -1856,7 +1985,8 @@ impl Database {
                 "INSERT INTO members(account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,group_id,user_id) DO UPDATE SET nim_id=CASE WHEN excluded.nim_id<>'' THEN excluded.nim_id ELSE members.nim_id END,nickname=CASE WHEN excluded.nickname<>'' THEN excluded.nickname ELSE members.nickname END,card_name=CASE WHEN excluded.card_name<>'' THEN excluded.card_name ELSE members.card_name END,role=excluded.role,account_state=excluded.account_state,present=excluded.present,join_source=CASE WHEN members.join_source='baseline' AND excluded.join_source<>'baseline' THEN excluded.join_source ELSE members.join_source END,joined_at=COALESCE(members.joined_at,excluded.joined_at),last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at",
                 params![member.account_id,member.group_id,effective_user_id,member.nim_id,member.nickname,member.card_name,member.original_card_name,member.managed_card_name,member.card_suffix,member.role,member.account_state,bool_i(member.blacklisted),bool_i(member.present),member.join_source,bool_i(member.prompt_read),member.locked_card_name,member.violation_count,member.discovered_at.to_rfc3339(),member.joined_at.map(|value| value.to_rfc3339()),member.last_seen_at.to_rfc3339(),member.updated_at.to_rfc3339()],
             )?;
-            transaction.commit()
+            transaction.commit()?;
+            Ok(effective_user_id)
         })
         .map_err(|error| AppError::new("member_write", error.to_string()))
     }
@@ -1893,16 +2023,27 @@ impl Database {
         group_id: i64,
         present_user_ids: &[i64],
     ) -> AppResult<Vec<Member>> {
+        self.mark_members_not_present_before(account_id, group_id, present_user_ids, &Utc::now())
+    }
+
+    pub fn mark_members_not_present_before(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        present_user_ids: &[i64],
+        before: &DateTime<Utc>,
+    ) -> AppResult<Vec<Member>> {
         let now = Utc::now().to_rfc3339();
+        let before = before.to_rfc3339();
         self.with_connection(|connection| {
             let current = {
-                let mut statement = connection.prepare("SELECT account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND present=1")?;
-                let result = statement.query_map(params![account_id, group_id], member_from_row)?.collect::<Result<Vec<_>, _>>()?;
+                let mut statement = connection.prepare("SELECT account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND present=1 AND updated_at<=?")?;
+                let result = statement.query_map(params![account_id, group_id, before], member_from_row)?.collect::<Result<Vec<_>, _>>()?;
                 result
             };
             for member in &current {
                 if !present_user_ids.contains(&member.user_id) {
-                    connection.execute("UPDATE members SET present=0,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?", params![now,account_id,group_id,member.user_id])?;
+                    connection.execute("UPDATE members SET present=0,updated_at=? WHERE account_id=? AND group_id=? AND user_id=? AND updated_at<=?", params![now,account_id,group_id,member.user_id,before])?;
                 }
             }
             Ok(current.into_iter().filter(|member| !present_user_ids.contains(&member.user_id)).collect())

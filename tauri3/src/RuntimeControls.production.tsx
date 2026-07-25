@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { RefreshCw } from 'lucide-react'
 import type { RuntimeControlProps } from './runtimeTypes'
 
-type WangStartResult = { needsConfirmation: boolean; detail: string; maintenanceRequestId?: string | null }
+type WangStartResult = { status?: string; needsConfirmation: boolean; detail: string; maintenanceRequestId?: string | null }
 type MaintenanceResult = { success: boolean; errorCode: string; message: string }
 type MaintenanceStatus = {
   state: string
@@ -35,7 +35,7 @@ async function finishMaintenance(
 export default function RuntimeControls({ diagnostic, loading, refresh, setError }: RuntimeControlProps) {
   const [starting, setStarting] = useState(false)
   const [candidates, setCandidates] = useState<{ path: string; source: string }[]>([])
-  const [wangPath, setWangPath] = useState(() => window.localStorage.getItem('dh.wangshangliao.path') || '')
+  const [wangPath, setWangPath] = useState('')
   const [autoStart, setAutoStart] = useState(true)
   const [profileStatus, setProfileStatus] = useState<MaintenanceStatus | null>(null)
 
@@ -49,7 +49,6 @@ export default function RuntimeControls({ diagnostic, loading, refresh, setError
       setCandidates(found)
       setWangPath(current => {
         if (current || found.length !== 1) return current
-        window.localStorage.setItem('dh.wangshangliao.path', found[0].path)
         return found[0].path
       })
     }).catch(() => undefined)
@@ -57,8 +56,6 @@ export default function RuntimeControls({ diagnostic, loading, refresh, setError
 
   const selectPath = (path: string) => {
     setWangPath(path)
-    if (path.trim()) window.localStorage.setItem('dh.wangshangliao.path', path.trim())
-    else window.localStorage.removeItem('dh.wangshangliao.path')
   }
 
   const checkProfileStatus = async (path = wangPath) => {
@@ -116,7 +113,7 @@ export default function RuntimeControls({ diagnostic, loading, refresh, setError
       if (result.needsConfirmation && window.confirm('检测到旺商聊已运行，但没有开启 9222 DevTools。需要结束该旺商聊进程并重新启动，是否继续？')) {
         result = await finishMaintenance(start, true, await start(true))
       }
-      if (result.detail) setError(result.detail)
+      if (result.status && !['starting', 'ready', 'devtools-ready', 'nim-not-ready'].includes(result.status) && result.detail) setError(result.detail)
       await checkProfileStatus()
       await refresh()
     } catch (reason) {

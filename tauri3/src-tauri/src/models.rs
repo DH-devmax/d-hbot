@@ -89,6 +89,8 @@ pub enum RosterCompleteness {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberRoster {
+    #[serde(default)]
+    pub status: String,
     pub members: Vec<Member>,
     pub reported_count: usize,
     pub resolved_count: usize,
@@ -103,6 +105,28 @@ pub struct MemberRoster {
     pub nim_cursor: Option<String>,
     pub authority: String,
     pub sources: Vec<String>,
+    #[serde(default)]
+    pub source_errors: Vec<MemberSourceError>,
+    #[serde(default)]
+    pub retry_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub canonical_count: usize,
+    #[serde(default)]
+    pub synthetic_user_ids: Vec<i64>,
+    #[serde(default)]
+    pub http_pages: usize,
+    #[serde(default)]
+    pub nim_pages: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberSourceError {
+    pub source: String,
+    pub route: String,
+    pub page: usize,
+    pub cursor: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

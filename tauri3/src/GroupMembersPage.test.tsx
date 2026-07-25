@@ -48,7 +48,7 @@ describe('GroupMembersPage control tabs', () => {
     await user.click(screen.getByRole('tab', { name: /规则处理/ }))
     expect(screen.getByRole('button', { name: /群管规则/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '保存群设置' })).toBeInTheDocument()
-    expect(screen.getByPlaceholderText('搜索名称、旺商号')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('搜索群名片、原名称')).toBeInTheDocument()
   })
 
   it('selects only current search results and reports partial batch announcement failures', async () => {
@@ -115,5 +115,29 @@ describe('GroupMembersPage control tabs', () => {
     expect(await screen.findByText('请到旺商聊确认')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '重试失败群' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /发布到/ })).not.toBeInTheDocument()
+  })
+
+  it('reports a saved announcement with unknown broadcast without claiming delivery', async () => {
+    const user = userEvent.setup()
+    const onError = vi.fn()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const defaultInvoke = invoke.getMockImplementation()
+    invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === 'set_group_announcement') {
+        return Promise.resolve({
+          status: 'unknown',
+          verification: 'unknown',
+          businessMessage: '群公告已保存，但广播结果未知；相同内容不会重复广播',
+        })
+      }
+      return defaultInvoke?.(command, args)
+    })
+    render(<GroupMembersPage groups={[group]} selectedGroup={group.groupId} setSelectedGroup={vi.fn()} activeGroup={group} onError={onError} refresh={vi.fn()} />)
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '发布公告' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '发布公告' }))
+
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('广播结果未知')))
+    expect(onError).not.toHaveBeenCalledWith('群公告已保存并发送到当前群')
   })
 })

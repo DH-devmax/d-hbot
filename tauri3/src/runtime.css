@@ -47,3 +47,45 @@
   background: #111;
   color: #fff;
 }
+
+.wang-status-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 11px 13px;
+  border: 1px solid var(--dh-button-border);
+  border-radius: 6px;
+  background: var(--dh-surface);
+  color: var(--dh-text);
+}
+
+.wang-status-banner.loading {
+  border-color: var(--dh-dark);
+  background: var(--dh-surface-strong);
+}
+
+.wang-status-banner.attention {
+  border-color: var(--dh-button-border);
+  background: var(--dh-bg);
+  color: var(--dh-text);
+}
+
+.wang-status-banner span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.wang-status-banner strong {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.wang-status-banner small {
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}

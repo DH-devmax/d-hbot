@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -258,9 +260,15 @@ impl BackendRuntime {
     async fn effect_loop(&self, app: AppHandle) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
-                if let Ok(items) = self.database.claim_effect_outbox(None, 50).await {
-                    for item in items {
-                        self.dispatch_effect(Some(&app), item).await;
+                if let Ok((_, account_id)) = self.gateway.session_identity().await {
+                    if let Ok(items) = self
+                        .database
+                        .claim_effect_outbox(Some(account_id), 50)
+                        .await
+                    {
+                        for item in items {
+                            self.dispatch_effect(Some(&app), item).await;
+                        }
                     }
                 }
             }
@@ -360,6 +368,11 @@ impl BackendRuntime {
             }
         };
         let (status, error_text, receipt) = match result {
+            Ok(receipt) if receipt.status == "unknown" => (
+                EffectDispatchStatus::Unknown,
+                "外部操作已返回，但写后回读无法确认最终状态".into(),
+                receipt,
+            ),
             Ok(receipt) => (EffectDispatchStatus::Succeeded, String::new(), receipt),
             Err(error) => {
                 let status = if error.delivery_outcome_unknown() {
@@ -538,17 +551,19 @@ impl BackendRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn worker_for(
         &self,
-        workers: &mut HashMap<i64, mpsc::Sender<IncomingJob>>,
+        workers: &mut HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>>,
         worker_tasks: &mut JoinSet<()>,
         group_id: i64,
+        session_epoch: u64,
         app: &AppHandle,
         account_id: &str,
         sender_id: i64,
     ) -> mpsc::Sender<IncomingJob> {
         workers
-            .entry(group_id)
+            .entry((account_id.to_string(), session_epoch, group_id))
             .or_insert_with(|| {
                 let (sender, mut receiver) = mpsc::channel::<IncomingJob>(128);
                 let runtime = self.clone();
@@ -991,25 +1006,90 @@ impl BackendRuntime {
             .await
             .ok()
             .and_then(|roster| {
-                roster
-                    .members
-                    .into_iter()
-                    .find(|member| member.user_id == sender_id)
+                roster.members.into_iter().find(|member| {
+                    member.user_id == sender_id && member.user_id > 0 && member.present
+                })
             })
             .map(|member| matches!(member.role.as_str(), "owner" | "admin"))
             .unwrap_or(false)
     }
 
-    async fn sync_members(&self, account_id: &str, sender_id: i64) {
+    async fn sync_members(&self, account_id: &str, sender_id: i64, session_epoch: u64) {
+        if self.gateway.session_epoch() != session_epoch {
+            return;
+        }
+        if self.gateway.member_sync_paused() {
+            self.logger
+                .write("WARN", "旺商聊成员同步已暂停，等待限流退避结束");
+            return;
+        }
         let groups = match self.gateway.list_groups().await {
             Ok(groups) => groups,
             Err(_) => return,
         };
         for group in groups {
+            if self.gateway.session_epoch() != session_epoch {
+                break;
+            }
+            if self.gateway.member_sync_paused() {
+                self.logger
+                    .write("WARN", "旺商聊成员同步触发限流，后台同步进入退避");
+                break;
+            }
+            let snapshot_started_at = Utc::now();
             let roster = match self.gateway.list_members(group.group_id).await {
                 Ok(roster) => roster,
-                Err(_) => continue,
+                Err(error) => {
+                    self.events.emit(
+                        "member-roster-status",
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "groupId": group.group_id,
+                            "status": if error.code == "gateway_rate_limited" { "rate-limited" } else { "error" },
+                            "reportedCount": 0,
+                            "resolvedCount": 0,
+                            "complete": false,
+                            "completenessReason": error.message.clone(),
+                        }),
+                    );
+                    self.logger.write(
+                        "WARN",
+                        &format!(
+                            "群 {} 成员同步失败：{}{}",
+                            group.group_id,
+                            error.message,
+                            if self.gateway.member_sync_paused() {
+                                "；后台同步已暂停"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                    if self.gateway.member_sync_paused() {
+                        break;
+                    }
+                    continue;
+                }
             };
+            if self.gateway.session_epoch() != session_epoch {
+                break;
+            }
+            self.events.emit(
+                "member-roster-status",
+                serde_json::json!({
+                    "accountId": account_id,
+                    "groupId": group.group_id,
+                    "status": roster.status.clone(),
+                    "reportedCount": roster.reported_count,
+                    "resolvedCount": roster.resolved_count,
+                    "complete": roster.complete,
+                    "completenessReason": roster.completeness_reason.clone(),
+                    "retryAt": roster.retry_at.clone(),
+                    "canonicalCount": roster.canonical_count,
+                    "syntheticUserIds": roster.synthetic_user_ids.clone(),
+                    "sourceErrors": roster.source_errors.clone(),
+                }),
+            );
             let existing = self
                 .database
                 .list_members(account_id.to_string(), group.group_id)
@@ -1019,12 +1099,11 @@ impl BackendRuntime {
             let mut present_ids = HashSet::new();
             let mut newly_discovered = HashSet::new();
             for mut member in roster.members {
-                present_ids.insert(member.user_id);
                 member.account_id = account_id.to_string();
-                if let Some(saved) = existing
-                    .iter()
-                    .find(|saved| saved.user_id == member.user_id)
-                {
+                if let Some(saved) = existing.iter().find(|saved| {
+                    saved.user_id == member.user_id
+                        || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
+                }) {
                     member.original_card_name = saved.original_card_name.clone();
                     member.managed_card_name = saved.managed_card_name.clone();
                     member.card_suffix = saved.card_suffix.clone();
@@ -1052,7 +1131,9 @@ impl BackendRuntime {
                 member.present = true;
                 member.last_seen_at = Utc::now();
                 member.updated_at = member.last_seen_at;
-                let _ = self.database.upsert_member(member.clone()).await;
+                if let Ok(canonical_user_id) = self.database.upsert_member(member.clone()).await {
+                    present_ids.insert(canonical_user_id);
+                }
                 if !baseline && newly_discovered.contains(&member.user_id) && member.blacklisted {
                     let queued = self
                         .enqueue_effect(
@@ -1118,7 +1199,10 @@ impl BackendRuntime {
                     self.database
                         .list_members(account_id.to_string(), group.group_id)
                         .await
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|member| member.present)
+                        .collect(),
                     sender_id,
                 ) {
                     for plan in preview.items.into_iter().filter(|plan| {
@@ -1131,13 +1215,17 @@ impl BackendRuntime {
                     }
                 }
             }
-            if roster.complete && !baseline {
+            if roster.authority == "authoritative"
+                && !baseline
+                && self.gateway.session_epoch() == session_epoch
+            {
                 let missing = self
                     .database
-                    .mark_members_not_present(
+                    .mark_members_not_present_before(
                         account_id.to_string(),
                         group.group_id,
                         present_ids.iter().copied().collect::<Vec<_>>(),
+                        snapshot_started_at,
                     )
                     .await
                     .unwrap_or_default();
@@ -1195,10 +1283,11 @@ impl BackendRuntime {
                                     .await
                                     .ok()
                                     .and_then(|roster| {
-                                        roster
-                                            .members
-                                            .into_iter()
-                                            .find(|member| member.user_id == sender_id)
+                                        roster.members.into_iter().find(|member| {
+                                            member.user_id == sender_id
+                                                && member.user_id > 0
+                                                && member.present
+                                        })
                                     })
                                     .map(|member| matches!(member.role.as_str(), "owner" | "admin"))
                                     .unwrap_or(false);
@@ -1276,9 +1365,12 @@ impl BackendRuntime {
     }
 
     async fn connection_loop(&self, app: AppHandle) {
-        let mut workers: HashMap<i64, mpsc::Sender<IncomingJob>> = HashMap::new();
+        let mut workers: HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>> = HashMap::new();
         let mut worker_tasks = JoinSet::new();
         let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
+        let member_sync_running = Arc::new(AtomicBool::new(false));
+        let mut active_account = String::new();
+        let mut session_epoch = 0u64;
         let mut last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
         'connection: loop {
@@ -1292,6 +1384,10 @@ impl BackendRuntime {
                 tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
                 continue;
             }
+            if self.gateway.install_message_listener().await.is_err() {
+                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
+                continue;
+            }
             let (sender_id, account_id) = match self.gateway.session_identity().await {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -1301,6 +1397,16 @@ impl BackendRuntime {
                     continue;
                 }
             };
+            let gateway_epoch = self.gateway.session_epoch();
+            if active_account != account_id || session_epoch != gateway_epoch {
+                workers.clear();
+                worker_tasks.abort_all();
+                member_event_cache.clear();
+                active_account = account_id.clone();
+                session_epoch = gateway_epoch;
+                last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
+                last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
+            }
             let now = Utc::now();
             let _ = self
                 .database
@@ -1320,10 +1426,6 @@ impl BackendRuntime {
                 for group in groups {
                     let _ = self.database.upsert_group(group).await;
                 }
-            }
-            if self.gateway.install_message_listener().await.is_err() {
-                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
-                continue;
             }
             let _ = app.emit(
                 "sync-progress",
@@ -1346,25 +1448,36 @@ impl BackendRuntime {
                         &mut workers,
                         &mut worker_tasks,
                         message.group_id,
+                        session_epoch,
                         &app,
                         &account_id,
                         sender_id,
                     );
-                    let _ = sender
-                        .send(IncomingJob {
-                            sequence: message.sequence.max(0) as u64,
-                            message,
-                        })
-                        .await;
+                    let _ = sender.try_send(IncomingJob {
+                        sequence: message.sequence.max(0) as u64,
+                        message,
+                    });
                 }
             }
-            loop {
+            let mut last_batch_session: Option<String> = None;
+            let mut last_ack_sequence: Option<u64> = None;
+            'batch: loop {
                 if Utc::now()
                     .signed_duration_since(last_roster_sync)
                     .num_seconds()
                     >= 60
                 {
-                    self.sync_members(&account_id, sender_id).await;
+                    if !member_sync_running.swap(true, Ordering::AcqRel) {
+                        let runtime = self.clone();
+                        let sync_account = account_id.clone();
+                        let running = member_sync_running.clone();
+                        tauri::async_runtime::spawn(async move {
+                            runtime
+                                .sync_members(&sync_account, sender_id, session_epoch)
+                                .await;
+                            running.store(false, Ordering::Release);
+                        });
+                    }
                     last_roster_sync = Utc::now();
                 }
                 if Utc::now()
@@ -1382,6 +1495,7 @@ impl BackendRuntime {
                                 &mut workers,
                                 &mut worker_tasks,
                                 message.group_id,
+                                session_epoch,
                                 &app,
                                 &account_id,
                                 sender_id,
@@ -1470,6 +1584,10 @@ impl BackendRuntime {
                                     Value::from(item.bridge_sequence.max(0) as u64),
                                 );
                                 object.insert("source".into(), Value::from("gateway-inbox"));
+                                object.insert(
+                                    "listenerSession".into(),
+                                    Value::from(item.bridge_session.clone()),
+                                );
                             }
                             match self.normalize_message(&account_id, sender_id, &raw).await {
                                 Ok(mut job) => {
@@ -1499,6 +1617,7 @@ impl BackendRuntime {
                                                                 &mut workers,
                                                                 &mut worker_tasks,
                                                                 job.message.group_id,
+                                                                session_epoch,
                                                                 &app,
                                                                 &account_id,
                                                                 sender_id,
@@ -1603,6 +1722,20 @@ impl BackendRuntime {
                         break;
                     }
                 };
+                if let Some(previous_session) = &last_batch_session {
+                    if previous_session != &batch.session {
+                        let _ = app.emit(
+                            "gateway-resync-required",
+                            serde_json::json!({
+                                "session": batch.session.clone(),
+                                "reason": "listener_session_changed"
+                            }),
+                        );
+                        break 'batch;
+                    }
+                } else {
+                    last_batch_session = Some(batch.session.clone());
+                }
                 if batch.dropped > 0 {
                     let _ = self
                         .database
@@ -1618,6 +1751,45 @@ impl BackendRuntime {
                             created_at: Utc::now(),
                         })
                         .await;
+                    let _ = app.emit(
+                        "gateway-resync-required",
+                        serde_json::json!({
+                            "session": batch.session.clone(),
+                            "dropped": batch.dropped,
+                            "reason": "source_queue_overflow"
+                        }),
+                    );
+                    break 'batch;
+                }
+                if batch
+                    .records
+                    .windows(2)
+                    .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
+                {
+                    let _ = app.emit(
+                        "gateway-resync-required",
+                        serde_json::json!({
+                            "session": batch.session.clone(),
+                            "reason": "sequence_gap"
+                        }),
+                    );
+                    break 'batch;
+                }
+                if let (Some(last_ack), Some(first_record)) =
+                    (last_ack_sequence, batch.records.first())
+                {
+                    if first_record.sequence > last_ack.saturating_add(1) {
+                        let _ = app.emit(
+                            "gateway-resync-required",
+                            serde_json::json!({
+                                "session": batch.session.clone(),
+                                "lastAcknowledged": last_ack,
+                                "firstAvailable": first_record.sequence,
+                                "reason": "sequence_gap"
+                            }),
+                        );
+                        break 'batch;
+                    }
                 }
                 let inbox_events = batch
                     .records
@@ -1669,6 +1841,10 @@ impl BackendRuntime {
                     if let Some(object) = raw.as_object_mut() {
                         object.insert("seq".into(), Value::from(record.sequence));
                         object.insert("source".into(), Value::from(record.source.clone()));
+                        object.insert(
+                            "listenerSession".into(),
+                            Value::from(record.session.clone()),
+                        );
                     }
                     match self.normalize_message(&account_id, sender_id, &raw).await {
                         Ok(job) => {
@@ -1714,13 +1890,26 @@ impl BackendRuntime {
                     if already_processed.len() == member_event_ids.len() {
                         ackable_event_ids.extend(already_processed);
                     } else {
+                        let member_records = batch
+                            .records
+                            .iter()
+                            .filter(|record| {
+                                matches!(
+                                    record.kind,
+                                    GatewayRecordKind::TeamMemberJoined
+                                        | GatewayRecordKind::TeamMemberLeft
+                                        | GatewayRecordKind::TeamMemberUpdated
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
                         let events = if let Some(cached) = member_cache_key
                             .as_ref()
                             .and_then(|key| member_event_cache.get(key))
                         {
                             Ok(cached.clone())
                         } else {
-                            self.gateway.poll_events().await
+                            self.gateway.member_events(member_records).await
                         };
                         match events {
                             Ok(events) if events.len() == expected_member_events => {
@@ -1829,6 +2018,7 @@ impl BackendRuntime {
                     if let Err(error) = self.gateway.ack(&batch.session, ack_sequence).await {
                         self.logger.write("WARN", &error.message);
                     } else {
+                        last_ack_sequence = Some(ack_sequence);
                         let completed_inbox_ids = batch
                             .records
                             .iter()
@@ -1884,11 +2074,12 @@ impl BackendRuntime {
                                     &mut workers,
                                     &mut worker_tasks,
                                     job.message.group_id,
+                                    session_epoch,
                                     &app,
                                     &account_id,
                                     sender_id,
                                 );
-                                let _ = sender.send(job).await;
+                                let _ = sender.try_send(job);
                                 let _ = app.emit("message-received", &raw);
                             }
                         }
@@ -1896,6 +2087,9 @@ impl BackendRuntime {
                 }
                 tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
             }
+            member_event_cache.clear();
+            last_roster_sync = Utc::now() - chrono::Duration::seconds(60);
+            last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
         }
         drop(workers);
@@ -2215,7 +2409,13 @@ impl BackendRuntime {
                     .filter(|value| !value.is_empty())
                     .or_else(|| value.get("idClient").and_then(Value::as_str))
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("seq-{sequence}")),
+                    .unwrap_or_else(|| {
+                        let session = value
+                            .get("listenerSession")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown-session");
+                        format!("seq-{}-{sequence}", session_hash(session))
+                    }),
                 sequence: sequence as i64,
                 user_id,
                 sender_name: decoded
@@ -2500,10 +2700,9 @@ impl BackendRuntime {
             .await
             .ok()
             .and_then(|roster| {
-                roster
-                    .members
-                    .into_iter()
-                    .find(|member| member.user_id == sender_id)
+                roster.members.into_iter().find(|member| {
+                    member.user_id == sender_id && member.user_id > 0 && member.present
+                })
             })
             .map(|member| member.role == "owner" || member.role == "admin")
             .unwrap_or(false);
@@ -3112,6 +3311,10 @@ impl BackendRuntime {
             if let Some(object) = raw.as_object_mut() {
                 object.insert("seq".into(), Value::from(record.sequence));
                 object.insert("source".into(), Value::from(record.source.clone()));
+                object.insert(
+                    "listenerSession".into(),
+                    Value::from(record.session.clone()),
+                );
             }
             match self.normalize_message(&account_id, sender_id, &raw).await {
                 Ok(job) => {
@@ -3175,7 +3378,11 @@ impl BackendRuntime {
 
     #[cfg(feature = "fixture")]
     pub async fn headless_dispatch_once(&self) -> AppResult<usize> {
-        let items = self.database.claim_effect_outbox(None, 100).await?;
+        let account_id = self.gateway.session_identity().await?.1;
+        let items = self
+            .database
+            .claim_effect_outbox(Some(account_id), 100)
+            .await?;
         let count = items.len();
         for item in items {
             self.dispatch_effect(None, item).await;
@@ -3227,6 +3434,14 @@ fn gateway_record_id(record: &GatewayRecord) -> String {
         }
     }
     format!("{}:{}", record.session, record.sequence)
+}
+
+fn session_hash(session: &str) -> String {
+    let digest = Sha256::digest(session.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn contiguous_ack_sequence(records: &[GatewayRecord], ackable_event_ids: &HashSet<String>) -> u64 {
@@ -3431,6 +3646,7 @@ mod tests {
             acknowledged: 0,
             remaining: 0,
             dropped: 0,
+            verification: None,
         });
         let archived = serde_json::to_string(&receipt).unwrap();
         assert!(!archived.contains("abcdefghijklmnopqrstuvwxyz"));

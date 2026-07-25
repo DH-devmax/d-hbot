@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)]
   [string]$Artifact,
   [string]$ExpectedSha256 = '',
@@ -97,11 +97,14 @@ function Get-DescendantIds([int]$RootPid, [object[]]$Snapshot) {
   return @($Known | Where-Object { $_ -ne $RootPid })
 }
 
-function Get-WindowSnapshot([int]$Pid) {
-  $Process = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+function Get-WindowSnapshot([int]$ProcessId, [long]$KnownHandle = 0) {
+  $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
   if (-not $Process) { return $null }
-  $Process.Refresh()
-  $Handle = $Process.MainWindowHandle
+  $Handle = if ($KnownHandle) {
+    [IntPtr]$KnownHandle
+  } else {
+    [DhBotRealMachine.NativeWindow]::FindMainWindow($ProcessId)
+  }
   if ($Handle -eq [IntPtr]::Zero) {
     return [ordered]@{ handle = 0; visible = $false; minimized = $false; title = '' }
   }
@@ -109,7 +112,7 @@ function Get-WindowSnapshot([int]$Pid) {
     handle = $Handle.ToInt64()
     visible = [DhBotRealMachine.NativeWindow]::IsWindowVisible($Handle)
     minimized = [DhBotRealMachine.NativeWindow]::IsIconic($Handle)
-    title = $Process.MainWindowTitle
+    title = [DhBotRealMachine.NativeWindow]::GetWindowTitle($Handle)
   }
 }
 
@@ -148,12 +151,57 @@ function Write-Reports([string]$Directory, [System.Collections.IDictionary]$Repo
 $NativeSource = @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 namespace DhBotRealMachine {
   public static class NativeWindow {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect { public int Left; public int Top; public int Right; public int Bottom; }
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    public static string GetWindowTitle(IntPtr hWnd) {
+      var text = new StringBuilder(Math.Max(GetWindowTextLength(hWnd) + 1, 2));
+      GetWindowText(hWnd, text, text.Capacity);
+      return text.ToString();
+    }
+
+    public static IntPtr FindMainWindow(int processId) {
+      var bestHandle = IntPtr.Zero;
+      long bestScore = long.MinValue;
+      EnumWindows(delegate(IntPtr handle, IntPtr lParam) {
+        uint ownerProcessId;
+        GetWindowThreadProcessId(handle, out ownerProcessId);
+        if (ownerProcessId != processId) return true;
+        Rect rect;
+        GetWindowRect(handle, out rect);
+        var width = Math.Max(rect.Right - rect.Left, 0);
+        var height = Math.Max(rect.Bottom - rect.Top, 0);
+        var title = GetWindowTitle(handle);
+        if (title.IndexOf("DH BOT", StringComparison.OrdinalIgnoreCase) < 0) return true;
+        var style = GetWindowLongPtr(handle, -16).ToInt64();
+        if ((style & 0x00CF0000L) != 0x00CF0000L || !IsWindowVisible(handle)) return true;
+        long score = (long)width * height;
+        if (width < 200 || height < 100) score -= 10000000;
+        if (IsWindowVisible(handle)) score += 1000000;
+        if (title.Equals("DH BOT", StringComparison.OrdinalIgnoreCase)) score += 100000000;
+        else if (title.IndexOf("DH BOT", StringComparison.OrdinalIgnoreCase) >= 0) score += 10000000;
+        if (score > bestScore) {
+          bestScore = score;
+          bestHandle = handle;
+        }
+        return true;
+      }, IntPtr.Zero);
+      return bestHandle;
+    }
   }
 }
 '@
@@ -236,19 +284,37 @@ try {
 
     $DhProcess = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -Parent $Executable) -PassThru
     $Deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
+    $StableWindowHandle = 0L
+    $StableWindowSince = Get-Date
     do {
       Start-Sleep -Milliseconds 500
       $DhProcess.Refresh()
       $WindowBeforeMinimize = Get-WindowSnapshot $DhProcess.Id
+      $CurrentWindowHandle = if ($WindowBeforeMinimize) { [long]$WindowBeforeMinimize.handle } else { 0L }
+      if ($CurrentWindowHandle -ne $StableWindowHandle) {
+        $StableWindowHandle = $CurrentWindowHandle
+        $StableWindowSince = Get-Date
+      }
     } while ((Get-Date) -lt $Deadline -and $DhProcess.HasExited -eq $false -and (-not $WindowBeforeMinimize -or $WindowBeforeMinimize.handle -eq 0))
+
+    while ((Get-Date) -lt $Deadline -and $DhProcess.HasExited -eq $false -and $StableWindowHandle -ne 0 -and ((Get-Date) - $StableWindowSince).TotalSeconds -lt 2) {
+      Start-Sleep -Milliseconds 250
+      $DhProcess.Refresh()
+      $WindowBeforeMinimize = Get-WindowSnapshot $DhProcess.Id
+      $CurrentWindowHandle = if ($WindowBeforeMinimize) { [long]$WindowBeforeMinimize.handle } else { 0L }
+      if ($CurrentWindowHandle -ne $StableWindowHandle) {
+        $StableWindowHandle = $CurrentWindowHandle
+        $StableWindowSince = Get-Date
+      }
+    }
 
     if ($DhProcess.HasExited) {
       Add-Result 'DH BOT 启动' 'failed' "进程提前退出，ExitCode=$($DhProcess.ExitCode)"
     } elseif ($WindowBeforeMinimize -and $WindowBeforeMinimize.handle -ne 0) {
       Add-Result 'DH BOT 启动' 'passed' "PID $($DhProcess.Id)，窗口：$($WindowBeforeMinimize.title)"
-      [void][DhBotRealMachine.NativeWindow]::SendMessage([IntPtr]$WindowBeforeMinimize.handle, 0x0112, [IntPtr]0xF020, [IntPtr]::Zero)
+      [void][DhBotRealMachine.NativeWindow]::ShowWindowAsync([IntPtr]$WindowBeforeMinimize.handle, 6)
       Start-Sleep -Seconds 2
-      $WindowMinimized = Get-WindowSnapshot $DhProcess.Id
+      $WindowMinimized = Get-WindowSnapshot $DhProcess.Id $WindowBeforeMinimize.handle
       if ($WindowMinimized -and $WindowMinimized.minimized -and $WindowMinimized.visible) {
         Add-Result '普通最小化' 'passed' '窗口仍可见且处于最小化状态，进程继续运行'
       } else {
@@ -256,7 +322,7 @@ try {
       }
       [void][DhBotRealMachine.NativeWindow]::ShowWindowAsync([IntPtr]$WindowBeforeMinimize.handle, 9)
       Start-Sleep -Seconds 2
-      $WindowRestored = Get-WindowSnapshot $DhProcess.Id
+      $WindowRestored = Get-WindowSnapshot $DhProcess.Id $WindowBeforeMinimize.handle
       if ($WindowRestored -and $WindowRestored.visible -and -not $WindowRestored.minimized) {
         Add-Result '窗口恢复' 'passed' '最小化后可正常恢复'
       } else {

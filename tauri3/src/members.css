@@ -865,6 +865,36 @@
   font-size: 12px;
 }
 
+.member-sync-status {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  margin-top: 8px;
+  padding: 8px 11px;
+  border-left: 3px solid #888;
+  background: #fafafa;
+  color: #666;
+  font-size: 12px;
+}
+
+.member-sync-status.member-sync-ready {
+  border-left-color: #16844a;
+  background: #f1fbf5;
+  color: #17683e;
+}
+
+.member-sync-status.member-sync-rate-limited,
+.member-sync-status.member-sync-error {
+  border-left-color: #c47a12;
+  background: #fff8eb;
+  color: #87530b;
+}
+
+.member-sync-status.member-sync-partial,
+.member-sync-status.member-sync-cached {
+  border-left-color: #6b7280;
+}
+
 .roster-stats strong {
   margin-left: 4px;
   color: #111;

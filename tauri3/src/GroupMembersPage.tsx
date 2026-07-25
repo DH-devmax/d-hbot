@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { Ban, Bot, Check, ChevronLeft, ChevronRight, Hand, Megaphone, Pencil, RefreshCw, Search, Shield, Sparkles, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
 import './members.css'
 
@@ -34,7 +35,20 @@ type MemberRoster = {
   reportedCount: number
   resolvedCount: number
   complete: boolean
+  status?: 'loading' | 'cached' | 'partial' | 'rate-limited' | 'retrying' | 'ready' | 'error' | string
+  completenessReason?: string
   sources: string[]
+  sourceErrors?: Array<{ source: string; route: string; page: number; cursor?: string; reason: string }>
+  retryAt?: string
+  canonicalCount?: number
+  syntheticUserIds?: number[]
+  httpPages?: number
+  nimPages?: number
+}
+
+type MemberRosterStatus = Pick<MemberRoster, 'status' | 'reportedCount' | 'resolvedCount' | 'complete' | 'completenessReason' | 'retryAt' | 'canonicalCount' | 'sourceErrors'> & {
+  accountId?: string
+  groupId: number
 }
 
 type CardRenameJob = {
@@ -77,6 +91,12 @@ type GroupAnnouncement = {
   content: string
   mode: string
   authorUserId: number
+}
+
+type GatewayReceipt = {
+  status: string
+  businessMessage?: string
+  verification?: string
 }
 
 type GroupBatchMode = 'announcement' | 'mute' | 'unmute' | null
@@ -127,6 +147,10 @@ function actionError(reason: unknown) {
   return String(reason)
 }
 
+function actionCode(reason: unknown) {
+  return reason && typeof reason === 'object' && 'code' in reason ? String(reason.code) : ''
+}
+
 function AutomationToggle({ title, detail, checked, disabled, danger, onChange }: { title: string; detail: string; checked: boolean; disabled: boolean; danger?: boolean; onChange: () => void }) {
   return <button data-help={`${title}：${detail}。点击后${checked ? '关闭' : '开启'}这项权限。`} className={`automation-toggle ${checked ? 'checked' : ''} ${danger ? 'danger' : ''}`} role="switch" aria-checked={checked} disabled={disabled} onClick={onChange}><span><strong>{title}</strong><small>{detail}</small></span><i aria-hidden="true"><b /></i></button>
 }
@@ -158,6 +182,7 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
   const [groupBatchResults, setGroupBatchResults] = useState<GroupBatchResult[] | null>(null)
   const [groupBatchDialogOpen, setGroupBatchDialogOpen] = useState(false)
   const [gatewayCapabilities, setGatewayCapabilities] = useState<GatewayCapabilities | null>(null)
+  const memberRequestGeneration = useRef(0)
 
   const filteredGroups = useMemo(() => {
     const query = groupSearch.trim().toLowerCase()
@@ -169,19 +194,41 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
     return (roster?.members ?? []).filter(member => {
       if (roleFilter !== 'all' && member.role !== roleFilter) return false
       if (!query) return true
-      return [member.cardName, member.nickname, member.nimId, String(member.userId)]
+      return [member.cardName, member.nickname]
         .some(value => value.toLowerCase().includes(query))
     })
   }, [memberSearch, roleFilter, roster])
 
   const memberPageSize = 50
   const memberPageCount = Math.max(1, Math.ceil(visibleMembers.length / memberPageSize))
-
   useEffect(() => { setMemberPage(0) }, [memberSearch, roleFilter, roster])
   useEffect(() => { if (memberPage > memberPageCount - 1) setMemberPage(memberPageCount - 1) }, [memberPage, memberPageCount])
   useEffect(() => {
     void invoke<GatewayCapabilities>('get_gateway_capabilities').then(setGatewayCapabilities).catch(() => setGatewayCapabilities(null))
   }, [])
+
+  useEffect(() => {
+    if (!selectedGroup) return
+    let disposed = false
+    const unlisten = listen<MemberRosterStatus>('member-roster-status', event => {
+      const payload = event.payload
+      if (disposed || payload.groupId !== selectedGroup || (payload.accountId && payload.accountId !== activeGroup?.accountId)) return
+      setRoster(previous => ({
+        ...(previous || {
+          members: [],
+          reportedCount: payload.reportedCount ?? 0,
+          resolvedCount: payload.resolvedCount ?? 0,
+          complete: Boolean(payload.complete),
+          sources: [],
+        }),
+        ...payload,
+      }))
+    }).catch(() => undefined)
+    return () => {
+      disposed = true
+      void unlisten.then(cleanup => cleanup?.())
+    }
+  }, [selectedGroup, activeGroup?.accountId])
 
   const pagedMembers = useMemo(
     () => visibleMembers.slice(memberPage * memberPageSize, memberPage * memberPageSize + memberPageSize),
@@ -190,16 +237,57 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
 
   const loadMembers = async (groupId = selectedGroup) => {
     if (!groupId) return
-    setMemberLoading(true)
+    const generation = ++memberRequestGeneration.current
     onError('')
+    setRoster(previous => previous ? { ...previous, status: 'loading', completenessReason: '正在获取旺商聊当前成员' } : {
+      members: [],
+      reportedCount: 0,
+      resolvedCount: 0,
+      complete: false,
+      status: 'loading',
+      completenessReason: '正在获取旺商聊当前成员',
+      sources: [],
+      canonicalCount: 0,
+      syntheticUserIds: [],
+    })
+    let hasCachedMembers = false
+    if (activeGroup?.accountId) {
+      try {
+        const cached = await invoke<Member[]>('local_members', { accountId: activeGroup.accountId, groupId })
+        if (cached.length) {
+          hasCachedMembers = true
+          if (generation !== memberRequestGeneration.current) return
+          setRoster({ members: cached, reportedCount: cached.length, resolvedCount: cached.length, complete: false, status: 'cached', completenessReason: '已显示上次名单，正在获取当前成员', sources: ['local-cache'], canonicalCount: cached.filter(member => member.userId > 0).length, syntheticUserIds: [] })
+          setSelected(new Set())
+        }
+      } catch (reason) {
+        if (!hasCachedMembers) onError(actionError(reason))
+      }
+    }
+    setMemberLoading(true)
     try {
-      const next = await invoke<MemberRoster>('list_members', { groupId })
+      const next = await invoke<MemberRoster>('list_members', { groupId, refresh: true })
+      if (generation !== memberRequestGeneration.current) return
       setRoster(next)
       setSelected(new Set())
     } catch (reason) {
-      onError(actionError(reason))
+      const detail = actionError(reason)
+      const status = actionCode(reason) === 'gateway_rate_limited' ? 'rate-limited' : 'error'
+      if (generation !== memberRequestGeneration.current) return
+      setRoster(previous => previous ? { ...previous, status, completenessReason: detail } : {
+        members: [],
+        reportedCount: 0,
+        resolvedCount: 0,
+        complete: false,
+        status,
+        completenessReason: detail,
+        sources: [],
+        canonicalCount: 0,
+        syntheticUserIds: [],
+      })
+      if (!hasCachedMembers) onError(detail)
     } finally {
-      setMemberLoading(false)
+      if (generation === memberRequestGeneration.current) setMemberLoading(false)
     }
   }
 
@@ -310,12 +398,16 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
 
   const saveAnnouncement = async () => {
     if (!activeGroup || !announcementText.trim()) return
-    if (!window.confirm('确认发布或更新当前群公告？保存后群内会出现一条新的公告消息。')) return
+    if (!window.confirm('确认发布或更新当前群公告？内容变化并成功广播时，群内会出现一条公告消息。')) return
     setActiveAction('announcement')
     onError('')
     try {
-      await invoke('set_group_announcement', { groupId: activeGroup.groupId, text: announcementText.trim() })
-      onError('群公告已保存并发送到当前群')
+      const receipt = await invoke<GatewayReceipt | null>('set_group_announcement', { groupId: activeGroup.groupId, text: announcementText.trim() })
+      onError(receipt?.status === 'unknown'
+        ? (receipt.businessMessage || '群公告已保存，但广播结果未知；相同内容不会重复广播')
+        : receipt?.verification === 'not-applicable'
+          ? (receipt.businessMessage || '群公告内容未变化，本次没有重复广播')
+          : '群公告已保存并发送到当前群')
       const latest = await invoke<GroupAnnouncement | null>('get_group_announcement', { groupId: activeGroup.groupId })
       setAnnouncementText(latest?.content || announcementText.trim())
     } catch (reason) {
@@ -667,16 +759,17 @@ export default function GroupMembersPage({ groups, selectedGroup, setSelectedGro
             <div className="card-queue-status"><div><strong>后台队列</strong><span>待处理 {cardJobs.filter(job => ['queued', 'processing', 'retry'].includes(job.state)).length} · 已完成 {cardJobs.filter(job => job.state === 'succeeded').length} · 失败 {cardJobs.filter(job => job.state === 'failed').length}</span></div>{cardJobs.some(job => job.state === 'failed') && <button className="secondary" data-help="把当前群中处理失败的改名任务重新放回后台队列。" onClick={() => void retryFailedCards()} disabled={Boolean(activeAction)}>重试失败</button>}<div className="card-job-list">{cardJobs.filter(job => ['processing', 'queued', 'retry', 'failed'].includes(job.state)).slice(0, 8).map(job => <span key={job.id} className={`card-job card-job-${job.state}`}><b>{job.desiredName}</b><small>{job.state === 'processing' ? '处理中' : job.state === 'queued' ? '排队中' : job.state === 'retry' ? `等待重试（第 ${job.attempts} 次）` : `失败：${job.lastError || '待重试'}`}</small></span>)}</div></div>
           </div>}
         </div>
-        <div className="roster-stats"><span>群人数 <strong>{roster?.reportedCount ?? '-'}</strong></span><span>已识别 <strong>{roster?.resolvedCount ?? '-'}</strong></span><span>缺口 <strong>{roster ? Math.max(0, roster.reportedCount - roster.resolvedCount) : '-'}</strong></span><span>{roster?.complete ? '名单完整' : '持续补齐中'}</span><div className="roster-pager"><button className="icon-command" title="上一页" onClick={() => setMemberPage(page => Math.max(0, page - 1))} disabled={memberPage <= 0}><ChevronLeft size={15} /></button><span>{memberPage + 1} / {memberPageCount}</span><button className="icon-command" title="下一页" onClick={() => setMemberPage(page => Math.min(memberPageCount - 1, page + 1))} disabled={memberPage >= memberPageCount - 1}><ChevronRight size={15} /></button></div></div>
+        {roster && <div className={`member-sync-status member-sync-${roster.status || 'loading'}`} role="status" aria-live="polite">{memberLoading ? '正在获取旺商聊当前成员…' : roster.status === 'cached' ? '已显示上次名单，正在获取当前成员' : roster.status === 'rate-limited' ? '旺商聊请求过于频繁，稍后自动重试' : roster.status === 'error' ? (roster.completenessReason || '成员名单刷新失败，保留当前名单') : '成员名单已更新'}</div>}
+        <div className="roster-stats"><span>群成员 <strong>{roster?.members.length ?? '-'}</strong></span><div className="roster-pager"><button className="icon-command" title="上一页" onClick={() => setMemberPage(page => Math.max(0, page - 1))} disabled={memberPage <= 0}><ChevronLeft size={15} /></button><span>{memberPage + 1} / {memberPageCount}</span><button className="icon-command" title="下一页" onClick={() => setMemberPage(page => Math.min(memberPageCount - 1, page + 1))} disabled={memberPage >= memberPageCount - 1}><ChevronRight size={15} /></button></div></div>
         <div className="member-toolbar">
-          <label className="search-field member-search"><Search size={15} /><input value={memberSearch} onChange={event => setMemberSearch(event.target.value)} placeholder="搜索名称、旺商号" /></label>
+          <label className="search-field member-search"><Search size={15} /><input value={memberSearch} onChange={event => setMemberSearch(event.target.value)} placeholder="搜索群名片、原名称" /></label>
           <select value={roleFilter} onChange={event => setRoleFilter(event.target.value)} aria-label="角色筛选"><option value="all">全部角色</option><option value="owner">群主</option><option value="admin">管理员</option><option value="member">群员</option></select>
           <select value={muteSeconds} onChange={event => setMuteSeconds(Number(event.target.value))} aria-label="禁言时长"><option value={600}>禁言 10 分钟</option><option value={3600}>禁言 1 小时</option><option value={86400}>禁言 24 小时</option><option value={604800}>禁言 7 天</option></select>
           <button className="icon-command" title="重新同步成员" onClick={() => void loadMembers()} disabled={memberLoading}><RefreshCw size={16} className={memberLoading ? 'spin' : ''} /></button>
         </div>
         {selected.size > 0 && <div className="bulk-bar"><strong>已选择 {selected.size} 人</strong><button onClick={() => void runBulk('mute')} disabled={Boolean(activeAction)}><VolumeX size={14} />禁言</button><button onClick={() => void runBulk('unmute')} disabled={Boolean(activeAction)}><Volume2 size={14} />解禁</button><button onClick={() => void runBulk('blacklist')} disabled={Boolean(activeAction)}><Ban size={14} />加入黑名单</button><button onClick={() => void runBulk('unblacklist')} disabled={Boolean(activeAction)}><Shield size={14} />移出黑名单</button><button className="danger-text" onClick={() => void runBulk('remove')} disabled={Boolean(activeAction)}><UserMinus size={14} />移出</button><button onClick={() => setSelected(new Set())}>取消选择</button></div>}
         <div className="member-table-wrap">
-          <table className="member-table"><thead><tr><th><input type="checkbox" checked={allVisibleSelected} onChange={toggleAll} aria-label="选择当前列表" /></th><th>序号</th><th>群员</th><th>角色</th><th>账号状态</th><th>操作</th></tr></thead><tbody>{pagedMembers.map((member, index) => <tr key={`${member.userId}:${member.nimId}`}><td><input type="checkbox" checked={selected.has(member.userId)} onChange={() => setSelected(previous => { const next = new Set(previous); if (next.has(member.userId)) next.delete(member.userId); else next.add(member.userId); return next })} aria-label={`选择${displayName(member)}`} /></td><td>{memberPage * memberPageSize + index + 1}</td><td><strong>{displayName(member)}</strong><small>{member.nickname && member.nickname !== member.cardName ? `原名称：${member.nickname}` : `旺商号：${member.nimId || '未识别'}`}</small></td><td><span className={`role role-${member.role}`}>{roleLabels[member.role] || '群员'}</span></td><td><span className={member.accountState.includes('BAN') || member.accountState.includes('CANCEL') ? 'state-bad' : ''}>{member.blacklisted ? '黑名单 · ' : ''}{stateLabels[member.accountState] || '未知'}</span></td><td><div className="row-actions"><button title="修改群名片" onClick={() => void invokeMemberAction(member, 'rename')} disabled={Boolean(activeAction)}><Pencil size={15} /></button><button title={`禁言 ${Math.round(muteSeconds / 60)} 分钟`} onClick={() => void invokeMemberAction(member, 'mute')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><VolumeX size={15} /></button><button title="解除禁言" onClick={() => void invokeMemberAction(member, 'unmute')} disabled={Boolean(activeAction) || member.userId <= 0}><Volume2 size={15} /></button><button className="danger-text" title="移出群聊" onClick={() => void invokeMemberAction(member, 'remove')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><UserMinus size={15} /></button></div></td></tr>)}</tbody></table>
+          <table className="member-table"><thead><tr><th><input type="checkbox" checked={allVisibleSelected} onChange={toggleAll} aria-label="选择当前列表" /></th><th>序号</th><th>群员</th><th>角色</th><th>账号状态</th><th>操作</th></tr></thead><tbody>{pagedMembers.map((member, index) => <tr key={`${member.userId}:${member.nimId}`}><td><input type="checkbox" checked={selected.has(member.userId)} onChange={() => setSelected(previous => { const next = new Set(previous); if (next.has(member.userId)) next.delete(member.userId); else next.add(member.userId); return next })} aria-label={`选择${displayName(member)}`} /></td><td>{memberPage * memberPageSize + index + 1}</td><td><strong>{displayName(member)}</strong><small>{member.nickname ? `原名称：${member.nickname}` : ''}</small></td><td><span className={`role role-${member.role}`}>{roleLabels[member.role] || '群员'}</span></td><td><span className={member.accountState.includes('BAN') || member.accountState.includes('CANCEL') ? 'state-bad' : ''}>{member.blacklisted ? '黑名单 · ' : ''}{stateLabels[member.accountState] || '未知'}</span></td><td><div className="row-actions"><button title="修改群名片" onClick={() => void invokeMemberAction(member, 'rename')} disabled={Boolean(activeAction)}><Pencil size={15} /></button><button title={`禁言 ${Math.round(muteSeconds / 60)} 分钟`} onClick={() => void invokeMemberAction(member, 'mute')} disabled={Boolean(activeAction) || !member.userId || member.userId <= 0 || member.role === 'owner'}><VolumeX size={15} /></button><button title="解除禁言" onClick={() => void invokeMemberAction(member, 'unmute')} disabled={Boolean(activeAction) || member.userId <= 0}><Volume2 size={15} /></button><button className="danger-text" title="移出群聊" onClick={() => void invokeMemberAction(member, 'remove')} disabled={Boolean(activeAction) || member.userId <= 0 || member.role === 'owner'}><UserMinus size={15} /></button></div></td></tr>)}</tbody></table>
           {memberLoading && <div className="member-loading"><RefreshCw size={18} className="spin" />正在同步成员</div>}
           {!memberLoading && roster && !visibleMembers.length && <div className="compact-empty">没有匹配的群员</div>}
         </div>
