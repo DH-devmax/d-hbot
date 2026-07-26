@@ -30,6 +30,21 @@
         "groupMute": "unverified",
         "memberEvents": "unverified"
       }
+    },
+    {
+      "appFileVersion": "2.7.8",
+      "mainScriptSha256": "a6221de2804874286b7de5bfe361f8452fdcc91566eb9161d697d447552790eb",
+      "verified": true,
+      "capabilities": {
+        "announcement": "unverified",
+        "sendText": "unverified",
+        "mute": "supported",
+        "recall": "unverified",
+        "rename": "supported",
+        "removeMember": "unsupported",
+        "groupMute": "unverified",
+        "memberEvents": "unverified"
+      }
     }
   ]
 }

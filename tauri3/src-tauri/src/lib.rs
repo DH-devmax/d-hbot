@@ -2589,10 +2589,26 @@ async fn get_group_management_context(
             && matches!(member.role.as_str(), "owner" | "admin")
     });
     let capabilities = state.gateway.capabilities();
-    let announcement_status = match capabilities.announcement {
-        gateway::CapabilityStatus::Supported => "可用",
-        gateway::CapabilityStatus::Unverified => "当前版本待校准",
-        gateway::CapabilityStatus::Unsupported => "功能未开放",
+    #[cfg(feature = "fixture")]
+    let calibration_allows_announcement = {
+        let calibration = state.gateway.developer_calibration_status();
+        calibration.active
+            && !calibration.finishing
+            && calibration
+                .capabilities
+                .iter()
+                .any(|capability| capability == "announcement")
+    };
+    #[cfg(not(feature = "fixture"))]
+    let calibration_allows_announcement = false;
+    let announcement_status = if calibration_allows_announcement {
+        "可用"
+    } else {
+        match capabilities.announcement {
+            gateway::CapabilityStatus::Supported => "可用",
+            gateway::CapabilityStatus::Unverified => "当前版本待校准",
+            gateway::CapabilityStatus::Unsupported => "功能未开放",
+        }
     };
     Ok(GroupManagementContext {
         group_id,
