@@ -3,10 +3,11 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-const sensitiveKey = /^(api[-_]?key|authorization|cookie|set-cookie|password|passwd|secret|access[-_]?token|refresh[-_]?token)$/i
+const sensitiveKeySuffixes = ['apikey', 'authorization', 'cookie', 'jwt', 'password', 'passwd', 'privatekey', 'secret', 'signingkey', 'token']
 const sensitiveValues = [
   /\bsk-[a-z0-9_-]{12,}\b/i,
   /\bbearer\s+[a-z0-9._~+\/-]+=*\b/i,
+  /\beyj[a-z0-9_-]{5,}\.[a-z0-9_-]{5,}\.[a-z0-9_-]{5,}\b/i,
   /(?:^|[;\s])(sessionid|auth_token|access_token|refresh_token)=[^;\s]+/i,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i,
 ]
@@ -44,6 +45,11 @@ const protocolLiteralKeys = new Set([
 
 function normalizedKey(key) {
   return String(key || '').replace(/[-_]/g, '').toLowerCase()
+}
+
+function isSensitiveKey(key) {
+  const normalized = normalizedKey(key)
+  return sensitiveKeySuffixes.some(suffix => normalized === suffix || normalized.endsWith(suffix))
 }
 
 function isProtocolLiteralContext(context) {
@@ -129,7 +135,7 @@ function assertNoSecrets(value, location = '$') {
   }
   if (value && typeof value === 'object') {
     for (const [key, item] of Object.entries(value)) {
-      if (sensitiveKey.test(key)) throw new Error(`捕获包含敏感字段：${location}.${key}`)
+      if (isSensitiveKey(key)) throw new Error(`捕获包含敏感字段：${location}.${key}`)
       assertNoSecrets(item, `${location}.${key}`)
     }
     return
@@ -152,6 +158,7 @@ function sanitizedPlaceholder(kind, value) {
 }
 
 export function assertSanitizedContract(value, context = {}, location = '$') {
+  if (location === '$') assertNoSecrets(value)
   if (typeof value === 'string') {
     const embedded = parsedJson(value)
     if (embedded !== null) return assertSanitizedContract(embedded, context, `${location}<json>`)

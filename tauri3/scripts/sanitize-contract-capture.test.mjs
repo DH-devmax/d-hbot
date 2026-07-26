@@ -309,6 +309,30 @@ test('sensitive keys and values stop contract generation', () => {
     () => sanitizeContractCapture(capture({ response: JSON.stringify({ accessToken: 'hidden' }) })),
     /敏感字段/,
   )
+  for (const key of ['token', 'nimToken', 'jwtToken', 'groupToken', 'sigToken']) {
+    assert.throws(
+      () => sanitizeContractCapture(capture({
+        operations: [{ route: '/v1/login', business: { data: { [key]: 'login-credential-sentinel' } } }],
+      })),
+      new RegExp(`敏感字段.*${key}`, 'i'),
+    )
+  }
+  for (const key of ['X-Token', 'X-jwt', 'X-Group-Token']) {
+    assert.throws(
+      () => sanitizeContractCapture(capture({
+        operations: [{ route: '/v1/group/get-group-list', request: { headers: { [key]: 'header-credential-sentinel' } } }],
+      })),
+      new RegExp(`敏感字段.*${key}`, 'i'),
+    )
+  }
+  assert.throws(
+    () => sanitizeContractCapture(capture({ note: 'eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZC1zZW50aW5lbA.c2lnbmF0dXJlLXNlbnRpbmVs' })),
+    /敏感值/,
+  )
+  assert.throws(
+    () => assertSanitizedContract({ transport: { headers: { 'X-Group-Token': 'credential' } } }),
+    /敏感字段/,
+  )
 })
 
 test('version and main script hash are mandatory', () => {

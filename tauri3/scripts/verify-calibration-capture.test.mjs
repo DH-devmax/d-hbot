@@ -200,3 +200,9 @@ test('rejects fixture endpoints', () => {
 test('strict verifier rejects unsanitized captures', () => {
   assert.throws(() => verifyCalibrationCapture(capture()), /未脱敏/)
 })
+
+test('strict verifier rejects credentials added after sanitization', () => {
+  const sanitized = sanitizeContractCapture(capture())
+  sanitized.operations[0].transport.headers = { 'X-jwt': 'credential-sentinel' }
+  assert.throws(() => verifyCalibrationCapture(sanitized), /敏感字段/)
+})
