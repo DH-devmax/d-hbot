@@ -1776,7 +1776,7 @@ impl CdpGateway {
             json!({"cardName": roster.members.iter().find(|member| member.user_id == user_id).map(|member| member.card_name.clone()).unwrap_or_default()}),
         );
         if matches {
-            Ok(receipt)
+            Ok(mark_readback_verified(receipt))
         } else {
             Err(AppError::new(
                 "write_verify_failed",
@@ -2134,6 +2134,9 @@ impl MemberRequestGateway for CdpGateway {
                 if wire_name_missing(&member.card_name) && !wire_name_missing(&card) {
                     member.card_name = card;
                 }
+                if value.get("mute").and_then(Value::as_bool) == Some(true) {
+                    member.account_state = "NIM_MUTE".into();
+                }
                 continue;
             }
             if nim_id.is_empty() {
@@ -2151,7 +2154,11 @@ impl MemberRequestGateway for CdpGateway {
                 managed_card_name: String::new(),
                 card_suffix: String::new(),
                 role: member_role(&text_field(value, &["type"])),
-                account_state: String::new(),
+                account_state: if value.get("mute").and_then(Value::as_bool) == Some(true) {
+                    "NIM_MUTE".into()
+                } else {
+                    String::new()
+                },
                 blacklisted: false,
                 present: true,
                 join_source: "baseline".into(),
@@ -3024,7 +3031,7 @@ fn nim_send_expression(target: &str, content: &str) -> String {
 fn nim_team_members_expression(team_id: &str, cursor: Option<&str>) -> String {
     let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
     format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503,members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),timedOut:Boolean(error&&error.timedOut),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal"}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{const requestId="dh-nim-members-"+Date.now()+"-"+Math.random();let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve({{requestId,...value}});}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503,members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),timedOut:Boolean(error&&error.timedOut),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal",mute:item.mute===true,active:item.active!==false,valid:item.valid!==false}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
     )
 }
 
@@ -3295,7 +3302,7 @@ fn is_member_rate_limited(error: &AppError) -> bool {
 fn nim_update_nick_expression(team_id: &str, nim_id: &str, nickname: &str) -> String {
     let input = json!({"teamId":team_id,"account":nim_id,"nickInTeam":nickname});
     format!(
-        r#"(async()=>{{const input={input};return new Promise(resolve=>{{let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve(value);}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable"}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",timedOut:true}}),15000);window.nim.updateNickInTeam({{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam,done:(error,value)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),member:value||null}});}}}});}});}})()"#
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{const requestId="dh-nim-rename-"+Date.now()+"-"+Math.random();let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve({{requestId,...value}});}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,timedOut:true}}),15000);window.nim.updateNickInTeam({{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam,done:(error,value)=>{{clearTimeout(timer);finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),member:value||null}});}}}});}});}})()"#
     )
 }
 
@@ -3479,6 +3486,11 @@ fn member_mute_observation(account_state: &str) -> Option<bool> {
         );
     }
     None
+}
+
+fn mark_readback_verified(mut receipt: GatewayReceipt) -> GatewayReceipt {
+    receipt.verification = Some("verified".into());
+    receipt
 }
 
 #[cfg(feature = "fixture")]
@@ -3789,6 +3801,20 @@ mod tests {
         assert_eq!(member_role("MSG_ADMIN"), "admin");
         assert_eq!(member_role("owner"), "owner");
         assert_eq!(member_role("unknown"), "member");
+    }
+
+    #[test]
+    fn nim_mute_state_is_preserved_for_write_verification() {
+        assert_eq!(member_mute_observation("ACCOUNT_STATE_GOOD"), Some(false));
+        assert_eq!(member_mute_observation("NIM_MUTE"), Some(true));
+        let expression = nim_team_members_expression("team", None);
+        assert!(expression.contains("mute:item.mute===true"));
+    }
+
+    #[test]
+    fn rename_readback_marks_receipt_verified() {
+        let receipt = mark_readback_verified(GatewayReceipt::succeeded(MEMBER_RENAME_ROUTE));
+        assert_eq!(receipt.verification.as_deref(), Some("verified"));
     }
 
     #[test]
