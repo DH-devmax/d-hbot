@@ -11,18 +11,21 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::ai::{self, AiConfig, AiContextMessage, AiProvider, AiRequest, ConfiguredProvider};
-use crate::business_apps::{self, BusinessApp, BusinessAppContext, BusinessAppRegistry};
+use crate::ai::{
+    self, AiConfig, AiContextMessage, AiKnowledgeCache, AiProvider, AiProviderPool, AiReplyCache,
+    AiRequest,
+};
+use crate::business_apps::{BusinessApp, BusinessAppContext, BusinessAppRegistry};
 use crate::database::DatabaseExecutor;
 use crate::diagnostics::{redact, Logger};
 use crate::error::{AppError, AppResult};
 use crate::gateway::{
-    AutomaticWritePermit, ConnectionStatus, GatewayEvent, GatewayReceipt, GatewayRecord,
-    GatewayRecordKind, RuntimeGateway,
+    synthetic_nim_user_id, AutomaticWritePermit, CapabilityStatus, ConnectionStatus, GatewayEvent,
+    GatewayReceipt, GatewayRecord, GatewayRecordKind, RuntimeGateway,
 };
 use crate::models::{
     Account, ActionRecord, AuditEvent, DailySummary, EffectOutboxItem, EffectOutboxRequest,
-    GatewayInboxEvent, Group, Member, MemberRef, Message, RuleAction, TaskItem,
+    GatewayInboxEvent, Group, Member, MemberRef, Message, ModerationRule, RuleAction, TaskItem,
 };
 use crate::secrets::SecretStore;
 use crate::shutdown::ShutdownSignal;
@@ -42,11 +45,33 @@ struct IncomingJob {
     message: Message,
 }
 
+struct PredictionNarrationJob {
+    account_id: String,
+    cache_key: String,
+    provider: Arc<dyn AiProvider>,
+    request: AiRequest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectDispatchStatus {
     Succeeded,
     Failed,
+    TerminalFailed,
     Unknown,
+}
+
+fn classify_effect_error(error: &AppError) -> EffectDispatchStatus {
+    if error.delivery_outcome_unknown() {
+        EffectDispatchStatus::Unknown
+    } else if !error.retryable
+        || error.gateway.as_deref().is_some_and(|metadata| {
+            metadata.business_code == Some(1001) || metadata.business_errno == Some(1001)
+        })
+    {
+        EffectDispatchStatus::TerminalFailed
+    } else {
+        EffectDispatchStatus::Failed
+    }
 }
 
 pub trait Clock: Send + Sync {
@@ -95,15 +120,23 @@ impl RuntimeEventSink for TauriEventSink {
 }
 
 pub trait AiProviderFactory: Send + Sync {
-    fn create(&self, config: AiConfig) -> AppResult<Arc<dyn AiProvider>>;
+    fn create(&self, configs: Vec<AiConfig>) -> AppResult<Arc<dyn AiProvider>>;
 }
 
-#[derive(Default)]
-pub struct ConfiguredAiProviderFactory;
+#[derive(Clone, Default)]
+pub struct ConfiguredAiProviderFactory {
+    pool: AiProviderPool,
+}
 
 impl AiProviderFactory for ConfiguredAiProviderFactory {
-    fn create(&self, config: AiConfig) -> AppResult<Arc<dyn AiProvider>> {
-        Ok(Arc::new(ConfiguredProvider::new(config)?))
+    fn create(&self, configs: Vec<AiConfig>) -> AppResult<Arc<dyn AiProvider>> {
+        self.pool.chain(configs)
+    }
+}
+
+impl ConfiguredAiProviderFactory {
+    pub fn new(pool: AiProviderPool) -> Self {
+        Self { pool }
     }
 }
 
@@ -120,11 +153,9 @@ impl RuntimeDependencies {
         Ok(Self {
             clock: Arc::new(SystemClock),
             events: Arc::new(NoopEventSink),
-            ai_factory: Arc::new(ConfiguredAiProviderFactory),
+            ai_factory: Arc::new(ConfiguredAiProviderFactory::default()),
             semantic_classifier: Arc::new(moderation::DeterministicSemanticClassifier::default()),
-            prediction_source: Arc::new(prediction::HttpPredictionSource::new(
-                Duration::from_secs(8),
-            )?),
+            prediction_source: Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?),
         })
     }
 }
@@ -132,6 +163,21 @@ impl RuntimeDependencies {
 impl EffectDispatchStatus {
     fn succeeded(self) -> bool {
         matches!(self, Self::Succeeded)
+    }
+}
+
+fn capability_for_effect(
+    capabilities: &crate::gateway::GatewayCapabilities,
+    effect_type: &str,
+) -> Option<crate::gateway::GatewayCapability> {
+    match effect_type {
+        "send_text" => Some(capabilities.send_text.clone()),
+        "recall" => Some(capabilities.recall.clone()),
+        "mute" | "unmute" => Some(capabilities.mute.clone()),
+        "remove" => Some(capabilities.remove_member.clone()),
+        "rename" => Some(capabilities.rename.clone()),
+        "group_mute" => Some(capabilities.group_mute.clone()),
+        _ => None,
     }
 }
 
@@ -147,6 +193,13 @@ pub struct BackendRuntime {
     ai_factory: Arc<dyn AiProviderFactory>,
     semantic_classifier: Arc<dyn moderation::SemanticClassifier>,
     business_apps: Arc<BusinessAppRegistry>,
+    ai_reply_cache: AiReplyCache,
+    ai_knowledge_cache: AiKnowledgeCache,
+    prediction_narration_cache: AiReplyCache,
+    prediction_narration_tx: mpsc::Sender<PredictionNarrationJob>,
+    prediction_narration_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PredictionNarrationJob>>>,
+    prediction_narration_pending: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    ai_rule_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl BackendRuntime {
@@ -162,6 +215,22 @@ impl BackendRuntime {
         Self::with_dependencies(database, gateway, secrets, shutdown, logger, dependencies)
     }
 
+    pub fn new_with_ai_pool(
+        database: DatabaseExecutor,
+        gateway: Arc<dyn RuntimeGateway>,
+        secrets: SecretStore,
+        shutdown: Arc<ShutdownSignal>,
+        logger: Logger,
+        pool: AiProviderPool,
+        prediction_source: Arc<dyn prediction::PredictionSource>,
+    ) -> Self {
+        let mut dependencies = RuntimeDependencies::production()
+            .expect("production runtime dependencies must initialize");
+        dependencies.ai_factory = Arc::new(ConfiguredAiProviderFactory::new(pool));
+        dependencies.prediction_source = prediction_source;
+        Self::with_dependencies(database, gateway, secrets, shutdown, logger, dependencies)
+    }
+
     pub fn with_dependencies(
         database: DatabaseExecutor,
         gateway: Arc<dyn RuntimeGateway>,
@@ -170,6 +239,7 @@ impl BackendRuntime {
         logger: Logger,
         dependencies: RuntimeDependencies,
     ) -> Self {
+        let (prediction_narration_tx, prediction_narration_rx) = mpsc::channel(64);
         Self {
             database,
             gateway,
@@ -181,12 +251,19 @@ impl BackendRuntime {
             ai_factory: dependencies.ai_factory,
             semantic_classifier: dependencies.semantic_classifier,
             business_apps: Arc::new(BusinessAppRegistry::new(dependencies.prediction_source)),
+            ai_reply_cache: AiReplyCache::default(),
+            ai_knowledge_cache: AiKnowledgeCache::default(),
+            prediction_narration_cache: AiReplyCache::new(512, Duration::from_secs(30 * 60)),
+            prediction_narration_tx,
+            prediction_narration_rx: Arc::new(tokio::sync::Mutex::new(prediction_narration_rx)),
+            prediction_narration_pending: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
     pub fn spawn(mut self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
         self.events = Arc::new(TauriEventSink::new(app.clone()));
-        let mut workers = Vec::with_capacity(6);
+        let mut workers = Vec::with_capacity(8);
         let card_queue = self.clone();
         let card_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
@@ -220,7 +297,35 @@ impl BackendRuntime {
         workers.push(tauri::async_runtime::spawn(async move {
             effects.effect_loop(app).await;
         }));
+        let prediction_narration = self.clone();
+        workers.push(tauri::async_runtime::spawn(async move {
+            prediction_narration.prediction_narration_loop().await;
+        }));
         workers
+    }
+
+    async fn prediction_narration_loop(&self) {
+        let mut receiver = self.prediction_narration_rx.lock().await;
+        loop {
+            let job = tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                job = receiver.recv() => match job {
+                    Some(job) => job,
+                    None => break,
+                },
+            };
+            if let Ok(decision) = job.provider.decide(&job.request).await {
+                self.prediction_narration_cache.insert_scoped(
+                    &job.account_id,
+                    job.cache_key.clone(),
+                    decision,
+                );
+            }
+            self.prediction_narration_pending
+                .lock()
+                .await
+                .remove(&job.cache_key);
+        }
     }
 
     async fn enqueue_effect(
@@ -311,21 +416,38 @@ impl BackendRuntime {
             .get("durationSeconds")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let capabilities = self.gateway.capabilities();
-        let capability = match item.effect_type.as_str() {
-            "send_text" => Some(&capabilities.send_text),
-            "recall" => Some(&capabilities.recall),
-            "mute" | "unmute" => Some(&capabilities.mute),
-            "remove" => Some(&capabilities.remove_member),
-            "rename" => Some(&capabilities.rename),
-            "group_mute" => Some(&capabilities.group_mute),
-            _ => None,
-        };
-        let result = if capability.is_some_and(|value| !value.is_supported()) {
-            Err(AppError::new(
-                "capability_unverified",
-                "当前旺商聊版本尚未完成该协议能力校准",
-            ))
+        let mut capabilities = self.gateway.capabilities();
+        // The runtime starts its workers concurrently. A real inbound message
+        // can therefore reach the effect queue before the background capability
+        // worker has completed its first structural probe. Probe once here,
+        // through the gateway's single-flight gate, rather than permanently
+        // discarding a valid automatic effect as "not calibrated".
+        if capability_for_effect(&capabilities, &item.effect_type).is_some_and(|value| {
+            value.status == CapabilityStatus::ManualVerification && !value.automatic_allowed
+        }) {
+            capabilities = self.gateway.probe_capabilities("", "").await;
+        }
+        let capability = capability_for_effect(&capabilities, &item.effect_type);
+        let result = if capability
+            .as_ref()
+            .is_some_and(|value| !value.automatic_allowed)
+        {
+            let retryable_probe = capability
+                .as_ref()
+                .is_some_and(|value| value.status == CapabilityStatus::ManualVerification);
+            let error = AppError::new(
+                "capability_automatic_disabled",
+                if retryable_probe {
+                    "协议能力仍在启动探测中，自动操作将按退避策略重试"
+                } else {
+                    "当前协议能力尚未开放自动执行，请查看调试页的探测说明"
+                },
+            );
+            Err(if retryable_probe {
+                error.retryable()
+            } else {
+                error
+            })
         } else {
             match item.effect_type.as_str() {
                 "send_text" => {
@@ -400,11 +522,7 @@ impl BackendRuntime {
             ),
             Ok(receipt) => (EffectDispatchStatus::Succeeded, String::new(), receipt),
             Err(error) => {
-                let status = if error.delivery_outcome_unknown() {
-                    EffectDispatchStatus::Unknown
-                } else {
-                    EffectDispatchStatus::Failed
-                };
+                let status = classify_effect_error(&error);
                 let mut receipt = GatewayReceipt::failed(&item.effect_type, &error);
                 if status == EffectDispatchStatus::Unknown {
                     receipt.status = "unknown".into();
@@ -453,6 +571,7 @@ impl BackendRuntime {
         let status_name = match status {
             EffectDispatchStatus::Succeeded => "succeeded",
             EffectDispatchStatus::Failed => "failed",
+            EffectDispatchStatus::TerminalFailed => "failed-terminal",
             EffectDispatchStatus::Unknown => "unknown",
         };
         let audit = AuditEvent {
@@ -464,12 +583,17 @@ impl BackendRuntime {
             event: "effect_dispatched".into(),
             level: match status {
                 EffectDispatchStatus::Succeeded => "info",
-                EffectDispatchStatus::Failed => "error",
+                EffectDispatchStatus::Failed | EffectDispatchStatus::TerminalFailed => "error",
                 EffectDispatchStatus::Unknown => "warning",
             }
             .into(),
             details: serde_json::json!({
                 "effect": item.effect_type,
+                "actionKind": action_kind,
+                "messageId": payload.get("messageId").and_then(Value::as_i64),
+                "ruleId": payload.get("ruleId").and_then(Value::as_i64),
+                "mode": payload.get("mode").and_then(Value::as_str).unwrap_or("automatic"),
+                "reason": payload.get("reason").and_then(Value::as_str).unwrap_or_default(),
                 "success": success,
                 "status": status_name,
                 "error": error_text,
@@ -512,7 +636,7 @@ impl BackendRuntime {
                     .database
                     .finish_task_reminder(task_id, true, String::new())
                     .await;
-            } else if item.attempts >= 5 {
+            } else if status == EffectDispatchStatus::TerminalFailed || item.attempts >= 5 {
                 let _ = self
                     .database
                     .finish_task_reminder(task_id, false, error_text.clone())
@@ -531,7 +655,10 @@ impl BackendRuntime {
                     .database
                     .mark_schedule_run_unknown(run_key.to_string(), error_text.clone())
                     .await;
-            } else if success || item.attempts >= 5 {
+            } else if success
+                || status == EffectDispatchStatus::TerminalFailed
+                || item.attempts >= 5
+            {
                 let _ = self
                     .database
                     .finish_schedule_run(run_key.to_string(), success, error_text.clone())
@@ -550,23 +677,6 @@ impl BackendRuntime {
             }
         }
         if action.is_some() {
-            if success {
-                if let Some(rule_ids) = payload.get("contributorRuleIds").and_then(Value::as_array)
-                {
-                    for rule_id in rule_ids.iter().filter_map(Value::as_i64) {
-                        let _ = self
-                            .database
-                            .mark_rule_executed(
-                                rule_id,
-                                item.account_id.clone(),
-                                item.group_id,
-                                user_id,
-                                Utc::now(),
-                            )
-                            .await;
-                    }
-                }
-            }
             if let Some(app) = app {
                 let _ = app.emit(
                     "action-recorded",
@@ -752,25 +862,9 @@ impl BackendRuntime {
                 "当前群今天还没有可供总结的消息",
             ));
         }
-        let provider = self.ai_factory.create(AiConfig {
-            base_url: self
-                .database
-                .get_setting("ai.base_url".into())
-                .await?
-                .unwrap_or_default(),
-            webhook_url: self
-                .database
-                .get_setting("ai.webhook_url".into())
-                .await?
-                .unwrap_or_default(),
-            model: self
-                .database
-                .get_setting("ai.model".into())
-                .await?
-                .unwrap_or_else(|| "deepseek-v4-pro".into()),
-            api_key: self.gateway_secret("ai.api_key").await,
-            timeout: Duration::from_secs(30),
-        })?;
+        let (provider, _) = self
+            .ai_provider(account_id, ai::AI_PROVIDER_TIMEOUT)
+            .await?;
         let request = AiRequest {
             version: "1",
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -926,10 +1020,9 @@ impl BackendRuntime {
                                         &job.desired_name,
                                     )
                                     .await
-                                    .map(|_| ())
                             };
                             let result = match result {
-                                Ok(()) => {
+                                Ok(receipt) => {
                                     sleep(Duration::from_millis(500)).await;
                                     match self.gateway.list_members(job.group_id).await {
                                         Ok(roster) => {
@@ -939,7 +1032,7 @@ impl BackendRuntime {
                                                         && member.nim_id == job.nim_id))
                                                     && member.card_name == job.desired_name
                                             }) {
-                                                Ok(())
+                                                Ok(receipt)
                                             } else {
                                                 Err(AppError::new(
                                                     "card_verify",
@@ -953,13 +1046,53 @@ impl BackendRuntime {
                                 }
                                 Err(error) => Err(error),
                             };
-                            let (success, error) = match result {
-                                Ok(()) => (true, String::new()),
-                                Err(error) => (false, error.message),
+                            let (success, retryable, error, audit_details) = match result {
+                                Ok(receipt) => (
+                                    true,
+                                    false,
+                                    String::new(),
+                                    serde_json::json!({
+                                        "jobId": job.id,
+                                        "originalName": job.original_name,
+                                        "desiredName": job.desired_name,
+                                        "attempts": job.attempts,
+                                        "status": "succeeded",
+                                        "verification": "verified",
+                                        "receipt": redact_gateway_receipt(receipt),
+                                    })
+                                    .to_string(),
+                                ),
+                                Err(operation_error) => {
+                                    let error_message = redact(&operation_error.message);
+                                    let gateway_error = operation_error.gateway.as_deref().cloned();
+                                    (
+                                        false,
+                                        operation_error.retryable
+                                            && !operation_error.delivery_outcome_unknown(),
+                                        error_message.clone(),
+                                        serde_json::json!({
+                                            "jobId": job.id,
+                                            "originalName": job.original_name,
+                                            "desiredName": job.desired_name,
+                                            "attempts": job.attempts,
+                                            "status": if operation_error.delivery_outcome_unknown() { "unknown" } else { "failed" },
+                                            "verification": if operation_error.code == "card_verify" { "failed" } else { "not-applicable" },
+                                            "errorCode": operation_error.code,
+                                            "error": error_message,
+                                            "retryable": operation_error.retryable,
+                                            "errorKind": gateway_error.as_ref().map(|value| format!("{:?}", value.kind)),
+                                            "route": gateway_error.as_ref().map(|value| value.route.clone()),
+                                            "transportCode": gateway_error.as_ref().and_then(|value| value.transport_code),
+                                            "transportErrno": gateway_error.as_ref().and_then(|value| value.transport_errno),
+                                            "businessCode": gateway_error.as_ref().and_then(|value| value.business_code),
+                                            "businessErrno": gateway_error.as_ref().and_then(|value| value.business_errno),
+                                        }).to_string(),
+                                    )
+                                }
                             };
                             let _ = self
                                 .database
-                                .finish_card_job(job.clone(), success, error.clone())
+                                .finish_card_job(job.clone(), success, retryable, error.clone())
                                 .await;
                             if success && job.welcome_pending {
                                 let welcome = self
@@ -996,12 +1129,8 @@ impl BackendRuntime {
                                     user_id: job.user_id,
                                     actor: "DH BOT".into(),
                                     event: "card_rename_job".into(),
-                                    level: if success { "info" } else { "error" }.into(),
-                                    details: if success {
-                                        format!("群名片已改为“{}”", job.desired_name)
-                                    } else {
-                                        error.clone()
-                                    },
+                                    level: if success { "success" } else { "error" }.into(),
+                                    details: audit_details,
                                     created_at: Utc::now(),
                                 })
                                 .await;
@@ -1011,7 +1140,7 @@ impl BackendRuntime {
                                 "kind":"cardRename",
                                 "groupId":job.group_id,
                                 "userId":job.user_id,
-                                "state":if success { "succeeded" } else if job.attempts >= 5 { "failed" } else { "retry" },
+                                "state":if success { "succeeded" } else if !retryable || job.attempts >= 5 { "failed" } else { "retry" },
                                 "error":error
                             }),
                         );
@@ -1025,7 +1154,7 @@ impl BackendRuntime {
                 }
             }
             tokio::select! {
-                _ = sleep(Duration::from_secs(1)) => {},
+                _ = sleep(Duration::from_secs(5)) => {},
                 _ = self.shutdown.cancelled() => break,
             }
         }
@@ -1059,7 +1188,7 @@ impl BackendRuntime {
                     self.sync_members(&account_id).await;
                 }
             }
-            delay = Duration::from_secs(600);
+            delay = Duration::from_secs(60);
         }
     }
 
@@ -1141,13 +1270,26 @@ impl BackendRuntime {
             let mut present_ids = HashSet::new();
             let mut newly_discovered = HashSet::new();
             let mut card_candidate_ids = HashSet::new();
+            let mut invalid_card_ids = HashSet::new();
             for mut member in roster.members {
                 member.account_id = account_id.to_string();
+                let mut managed_name_drifted = false;
+                let mut drift_audit = None;
                 let is_new = if let Some(saved) = existing.iter().find(|saved| {
                     saved.user_id == member.user_id
                         || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
                 }) {
                     merge_managed_member_state(&mut member, saved);
+                    let locked_name = if !saved.locked_card_name.trim().is_empty() {
+                        saved.locked_card_name.trim()
+                    } else {
+                        saved.managed_card_name.trim()
+                    };
+                    managed_name_drifted =
+                        !locked_name.is_empty() && member.card_name.trim() != locked_name;
+                    if managed_name_drifted && saved.card_name.trim() != member.card_name.trim() {
+                        drift_audit = Some((member.card_name.clone(), locked_name.to_string()));
+                    }
                     if !saved.present {
                         let now = Utc::now();
                         member.join_source = "offline-discovered".into();
@@ -1173,13 +1315,53 @@ impl BackendRuntime {
                 member.present = true;
                 member.last_seen_at = Utc::now();
                 member.updated_at = member.last_seen_at;
+                let needs_card_correction =
+                    crate::cardnames::automatic_correction_eligible(&member);
                 if let Ok(canonical_user_id) = self.database.upsert_member(member.clone()).await {
                     present_ids.insert(canonical_user_id);
+                    if let Some((observed, locked)) = drift_audit {
+                        let count = self
+                            .database
+                            .increment_member_violation(
+                                account_id.to_string(),
+                                group.group_id,
+                                canonical_user_id,
+                            )
+                            .await
+                            .unwrap_or(member.violation_count);
+                        let _ = self
+                            .database
+                            .record_audit(AuditEvent {
+                                id: 0,
+                                account_id: account_id.into(),
+                                group_id: group.group_id,
+                                user_id: canonical_user_id,
+                                actor: "DH BOT".into(),
+                                event: "locked_card_drift_detected".into(),
+                                level: "warning".into(),
+                                details: serde_json::json!({
+                                    "source": "authoritative-roster",
+                                    "observedName": observed,
+                                    "lockedName": locked,
+                                    "violationCount": count,
+                                    "action": "queued-for-restore",
+                                })
+                                .to_string(),
+                                created_at: Utc::now(),
+                            })
+                            .await;
+                    }
                     if is_new {
                         newly_discovered.insert(canonical_user_id);
                         if !member.blacklisted {
                             card_candidate_ids.insert(canonical_user_id);
                         }
+                    } else if managed_name_drifted && !member.blacklisted {
+                        card_candidate_ids.insert(canonical_user_id);
+                    }
+                    if !baseline && needs_card_correction && !member.blacklisted {
+                        invalid_card_ids.insert(canonical_user_id);
+                        card_candidate_ids.insert(canonical_user_id);
                     }
                 }
                 if !baseline && is_new && member.blacklisted {
@@ -1229,8 +1411,27 @@ impl BackendRuntime {
                 {
                     self.logger.write(
                         "WARN",
-                        &format!("离线新增成员自动群名片入队失败：{}", error.message),
+                        &format!("成员群名片自动校正入队失败：{}", error.message),
                     );
+                }
+                if !invalid_card_ids.is_empty() {
+                    let _ = self
+                        .database
+                        .record_audit(AuditEvent {
+                            id: 0,
+                            account_id: account_id.into(),
+                            group_id: group.group_id,
+                            user_id: 0,
+                            actor: "DH BOT".into(),
+                            event: "card_name_correction_queued".into(),
+                            level: "warning".into(),
+                            details: format!(
+                                "名单对账发现 {} 名群员的当前群名片异常，已进入自动纠正队列",
+                                invalid_card_ids.len()
+                            ),
+                            created_at: Utc::now(),
+                        })
+                        .await;
                 }
             }
             if self.gateway.session_epoch() != session_epoch {
@@ -1371,7 +1572,7 @@ impl BackendRuntime {
                                     .map(|member| matches!(member.role.as_str(), "owner" | "admin"))
                                     .unwrap_or(false);
                                 let result = if allowed
-                                    && self.gateway.capabilities().group_mute.is_supported()
+                                    && self.gateway.capabilities().group_mute.automatic_allowed
                                 {
                                     self.enqueue_effect(
                                         &account_id,
@@ -1447,6 +1648,8 @@ impl BackendRuntime {
         let mut workers: HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>> = HashMap::new();
         let mut worker_tasks = JoinSet::new();
         let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
+        let mut reported_member_event_mismatches = HashSet::new();
+        let mut reported_ignored_events = HashSet::new();
         let mut active_account = String::new();
         let mut session_epoch = 0u64;
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
@@ -1479,6 +1682,8 @@ impl BackendRuntime {
                 workers.clear();
                 worker_tasks.abort_all();
                 member_event_cache.clear();
+                reported_member_event_mismatches.clear();
+                reported_ignored_events.clear();
                 active_account = account_id.clone();
                 session_epoch = gateway_epoch;
                 last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
@@ -1718,10 +1923,15 @@ impl BackendRuntime {
                                     }
                                 }
                                 Err(reason) if reason == "解码失败且群身份未映射" => {
-                                    let _ = self
+                                    let retry_error =
+                                        format!("{reason}；已保留事件，等待群列表映射恢复后重试");
+                                    if let Err(error) = self
                                         .database
-                                        .finish_gateway_inbox(item.id, false, reason)
-                                        .await;
+                                        .finish_gateway_inbox(item.id, false, retry_error)
+                                        .await
+                                    {
+                                        self.logger.write("WARN", &error.message);
+                                    }
                                 }
                                 Err(reason) => {
                                     match self
@@ -1884,12 +2094,22 @@ impl BackendRuntime {
                         GatewayRecordKind::TeamMemberJoined
                         | GatewayRecordKind::TeamMemberLeft
                         | GatewayRecordKind::TeamMemberUpdated => {
-                            expected_member_events += record
-                                .payload
-                                .get("members")
-                                .and_then(Value::as_array)
-                                .map(Vec::len)
-                                .unwrap_or(0);
+                            expected_member_events +=
+                                ["members", "teamMembers", "accounts", "memberList"]
+                                    .iter()
+                                    .find_map(|key| {
+                                        record.payload.get(*key).and_then(Value::as_array)
+                                    })
+                                    .map(Vec::len)
+                                    .or_else(|| {
+                                        record
+                                            .payload
+                                            .get("member")
+                                            .or_else(|| record.payload.get("account"))
+                                            .filter(|value| value.is_object())
+                                            .map(|_| 1)
+                                    })
+                                    .unwrap_or(0);
                             member_event_ids.push(inbox_event_id);
                             continue;
                         }
@@ -1911,9 +2131,14 @@ impl BackendRuntime {
                         }
                         Err(reason) => {
                             if reason != "解码失败且群身份未映射" {
-                                ackable_event_ids.insert(inbox_event_id);
+                                ackable_event_ids.insert(inbox_event_id.clone());
                             }
-                            ignored.push((record.sequence, reason));
+                            ignored.push((
+                                inbox_event_id,
+                                record.sequence,
+                                record.source.clone(),
+                                reason,
+                            ));
                         }
                     }
                 }
@@ -1934,6 +2159,9 @@ impl BackendRuntime {
                         continue;
                     }
                 };
+                // A temporarily missing team-to-group mapping is not malformed
+                // input. Keep the durable inbox row pending and withhold the
+                // source ACK so a successful group-list refresh can replay it.
                 // Member records join the ACK prefix only after every normalized
                 // event has been durably applied. Transient database failures are
                 // retried in-place so a gateway cursor cannot outrun persistence.
@@ -2035,13 +2263,58 @@ impl BackendRuntime {
                                 ackable_event_ids.extend(member_event_ids.iter().cloned());
                             }
                             Ok(events) => {
-                                self.logger.write(
-                                "WARN",
-                                &format!(
-                                    "成员事件归一化数量不一致：期望 {expected_member_events}，实际 {}",
-                                    events.len()
-                                ),
-                            );
+                                let actual = events.len();
+                                let mismatch_key = member_cache_key
+                                    .clone()
+                                    .unwrap_or_else(|| member_event_ids.join("|"));
+                                if reported_member_event_mismatches.insert(mismatch_key) {
+                                    self.logger.write(
+                                        "WARN",
+                                        &format!(
+                                            "成员事件未完整识别：预期 {expected_member_events}，实际 {actual}；已转为 60 秒名单对账"
+                                        ),
+                                    );
+                                    let _ = self
+                                        .database
+                                        .record_audit(AuditEvent {
+                                            id: 0,
+                                            account_id: account_id.clone(),
+                                            group_id: 0,
+                                            user_id: 0,
+                                            actor: "DH BOT".into(),
+                                            event: "member_event_fallback".into(),
+                                            level: "warning".into(),
+                                            details: serde_json::json!({
+                                                "expected": expected_member_events,
+                                                "normalized": actual,
+                                                "result": "ignored",
+                                                "fallback": "roster-reconciliation",
+                                                "reason": "成员事件缺少可映射的群或成员身份"
+                                            })
+                                            .to_string(),
+                                            created_at: Utc::now(),
+                                        })
+                                        .await;
+                                }
+                                match self
+                                    .database
+                                    .mark_gateway_inbox_processed(
+                                        account_id.clone(),
+                                        member_event_ids.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        ackable_event_ids.extend(member_event_ids.iter().cloned())
+                                    }
+                                    Err(error) => self.logger.write(
+                                        "WARN",
+                                        &format!(
+                                            "成员事件转入名单对账时写入状态失败：{}",
+                                            error.message
+                                        ),
+                                    ),
+                                }
                             }
                             Err(error) => {
                                 self.logger.write("WARN", &error.message);
@@ -2050,7 +2323,11 @@ impl BackendRuntime {
                         }
                     }
                 }
-                for (sequence, reason) in ignored {
+                for (event_id, sequence, source, reason) in ignored {
+                    if !reported_ignored_events.insert(event_id) {
+                        continue;
+                    }
+                    let mapping_pending = reason == "解码失败且群身份未映射";
                     let _ = self
                         .database
                         .record_audit(AuditEvent {
@@ -2059,14 +2336,26 @@ impl BackendRuntime {
                             group_id: 0,
                             user_id: 0,
                             actor: "DH BOT".into(),
-                            event: "message_ignored".into(),
-                            level: if reason == "解码失败且群身份未映射" {
+                            event: if mapping_pending {
+                                "message_mapping_pending"
+                            } else {
+                                "message_ignored"
+                            }
+                            .into(),
+                            level: if mapping_pending {
                                 "warning"
                             } else {
                                 "info"
                             }
                             .into(),
-                            details: format!("序号={sequence}，{reason}"),
+                            details: serde_json::json!({
+                                "direction": "incoming",
+                                "sequence": sequence,
+                                "source": source,
+                                "processingState": if mapping_pending { "retry" } else { "ignored" },
+                                "reason": reason,
+                            })
+                            .to_string(),
                             created_at: Utc::now(),
                         })
                         .await;
@@ -2128,6 +2417,27 @@ impl BackendRuntime {
                                     continue;
                                 }
                                 job.message.id = persisted.id;
+                                if persisted.inserted {
+                                    let _ = self
+                                        .database
+                                        .record_audit(AuditEvent {
+                                            id: 0,
+                                            account_id: account_id.clone(),
+                                            group_id: job.message.group_id,
+                                            user_id: job.message.user_id,
+                                            actor: "DH BOT".into(),
+                                            event: "message_received".into(),
+                                            level: "info".into(),
+                                            details: message_audit_details(
+                                                &job.message,
+                                                job.sequence,
+                                                "queued",
+                                                "persisted-and-acknowledged",
+                                            ),
+                                            created_at: Utc::now(),
+                                        })
+                                        .await;
+                                }
                                 let sender = self.worker_for(
                                     &mut workers,
                                     &mut worker_tasks,
@@ -2146,6 +2456,8 @@ impl BackendRuntime {
                 tokio::select! { _ = sleep(Duration::from_millis(700)) => {}, _ = self.shutdown.cancelled() => break 'connection }
             }
             member_event_cache.clear();
+            reported_member_event_mismatches.clear();
+            reported_ignored_events.clear();
             last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
             tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
         }
@@ -2265,10 +2577,17 @@ impl BackendRuntime {
                     && saved
                         .as_ref()
                         .is_none_or(|saved| saved.card_name != member.card_name);
-                if new_violation {
-                    member.violation_count += 1;
-                }
                 self.database.upsert_member(member.clone()).await?;
+                if new_violation {
+                    member.violation_count = self
+                        .database
+                        .increment_member_violation(
+                            account_id.to_string(),
+                            group_id,
+                            member.user_id,
+                        )
+                        .await?;
+                }
                 if let Some(locked) = restore_name {
                     self.enqueue_effect(
                         account_id,
@@ -2295,7 +2614,12 @@ impl BackendRuntime {
                             actor: "DH BOT".into(),
                             event: "locked_card_restore_queued".into(),
                             level: "warning".into(),
-                            details: format!("群名片已进入恢复队列：「{locked}」"),
+                            details: serde_json::json!({
+                                "lockedName": locked,
+                                "violationCount": member.violation_count,
+                                "action": "queued-for-restore",
+                            })
+                            .to_string(),
                             created_at: Utc::now(),
                         })
                         .await?;
@@ -2394,25 +2718,19 @@ impl BackendRuntime {
             return Err("群身份无效".into());
         }
         let nim_sender = value.get("from").and_then(Value::as_str);
-        let mut user_id = decoded
-            .pointer("/from/id")
-            .and_then(value_i64)
-            .or_else(|| value.get("from").and_then(value_i64))
-            .unwrap_or(0);
+        let mut user_id = decoded.pointer("/from/id").and_then(value_i64).unwrap_or(0);
         if user_id <= 0 {
             if let Some(nim_id) = nim_sender {
                 user_id = self
                     .database
-                    .list_members(account_id.to_string(), group_id)
+                    .resolve_member_user_id(account_id.to_string(), group_id, nim_id.to_string())
                     .await
                     .ok()
-                    .and_then(|members| {
-                        members
-                            .into_iter()
-                            .find(|member| member.nim_id == nim_id)
-                            .map(|member| member.user_id)
-                    })
+                    .flatten()
                     .unwrap_or(0);
+                if user_id <= 0 {
+                    user_id = synthetic_nim_user_id(nim_id);
+                }
             }
         }
         if user_id <= 0 {
@@ -2421,38 +2739,40 @@ impl BackendRuntime {
         if user_id == sender_id {
             return Err("已忽略本账号消息".into());
         }
-        let text = decoded
-            .pointer("/content/data")
+        let wire_sender_name = decoded
+            .pointer("/from/name")
             .and_then(Value::as_str)
-            .or_else(|| value.get("text").and_then(Value::as_str))
-            .or_else(|| value.get("content").and_then(Value::as_str))
-            .unwrap_or_else(|| {
-                if decoded.is_null() {
-                    "[消息解码失败]"
-                } else {
-                    ""
-                }
+            .or_else(|| value.get("fromNick").and_then(Value::as_str))
+            .unwrap_or_default();
+        let sender_name = self
+            .database
+            .list_members(account_id.to_string(), group_id)
+            .await
+            .ok()
+            .and_then(|members| {
+                members
+                    .into_iter()
+                    .find(|member| member.user_id == user_id)
+                    .and_then(|member| {
+                        preferred_member_display_name(
+                            &member.card_name,
+                            &member.managed_card_name,
+                            &member.nickname,
+                        )
+                    })
             })
-            .to_string();
+            .unwrap_or_else(|| wire_sender_name.to_string());
+        let text = normalized_message_text(decoded, value);
         let format = decoded
             .get("msgFormat")
             .and_then(value_i64)
             .or_else(|| value.get("msgFormat").and_then(value_i64))
             .unwrap_or(99);
-        let kind = match value.get("type").and_then(Value::as_str) {
-            Some("text") => "text",
-            Some("image") => "image",
-            Some("card") => "card",
-            Some("notification") | Some("notice") => "notice",
-            Some(_) => "other",
-            None => match format {
-                0 => "text",
-                1 => "image",
-                13 => "card",
-                7 | 8 => "notice",
-                _ => "other",
-            },
-        };
+        let kind = normalized_message_kind(
+            value.get("type").and_then(Value::as_str),
+            format,
+            !text.trim().is_empty(),
+        );
         let now = self.clock.now_utc();
         Ok(IncomingJob {
             sequence,
@@ -2475,12 +2795,7 @@ impl BackendRuntime {
                     }),
                 sequence: sequence as i64,
                 user_id,
-                sender_name: decoded
-                    .pointer("/from/name")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("fromNick").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .into(),
+                sender_name,
                 kind: kind.into(),
                 text,
                 sent_at: timestamp(value.get("time").and_then(value_i64)).unwrap_or(now),
@@ -2494,6 +2809,7 @@ impl BackendRuntime {
                 mentions_json: decoded
                     .get("mentions")
                     .or_else(|| value.get("mentions"))
+                    .filter(|value| !value.is_null())
                     .map(Value::to_string)
                     .unwrap_or_else(|| "[]".into()),
                 source_kind: value
@@ -2534,7 +2850,14 @@ impl BackendRuntime {
                     actor: "DH BOT".into(),
                     event: "automation_paused".into(),
                     level: "info".into(),
-                    details: "托盘暂停了自动化执行".into(),
+                    details: serde_json::json!({
+                        "messageId": job.message.id,
+                        "serverMessageId": job.message.server_message_id,
+                        "sequence": job.sequence,
+                        "processingState": "ignored",
+                        "reason": "托盘已暂停全部自动化；消息仍已保存"
+                    })
+                    .to_string(),
                     created_at: Utc::now(),
                 })
                 .await;
@@ -2580,7 +2903,8 @@ impl BackendRuntime {
                 at: message.sent_at,
             })
             .collect::<Vec<_>>();
-        if group.moderation_enabled {
+        let mut deferred_ai_rules = Vec::new();
+        if group.machine_rules_enabled || group.ai_rules_enabled {
             if let Ok(rules) = self
                 .database
                 .list_rules(account_id.to_string(), Some(group.group_id))
@@ -2594,90 +2918,78 @@ impl BackendRuntime {
                     recent: &recent_events,
                     rename_violations: member.violation_count,
                 };
-                let mut categories = rules
-                    .iter()
-                    .filter(|rule| rule.enabled && rule.matcher == "semantic")
-                    .map(|rule| rule.pattern.trim().to_string())
-                    .filter(|category| !category.is_empty())
-                    .collect::<Vec<_>>();
-                categories.sort();
-                categories.dedup();
-                let mut decision = if categories.is_empty() {
-                    moderation::evaluate_with_classifier(
-                        &rules,
+                if group.machine_rules_enabled {
+                    let machine_rules = rules
+                        .iter()
+                        .filter(|rule| !rule.is_ai_rule() && rule.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let started = std::time::Instant::now();
+                    let decision = moderation::evaluate_with_classifier(
+                        &machine_rules,
                         &input,
                         self.semantic_classifier.as_ref(),
-                    )
-                } else {
-                    match self
-                        .classify_semantics(&group, &member, &job.message, &categories)
-                        .await
-                    {
-                        Ok(scores) => {
-                            moderation::evaluate_with_semantic_scores(&rules, &input, &scores)
-                        }
-                        Err(error) => {
-                            let _ = self
-                                .database
-                                .record_audit(AuditEvent {
-                                    id: 0,
-                                    account_id: account_id.into(),
-                                    group_id: group.group_id,
-                                    user_id: member.user_id,
-                                    actor: "DH BOT".into(),
-                                    event: "semantic_classifier_fallback".into(),
-                                    level: "warning".into(),
-                                    details: error.message,
-                                    created_at: Utc::now(),
-                                })
-                                .await;
-                            moderation::evaluate_with_classifier(
-                                &rules,
-                                &input,
-                                self.semantic_classifier.as_ref(),
-                            )
-                        }
-                    }
-                };
-                let mut executable = Vec::new();
-                let mut contributor_rule_ids = Vec::new();
-                for matched in &decision.matches {
-                    if matches!(matched.mode.as_str(), "auto" | "automatic") {
-                        let cooldown = rules
+                    );
+                    let elapsed_ms = started.elapsed().as_millis() as i64;
+                    let matched_ids = decision
+                        .matches
+                        .iter()
+                        .map(|matched| matched.rule_id)
+                        .collect::<std::collections::HashSet<_>>();
+                    for rule in &machine_rules {
+                        let matched = decision
+                            .matches
                             .iter()
-                            .find(|rule| rule.id == matched.rule_id)
-                            .map(|rule| rule.cooldown_seconds)
-                            .unwrap_or(0);
-                        let allowed = cooldown <= 0
-                            || self
-                                .database
-                                .rule_cooldown_allows(
-                                    matched.rule_id,
-                                    account_id.to_string(),
-                                    group.group_id,
-                                    member.user_id,
-                                    self.clock.now_utc(),
-                                    cooldown,
-                                )
-                                .await
-                                .unwrap_or(false);
-                        if allowed {
-                            contributor_rule_ids.push(matched.rule_id);
-                            executable.extend(matched.actions.clone());
-                        }
+                            .find(|matched| matched.rule_id == rule.id);
+                        let _ = self
+                            .database
+                            .record_rule_evaluation(
+                                account_id.into(),
+                                group.group_id,
+                                member.user_id,
+                                job.message.id,
+                                rule.id,
+                                "machine".into(),
+                                matched.is_some(),
+                                None,
+                                rule.mode.clone(),
+                                if matched.is_some() {
+                                    "命中".into()
+                                } else {
+                                    "未命中".into()
+                                },
+                                matched
+                                    .map(|value| value.reason.clone())
+                                    .unwrap_or_default(),
+                                elapsed_ms,
+                            )
+                            .await;
                     }
+                    if !matched_ids.is_empty() {
+                        let _ = self.database.record_audit(AuditEvent { id:0, account_id:account_id.into(), group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"machine_rule_evaluated".into(), level:"info".into(), details:serde_json::json!({"messageId":job.message.id,"matchedRuleIds":matched_ids,"automatic":decision.automatic,"elapsedMs":elapsed_ms}).to_string(), created_at:Utc::now() }).await;
+                    }
+                    self.execute_rule_actions(
+                        Some(app),
+                        account_id,
+                        sender_id,
+                        &job.message,
+                        &decision.action_intents,
+                        decision.automatic,
+                    )
+                    .await;
                 }
-                decision.actions = moderation::merge_actions(executable);
-                self.execute_rule_actions(
-                    app,
-                    account_id,
-                    sender_id,
-                    &job.message,
-                    &decision.actions,
-                    &contributor_rule_ids,
-                    decision.automatic,
-                )
-                .await;
+
+                if group.ai_rules_enabled
+                    && group.enabled
+                    && !group.manual_takeover
+                    && message_supports_ai_rules(&job.message.kind, &job.message.text)
+                {
+                    deferred_ai_rules = rules
+                        .iter()
+                        .filter(|rule| rule.is_ai_rule() && rule.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                }
             }
         }
         let ai_reply_allowed = self
@@ -2687,7 +2999,7 @@ impl BackendRuntime {
             && group.ai_enabled
             && ai_reply_allowed
             && !group.manual_takeover
-            && message_explicitly_mentions(&job.message, account_id)
+            && message_explicitly_mentions(&job.message, account_id, sender_id)
         {
             if let Some(business_app) = self.business_apps.find_for_message(&job.message.text) {
                 let app_id = business_app.manifest().id.to_string();
@@ -2712,6 +3024,29 @@ impl BackendRuntime {
                     .await?;
             }
         }
+        if !deferred_ai_rules.is_empty() {
+            let runtime = self.clone();
+            let app = app.clone();
+            let account_id = account_id.to_string();
+            let group = group.clone();
+            let member = member.clone();
+            let message = job.message.clone();
+            let recent_events = recent_events.clone();
+            tauri::async_runtime::spawn(async move {
+                runtime
+                    .process_ai_rules_background(
+                        app,
+                        account_id,
+                        sender_id,
+                        group,
+                        member,
+                        message,
+                        recent_events,
+                        deferred_ai_rules,
+                    )
+                    .await;
+            });
+        }
         let _ = self
             .database
             .record_audit(AuditEvent {
@@ -2722,7 +3057,12 @@ impl BackendRuntime {
                 actor: "DH BOT".into(),
                 event: "message_processed".into(),
                 level: "info".into(),
-                details: format!("消息类型={}，序号={}", job.message.kind, job.sequence),
+                details: message_audit_details(
+                    &job.message,
+                    job.sequence,
+                    "processed",
+                    "rules-and-ai-evaluated",
+                ),
                 created_at: Utc::now(),
             })
             .await;
@@ -2738,14 +3078,130 @@ impl BackendRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn process_ai_rules_background(
+        &self,
+        app: AppHandle,
+        account_id: String,
+        sender_id: i64,
+        group: Group,
+        member: Member,
+        message: Message,
+        recent_events: Vec<moderation::RecentEvent>,
+        ai_rules: Vec<ModerationRule>,
+    ) {
+        let Ok(_permit) = self.ai_rule_gate.acquire().await else {
+            return;
+        };
+        let mut categories = ai_rules
+            .iter()
+            .map(|rule| rule.pattern.trim().to_string())
+            .filter(|category| !category.is_empty())
+            .collect::<Vec<_>>();
+        categories.sort();
+        categories.dedup();
+        if categories.is_empty() {
+            return;
+        }
+        let input = moderation::ModerationInput {
+            member: &member,
+            kind: &message.kind,
+            text: &message.text,
+            now: self.clock.now_utc(),
+            recent: &recent_events,
+            rename_violations: member.violation_count,
+        };
+        let started = std::time::Instant::now();
+        match self
+            .classify_semantics(&group, &member, &message, &categories)
+            .await
+        {
+            Ok(scores) => {
+                let decision =
+                    moderation::evaluate_with_semantic_scores(&ai_rules, &input, &scores);
+                let elapsed_ms = started.elapsed().as_millis() as i64;
+                for rule in &ai_rules {
+                    let matched = decision
+                        .matches
+                        .iter()
+                        .find(|matched| matched.rule_id == rule.id);
+                    let confidence = scores.get(rule.pattern.trim()).copied();
+                    let _ = self
+                        .database
+                        .record_rule_evaluation(
+                            account_id.clone(),
+                            group.group_id,
+                            member.user_id,
+                            message.id,
+                            rule.id,
+                            "ai".into(),
+                            matched.is_some(),
+                            confidence,
+                            rule.mode.clone(),
+                            if matched.is_some() {
+                                "命中".into()
+                            } else {
+                                "未命中".into()
+                            },
+                            matched
+                                .map(|value| value.reason.clone())
+                                .unwrap_or_default(),
+                            elapsed_ms,
+                        )
+                        .await;
+                }
+                let allow_recall = self
+                    .ai_permission(&account_id, group.group_id, "recall", false)
+                    .await;
+                let allow_mute = self
+                    .ai_permission(&account_id, group.group_id, "mute", false)
+                    .await;
+                let allow_remove = self
+                    .ai_permission(&account_id, group.group_id, "remove", false)
+                    .await;
+                let allow_notify = self
+                    .ai_permission(&account_id, group.group_id, "reply", false)
+                    .await;
+                let action_intents = filter_ai_rule_intents(
+                    decision.action_intents,
+                    allow_recall,
+                    allow_mute,
+                    allow_remove,
+                    allow_notify,
+                );
+                let matched_rule_ids = decision
+                    .matches
+                    .iter()
+                    .map(|matched| matched.rule_id)
+                    .collect::<Vec<_>>();
+                let automatic_action_rule_ids = action_intents
+                    .iter()
+                    .flat_map(|intent| intent.contributors.iter().map(|value| value.rule_id))
+                    .collect::<Vec<_>>();
+                let _ = self.database.record_audit(AuditEvent { id:0, account_id:account_id.clone(), group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"ai_rule_evaluated".into(), level:"info".into(), details:serde_json::json!({"messageId":message.id,"scores":scores,"matchedRuleIds":matched_rule_ids,"automaticActionRuleIds":automatic_action_rule_ids,"elapsedMs":elapsed_ms,"execution":"background"}).to_string(), created_at:Utc::now() }).await;
+                self.execute_rule_actions(
+                    Some(&app),
+                    &account_id,
+                    sender_id,
+                    &message,
+                    &action_intents,
+                    decision.automatic,
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = self.database.record_audit(AuditEvent { id:0, account_id, group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"ai_rule_failed".into(), level:"warning".into(), details:serde_json::json!({"messageId":message.id,"error":error.message,"decision":"未执行，不使用本地猜测结果","execution":"background"}).to_string(), created_at:Utc::now() }).await;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_rule_actions(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         account_id: &str,
         sender_id: i64,
         message: &Message,
-        actions: &[RuleAction],
-        rule_ids: &[i64],
+        intents: &[moderation::ActionIntent],
         automatic: bool,
     ) {
         if !automatic {
@@ -2767,34 +3223,27 @@ impl BackendRuntime {
             })
             .map(|member| member.role == "owner" || member.role == "admin")
             .unwrap_or(false);
-        let mut ordered = actions.iter().collect::<Vec<_>>();
-        let mut contributor_rule_ids = rule_ids.to_vec();
-        contributor_rule_ids.sort_unstable();
-        contributor_rule_ids.dedup();
-        let rule_id = contributor_rule_ids.first().copied();
-        let contributor_key = contributor_rule_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join("-");
-        ordered.sort_by_key(|action| match action.kind.as_str() {
+        let mut ordered = intents.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|intent| match intent.action.kind.as_str() {
             "recall" => 0,
             "remove" | "mute" | "unmute" => 1,
             "blacklist" => 2,
             "notify" | "reply" => 3,
             _ => 4,
         });
-        for action in ordered {
-            let dedupe_key = format!(
-                "message:{}:rule:{}:action:{}",
-                message.id,
-                if contributor_key.is_empty() {
-                    "ai"
-                } else {
-                    &contributor_key
-                },
-                action.kind
-            );
+        for intent in ordered {
+            let action = &intent.action;
+            let mut contributor_rule_ids = intent
+                .contributors
+                .iter()
+                .map(|value| value.rule_id)
+                .collect::<Vec<_>>();
+            contributor_rule_ids.sort_unstable();
+            contributor_rule_ids.dedup();
+            let rule_id = intent.contributors.first().map(|value| value.rule_id);
+            // Machine and AI rules may independently request the same action for one
+            // message. The external side effect is still performed only once.
+            let dedupe_key = format!("message:{}:action:{}", message.id, action.kind);
             if self
                 .database
                 .action_succeeded(account_id.to_string(), dedupe_key.clone())
@@ -2840,7 +3289,7 @@ impl BackendRuntime {
                                 "contributorRuleIds":contributor_rule_ids,
                                 "mode":"automatic",
                                 "durationSeconds":action.duration_seconds,
-                                "reason":action.message,
+                                "reason":if action.message.is_empty() { intent.contributors.iter().map(|value| value.rule_name.as_str()).collect::<Vec<_>>().join("、") } else { action.message.clone() },
                             })
                             .as_object()
                             .cloned()
@@ -2859,10 +3308,12 @@ impl BackendRuntime {
                     {
                         error_text = error.message;
                     } else {
-                        let _ = app.emit(
-                            "action-recorded",
-                            serde_json::json!({"kind":action.kind,"state":"queued"}),
-                        );
+                        if let Some(app) = app {
+                            let _ = app.emit(
+                                "action-recorded",
+                                serde_json::json!({"kind":action.kind,"state":"queued"}),
+                            );
+                        }
                         continue;
                     }
                 }
@@ -2887,10 +3338,12 @@ impl BackendRuntime {
                     created_at: Utc::now(),
                 })
                 .await;
-            let _ = app.emit(
-                "action-recorded",
-                json_action(&action.kind, false, &error_text),
-            );
+            if let Some(app) = app {
+                let _ = app.emit(
+                    "action-recorded",
+                    json_action(&action.kind, false, &error_text),
+                );
+            }
         }
     }
 
@@ -2901,25 +3354,9 @@ impl BackendRuntime {
         message: &Message,
         categories: &[String],
     ) -> AppResult<HashMap<String, f64>> {
-        let provider = self.ai_factory.create(AiConfig {
-            base_url: self
-                .database
-                .get_setting("ai.base_url".into())
-                .await?
-                .unwrap_or_default(),
-            webhook_url: self
-                .database
-                .get_setting("ai.webhook_url".into())
-                .await?
-                .unwrap_or_default(),
-            model: self
-                .database
-                .get_setting("ai.model".into())
-                .await?
-                .unwrap_or_else(|| "deepseek-v4-pro".into()),
-            api_key: self.gateway_secret("ai.api_key").await,
-            timeout: Duration::from_secs(15),
-        })?;
+        let (provider, _) = self
+            .ai_provider(&group.account_id, ai::AI_PROVIDER_TIMEOUT)
+            .await?;
         let category_text = serde_json::to_string(categories)
             .map_err(|error| AppError::new("semantic_categories", error.to_string()))?;
         let request = AiRequest {
@@ -2933,7 +3370,7 @@ impl BackendRuntime {
             member_role: member.role.clone(),
             message_id: message.server_message_id.clone(),
             message: format!(
-                "类别={category_text}\n待分类消息={}\n按统一 AI 响应协议返回；reply 必须是字符串，字符串内容只包含一个 JSON 对象，键为类别，值为 0 到 1 的置信度。actions 和 tasks 必须为空。",
+                "@DH 这是内部语义分类请求，不是群聊回复。\n类别={category_text}\n待分类消息={}\n按统一 AI 响应协议返回；reply 必须是字符串，字符串内容只包含一个 JSON 对象，键为类别，值为 0 到 1 的置信度。actions 和 tasks 必须为空。",
                 message.text
             ),
             recent_context: Vec::new(),
@@ -2941,6 +3378,20 @@ impl BackendRuntime {
         };
         let decision = provider.decide(&request).await?;
         parse_semantic_scores(&decision.reply, categories)
+            .or_else(|reply_error| {
+                parse_semantic_scores(&decision.reason, categories).map_err(|_| reply_error)
+            })
+            .map_err(|error| {
+                let reply_preview = semantic_response_preview(&decision.reply);
+                let reason_preview = semantic_response_preview(&decision.reason);
+                AppError::new(
+                    error.code,
+                    format!(
+                        "{}；reply={}；reason={}",
+                        error.message, reply_preview, reason_preview
+                    ),
+                )
+            })
     }
 
     async fn process_business_app(
@@ -2993,53 +3444,76 @@ impl BackendRuntime {
                     "业务应用返回了错误的应用标识",
                 ));
             }
+            // 群内预测先返回确定性模板，避免额外等待一次模型生成。
+            // AI 润色由本地测试或新期开奖预热任务完成，不阻塞本次群回复。
             let mut reply = outcome.fallback_reply.clone();
             let mut ai_used = false;
             let mut ai_error = String::new();
-
-            if let Some(data) = outcome.narration.as_ref() {
-                let provider = self.ai_factory.create(AiConfig {
-                    base_url: self
-                        .database
-                        .get_setting("ai.base_url".into())
-                        .await?
-                        .unwrap_or_default(),
-                    webhook_url: self
-                        .database
-                        .get_setting("ai.webhook_url".into())
-                        .await?
-                        .unwrap_or_default(),
-                    model: self
-                        .database
-                        .get_setting("ai.model".into())
-                        .await?
-                        .unwrap_or_else(|| "deepseek-v4-pro".into()),
-                    api_key: self.gateway_secret("ai.api_key").await,
-                    timeout: Duration::from_secs(20),
-                })?;
-                let request = AiRequest {
-                    version: "1",
-                    event_id: format!("business-app-{}-{}", manifest.id, message.id),
-                    persona: ai::PERSONA,
-                    group_id: group.group_id,
-                    group_name: group.name.clone(),
-                    member_id: member.user_id,
-                    member_name: member.card_name.clone(),
-                    member_role: member.role.clone(),
-                    message_id: message.server_message_id.clone(),
-                    message: business_apps::prediction_narration_prompt(data),
-                    recent_context: Vec::new(),
-                    knowledge: Vec::new(),
-                };
-                match provider.decide(&request).await {
-                    Ok(decision) if !decision.reply.trim().is_empty() => {
-                        // Business applications accept text only. Structured actions and tasks
-                        // are deliberately discarded even when a provider returns them.
-                        reply = decision.reply.trim().to_string();
-                        ai_used = true;
+            if let Some(narration) = outcome.narration.as_ref() {
+                match self.ai_provider(account_id, ai::AI_PROVIDER_TIMEOUT).await {
+                    Ok((provider, provider_revision)) => {
+                        let cache_key = ai::prediction_narration_cache_key(
+                            account_id,
+                            manifest.version,
+                            narration,
+                            &provider_revision,
+                        );
+                        if let Some(decision) = self
+                            .prediction_narration_cache
+                            .get_scoped(account_id, &cache_key)
+                        {
+                            reply = decision.reply;
+                            ai_used = true;
+                        } else {
+                            let request = AiRequest {
+                                version: "1",
+                                event_id: uuid::Uuid::new_v4().to_string(),
+                                persona: ai::PERSONA,
+                                group_id: group.group_id,
+                                group_name: group.name.clone(),
+                                member_id: member.user_id,
+                                member_name: member.card_name.clone(),
+                                member_role: member.role.clone(),
+                                message_id: format!("prediction:{cache_key}"),
+                                message: crate::business_apps::prediction_narration_prompt(
+                                    narration,
+                                ),
+                                recent_context: Vec::new(),
+                                knowledge: Vec::new(),
+                            };
+                            let should_queue = self
+                                .prediction_narration_pending
+                                .lock()
+                                .await
+                                .insert(cache_key.clone());
+                            if should_queue {
+                                match self.prediction_narration_tx.try_send(
+                                    PredictionNarrationJob {
+                                        account_id: account_id.into(),
+                                        cache_key: cache_key.clone(),
+                                        provider,
+                                        request,
+                                    },
+                                ) {
+                                    Ok(()) => {
+                                        ai_error = "已返回即时统计模板；AI 润色正在后台预热".into();
+                                    }
+                                    Err(_) => {
+                                        self.prediction_narration_pending
+                                            .lock()
+                                            .await
+                                            .remove(&cache_key);
+                                        ai_error = "已返回即时统计模板；AI 预热队列繁忙".into();
+                                    }
+                                }
+                            } else {
+                                ai_error = "已返回即时统计模板；AI 润色正在后台预热".into();
+                            }
+                        }
                     }
-                    Ok(_) => ai_error = "AI 没有返回文字，已使用应用模板".into(),
-                    Err(error) => ai_error = format!("{}；已使用应用模板", error.message),
+                    Err(_) => {
+                        ai_error = "已返回即时统计模板；AI 连接尚未可用".into();
+                    }
                 }
             }
 
@@ -3116,42 +3590,69 @@ impl BackendRuntime {
             return Ok(());
         }
         let result: AppResult<()> = async {
-            let base_url = self
+            let total_started = std::time::Instant::now();
+            let queue_ms = self
+                .clock
+                .now_utc()
+                .signed_duration_since(message.received_at)
+                .num_milliseconds()
+                .max(0);
+            let selected_endpoint = self
                 .database
-                .get_setting("ai.base_url".into())
+                .list_ai_provider_endpoints(account_id.to_string())
                 .await?
-                .unwrap_or_default();
-            let webhook_url = self
-                .database
-                .get_setting("ai.webhook_url".into())
-                .await?
-                .unwrap_or_default();
-            let model = self
-                .database
-                .get_setting("ai.model".into())
-                .await?
-                .unwrap_or_else(|| "deepseek-v4-pro".into());
-            let api_key = self.gateway_secret("ai.api_key").await;
-            let provider = self.ai_factory.create(AiConfig {
-                base_url,
-                webhook_url,
-                model,
-                api_key,
-                timeout: Duration::from_secs(30),
-            })?;
+                .into_iter()
+                .filter(|endpoint| endpoint.enabled)
+                .min_by_key(|endpoint| (endpoint.priority, endpoint.id));
+            let (provider, provider_revision) = self
+                .ai_provider(account_id, ai::AI_PROVIDER_TIMEOUT)
+                .await?;
+            let knowledge_started = std::time::Instant::now();
             let documents = self
                 .database
                 .list_knowledge_for_group(account_id.to_string(), group.group_id)
                 .await?;
-            let hits = knowledge::search(&message.text, &documents, 6);
+            let mut knowledge_revision = Sha256::new();
+            for document in &documents {
+                knowledge_revision.update(document.id.to_le_bytes());
+                knowledge_revision.update(document.content_hash.as_bytes());
+                knowledge_revision.update([0]);
+            }
+            let knowledge_revision = format!("{:x}", knowledge_revision.finalize());
+            let question = ai::message_without_mention(&message.text);
+            let knowledge_cache_key =
+                ai::knowledge_cache_key(account_id, group.group_id, &question, &knowledge_revision);
+            let (knowledge_chunks, knowledge_cache_hit) =
+                if let Some(chunks) = self.ai_knowledge_cache.get(&knowledge_cache_key) {
+                    (chunks, true)
+                } else {
+                    let chunks = knowledge::search(&question, &documents, 3)
+                        .into_iter()
+                        .map(|hit| ai::AiKnowledgeChunk {
+                            base: hit.document.base_name,
+                            title: hit.document.title,
+                            source: hit.document.source,
+                            text: hit.excerpt,
+                        })
+                        .collect::<Vec<_>>();
+                    self.ai_knowledge_cache
+                        .insert(knowledge_cache_key, chunks.clone());
+                    (chunks, false)
+                };
+            let knowledge_ms = knowledge_started.elapsed().as_millis();
             let recent_messages = self
                 .database
-                .recent_messages(account_id.to_string(), group.group_id, 21)
+                .recent_messages(account_id.to_string(), group.group_id, 9)
                 .await?
                 .into_iter()
                 .filter(|candidate| candidate.id != message.id)
                 .collect::<Vec<_>>();
-            let recent_context = ai::build_recent_context(&recent_messages, 20);
+            let recent_context = if !knowledge_chunks.is_empty() && ai::is_cacheable_faq(&question)
+            {
+                Vec::new()
+            } else {
+                ai::build_recent_context(&recent_messages, 8)
+            };
             let request = AiRequest {
                 version: "1",
                 event_id: uuid::Uuid::new_v4().to_string(),
@@ -3162,19 +3663,46 @@ impl BackendRuntime {
                 member_name: member.card_name.clone(),
                 member_role: member.role.clone(),
                 message_id: message.server_message_id.clone(),
-                message: ai::message_without_mention(&message.text),
+                // The runtime has already verified either @DH text or WangShangLiao
+                // mention metadata. Preserve that fact for the persona after the
+                // visible mention is stripped from the retrieval query.
+                message: format!("@DH {question}"),
                 recent_context,
-                knowledge: hits
-                    .into_iter()
-                    .map(|hit| ai::AiKnowledgeChunk {
-                        base: hit.document.base_name,
-                        title: hit.document.title,
-                        source: hit.document.source,
-                        text: hit.excerpt,
-                    })
-                    .collect(),
+                knowledge: knowledge_chunks,
             };
-            let decision = provider.decide(&request).await?;
+            let cache_key = ai::answer_cache_key(
+                account_id,
+                group.group_id,
+                &question,
+                &knowledge_revision,
+                &provider_revision,
+            );
+            let cacheable = !request.knowledge.is_empty()
+                && request.recent_context.is_empty()
+                && ai::is_cacheable_faq(&question);
+            let (decision, cache_hit, cache_stored, model_ms) = if cacheable {
+                if let Some(decision) = self.ai_reply_cache.get_scoped(account_id, &cache_key) {
+                    (decision, true, true, 0)
+                } else {
+                    let model_started = std::time::Instant::now();
+                    let decision = provider.decide(&request).await?;
+                    let model_ms = model_started.elapsed().as_millis();
+                    let cache_stored = self.ai_reply_cache
+                        .insert_scoped(account_id, cache_key, decision.clone());
+                    (decision, false, cache_stored, model_ms)
+                }
+            } else {
+                let model_started = std::time::Instant::now();
+                let decision = provider.decide(&request).await?;
+                (decision, false, false, model_started.elapsed().as_millis())
+            };
+            let decision_action_count = decision.actions.len();
+            let decision_task_count = decision.tasks.len();
+            let provider_attempts = if cache_hit {
+                0
+            } else {
+                provider.last_attempt_count()
+            };
             if self
                 .ai_permission(account_id, group.group_id, "reply", group.ai_enabled)
                 .await
@@ -3190,33 +3718,27 @@ impl BackendRuntime {
                 )
                 .await?;
             }
-            let allow_recall = self
-                .ai_permission(account_id, group.group_id, "recall", false)
-                .await;
             let allow_mute = self
                 .ai_permission(account_id, group.group_id, "mute", false)
                 .await;
             let allow_remove = self
                 .ai_permission(account_id, group.group_id, "remove", false)
                 .await;
-            let actions = decision
-                .actions
+            let actions = filter_ai_actions(decision.actions, allow_mute, allow_remove);
+            let action_intents = actions
                 .into_iter()
-                .filter(|action| match action.kind.as_str() {
-                    "recall" => allow_recall,
-                    "mute" | "unmute" => allow_mute,
-                    "remove" => allow_remove,
-                    _ => false,
+                .map(|action| moderation::ActionIntent {
+                    action,
+                    contributors: Vec::new(),
                 })
                 .collect::<Vec<_>>();
-            if !actions.is_empty() {
+            if !action_intents.is_empty() {
                 self.execute_rule_actions(
-                    app,
+                    Some(app),
                     account_id,
                     self.gateway.session_identity().await?.0,
                     message,
-                    &actions,
-                    &[],
+                    &action_intents,
                     true,
                 )
                 .await;
@@ -3254,24 +3776,104 @@ impl BackendRuntime {
                         .await;
                 }
             }
+            let _ = self
+                .database
+                .record_audit(AuditEvent {
+                    id: 0,
+                    account_id: account_id.into(),
+                    group_id: group.group_id,
+                    user_id: message.user_id,
+                    actor: "DH BOT".into(),
+                    event: "ai_reply_completed".into(),
+                    level: "info".into(),
+                    details: serde_json::json!({
+                        "messageId": message.id,
+                        "queueMs": queue_ms,
+                        "cacheHit": cache_hit,
+                        "cacheEligible": cacheable,
+                        "cacheStored": cache_stored,
+                        "decisionActions": decision_action_count,
+                        "decisionTasks": decision_task_count,
+                        "knowledgeCacheHit": knowledge_cache_hit,
+                        "knowledgeChunks": request.knowledge.len(),
+                        "knowledgeMs": knowledge_ms,
+                        "modelMs": model_ms,
+                        "providerAttempts": provider_attempts,
+                        "providerName": selected_endpoint.as_ref().map(|endpoint| endpoint.name.as_str()).unwrap_or(""),
+                        "model": selected_endpoint.as_ref().map(|endpoint| endpoint.model.as_str()).unwrap_or(""),
+                        "backend": selected_endpoint.as_ref().map(|endpoint| endpoint.api_backend.as_str()).unwrap_or(""),
+                        "reasoningEffort": selected_endpoint.as_ref().map(|endpoint| endpoint.reasoning_effort.as_str()).unwrap_or(""),
+                        "failover": provider_attempts > 1,
+                        "totalMs": total_started.elapsed().as_millis(),
+                        "status": "succeeded"
+                    })
+                    .to_string(),
+                    created_at: Utc::now(),
+                })
+                .await;
             Ok(())
         }
         .await;
-        let _ = self
-            .database
-            .finish_ai_run(
-                account_id.to_string(),
-                run_key,
-                result.is_ok(),
-                result
+        match result {
+            Ok(()) => {
+                let _ = self
+                    .database
+                    .finish_ai_run(account_id.to_string(), run_key, true, String::new())
+                    .await;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self
+                    .database
+                    .record_audit(AuditEvent {
+                        id: 0,
+                        account_id: account_id.into(),
+                        group_id: group.group_id,
+                        user_id: message.user_id,
+                        actor: "DH BOT".into(),
+                        event: "ai_reply_failed".into(),
+                        level: "warning".into(),
+                        details: serde_json::json!({
+                            "messageId": message.id,
+                            "status": "failed",
+                            "error": error.message,
+                            "fallback": "ai-service-unavailable"
+                        })
+                        .to_string(),
+                        created_at: Utc::now(),
+                    })
+                    .await;
+                let fallback = self
+                    .enqueue_text_effect(
+                        account_id,
+                        group.group_id,
+                        "AI 服务暂时连接不上，请稍后再试。",
+                        "ai-reply-fallback",
+                        format!("ai-reply-fallback:{}", message.id),
+                        serde_json::json!({
+                            "messageId": message.id,
+                            "userId": message.user_id,
+                            "providerError": true,
+                        }),
+                    )
+                    .await;
+                let fallback_error = fallback
                     .as_ref()
                     .err()
-                    .map(|error| error.message.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            )
-            .await;
-        result
+                    .map(|fallback_error| fallback_error.message.clone())
+                    .unwrap_or_default();
+                let _ = self
+                    .database
+                    .finish_ai_run(
+                        account_id.to_string(),
+                        run_key,
+                        fallback.is_ok(),
+                        fallback_error,
+                    )
+                    .await;
+                fallback
+            }
+        }
     }
 
     async fn ai_permission(
@@ -3304,12 +3906,51 @@ impl BackendRuntime {
             .unwrap_or(default)
     }
 
-    async fn gateway_secret(&self, key: &str) -> String {
-        self.secrets
-            .load()
-            .ok()
-            .and_then(|values| values.get(key).cloned())
-            .unwrap_or_default()
+    async fn ai_configs(
+        &self,
+        account_id: &str,
+        timeout: Duration,
+    ) -> AppResult<(Vec<AiConfig>, String)> {
+        self.database
+            .ensure_ai_provider_endpoints(account_id.to_string())
+            .await?;
+        let endpoints = self
+            .database
+            .list_ai_provider_endpoints(account_id.to_string())
+            .await?;
+        let secrets = self.secrets.load().unwrap_or_default();
+        let mut revision = Sha256::new();
+        let configs = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.enabled)
+            .map(|endpoint| {
+                revision.update(endpoint.id.to_le_bytes());
+                revision.update(endpoint.updated_at.to_rfc3339().as_bytes());
+                revision.update([0]);
+                AiConfig {
+                    base_url: endpoint.base_url.clone(),
+                    webhook_url: endpoint.webhook_url.clone(),
+                    api_backend: endpoint.api_backend.clone(),
+                    model: endpoint.model.clone(),
+                    reasoning_effort: endpoint.reasoning_effort.clone(),
+                    api_key: secrets
+                        .get(&endpoint.secret_ref)
+                        .cloned()
+                        .unwrap_or_default(),
+                    timeout,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok((configs, format!("{:x}", revision.finalize())))
+    }
+
+    async fn ai_provider(
+        &self,
+        account_id: &str,
+        timeout: Duration,
+    ) -> AppResult<(Arc<dyn AiProvider>, String)> {
+        let (configs, revision) = self.ai_configs(account_id, timeout).await?;
+        Ok((self.ai_factory.create(configs)?, revision))
     }
 
     #[cfg(feature = "fixture")]
@@ -3453,6 +4094,42 @@ impl BackendRuntime {
     }
 }
 
+fn message_audit_details(
+    message: &Message,
+    sequence: u64,
+    processing_state: &str,
+    result: &str,
+) -> String {
+    serde_json::json!({
+        "direction": "incoming",
+        "messageId": message.id,
+        "serverMessageId": message.server_message_id,
+        "sequence": sequence,
+        "kind": message.kind,
+        "senderName": message.sender_name,
+        "contentPreview": audit_content_preview(&message.text),
+        "processingState": processing_state,
+        "source": message.source_kind,
+        "flow": message.flow,
+        "result": result,
+    })
+    .to_string()
+}
+
+fn audit_content_preview(value: &str) -> String {
+    let normalized = redact(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = normalized.chars();
+    let preview = chars.by_ref().take(120).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
 fn redact_gateway_receipt(mut receipt: GatewayReceipt) -> GatewayReceipt {
     receipt.route = redact(&receipt.route);
     receipt.status = redact(&receipt.status);
@@ -3516,29 +4193,139 @@ fn contiguous_ack_sequence(records: &[GatewayRecord], ackable_event_ids: &HashSe
         .unwrap_or(0)
 }
 
-fn message_explicitly_mentions(message: &Message, account_id: &str) -> bool {
+fn message_explicitly_mentions(message: &Message, account_id: &str, user_id: i64) -> bool {
     if ai::is_mentioned(&message.text) {
         return true;
     }
     let Ok(metadata) = serde_json::from_str::<Value>(&message.mentions_json) else {
         return false;
     };
-    fn contains_account(value: &Value, account_id: &str) -> bool {
+    let user_id = user_id.to_string();
+    fn scalar_matches(value: &Value, account_id: &str, user_id: &str) -> bool {
         match value {
-            Value::String(value) => value.eq_ignore_ascii_case(account_id),
+            Value::String(value) => value.eq_ignore_ascii_case(account_id) || value == user_id,
+            Value::Number(value) => value.to_string() == account_id || value.to_string() == user_id,
+            _ => false,
+        }
+    }
+    fn contains_account(value: &Value, account_id: &str, user_id: &str) -> bool {
+        match value {
+            Value::String(_) | Value::Number(_) => scalar_matches(value, account_id, user_id),
             Value::Array(values) => values
                 .iter()
-                .any(|value| contains_account(value, account_id)),
+                .any(|value| contains_account(value, account_id, user_id)),
             Value::Object(values) => values.iter().any(|(key, value)| {
-                matches!(
+                (matches!(
                     key.as_str(),
-                    "account" | "accid" | "nimId" | "accountId" | "target"
-                ) && contains_account(value, account_id)
+                    "account" | "accid" | "nimId" | "accountId" | "target" | "uid"
+                ) && scalar_matches(value, account_id, user_id))
+                    || (matches!(value, Value::Array(_) | Value::Object(_))
+                        && contains_account(value, account_id, user_id))
             }),
             _ => false,
         }
     }
-    contains_account(&metadata, account_id)
+    contains_account(&metadata, account_id, &user_id)
+}
+
+fn filter_ai_actions(
+    actions: Vec<RuleAction>,
+    allow_mute: bool,
+    allow_remove: bool,
+) -> Vec<RuleAction> {
+    actions
+        .into_iter()
+        .filter(|action| match action.kind.as_str() {
+            "mute" | "unmute" => allow_mute,
+            "remove" => allow_remove,
+            _ => false,
+        })
+        .collect()
+}
+
+fn filter_ai_rule_intents(
+    intents: Vec<moderation::ActionIntent>,
+    allow_recall: bool,
+    allow_mute: bool,
+    allow_remove: bool,
+    allow_notify: bool,
+) -> Vec<moderation::ActionIntent> {
+    intents
+        .into_iter()
+        .filter(|intent| match intent.action.kind.as_str() {
+            "recall" => allow_recall,
+            "mute" | "unmute" => allow_mute,
+            "remove" | "blacklist" => allow_remove,
+            "notify" => allow_notify,
+            _ => false,
+        })
+        .collect()
+}
+
+fn message_supports_ai_rules(kind: &str, text: &str) -> bool {
+    kind == "text" && !text.trim().is_empty()
+}
+
+fn preferred_member_display_name(
+    card_name: &str,
+    managed_card_name: &str,
+    nickname: &str,
+) -> Option<String> {
+    [card_name, managed_card_name, nickname]
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_message_kind(raw_type: Option<&str>, format: i64, has_text: bool) -> &'static str {
+    match raw_type {
+        Some("text") => "text",
+        Some("image") => "image",
+        Some("card") => "card",
+        Some("notification") | Some("notice") => "notice",
+        Some("custom") if has_text => "text",
+        Some(_) => "other",
+        None => match format {
+            0 => "text",
+            1 => "image",
+            13 => "card",
+            7 | 8 => "notice",
+            _ if has_text => "text",
+            _ => "other",
+        },
+    }
+}
+
+fn normalized_message_text(decoded: &Value, raw: &Value) -> String {
+    decoded
+        .pointer("/content/data")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            decoded
+                .pointer("/mentions/content/data")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            decoded
+                .pointer("/aite/content/data")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            raw.pointer("/mentions/content/data")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| raw.pointer("/aite/content/data").and_then(Value::as_str))
+        .or_else(|| raw.get("text").and_then(Value::as_str))
+        .or_else(|| raw.get("content").and_then(Value::as_str))
+        .unwrap_or_else(|| {
+            if decoded.is_null() {
+                "[消息解码失败]"
+            } else {
+                ""
+            }
+        })
+        .to_string()
 }
 
 fn parse_semantic_scores(reply: &str, categories: &[String]) -> AppResult<HashMap<String, f64>> {
@@ -3576,6 +4363,21 @@ fn parse_semantic_scores(reply: &str, categories: &[String]) -> AppResult<HashMa
         scores.insert(category.clone(), score);
     }
     Ok(scores)
+}
+
+fn semantic_response_preview(value: &str) -> String {
+    let compact = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect::<String>();
+    if compact.is_empty() {
+        "[空]".into()
+    } else {
+        compact
+    }
 }
 
 fn placeholder_member(account_id: &str, message: &Message) -> Member {
@@ -3646,6 +4448,81 @@ mod tests {
         (directory, paths)
     }
 
+    fn action(kind: &str) -> RuleAction {
+        RuleAction {
+            kind: kind.into(),
+            duration_seconds: 600,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn ai_decisions_never_control_recall() {
+        let actions = filter_ai_actions(
+            vec![action("recall"), action("mute"), action("remove")],
+            true,
+            true,
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mute", "remove"]
+        );
+    }
+
+    #[test]
+    fn ai_rule_actions_require_their_independent_permissions() {
+        let intents = ["recall", "mute", "remove", "blacklist", "notify"]
+            .into_iter()
+            .map(|kind| moderation::ActionIntent {
+                action: action(kind),
+                contributors: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let allowed = filter_ai_rule_intents(intents, true, false, false, true);
+        assert_eq!(
+            allowed
+                .iter()
+                .map(|intent| intent.action.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recall", "notify"]
+        );
+    }
+
+    #[test]
+    fn ai_rules_only_classify_non_empty_text_messages() {
+        assert!(message_supports_ai_rules("text", "正常文本"));
+        assert!(!message_supports_ai_rules("text", ""));
+        assert!(!message_supports_ai_rules("image", "[消息解码失败]"));
+    }
+
+    #[test]
+    fn member_card_name_is_preferred_for_message_and_audit_display() {
+        assert_eq!(
+            preferred_member_display_name("我知", "DH群员0001", "我不知道啊").as_deref(),
+            Some("我知")
+        );
+    }
+
+    #[test]
+    fn http_business_1001_is_terminal_and_never_retried() {
+        let mut metadata = crate::error::GatewayErrorMetadata::new(
+            "/v1/group/message-rollback",
+            crate::error::GatewayErrorLayer::Business,
+        );
+        metadata.kind = crate::error::GatewayErrorKind::Business;
+        metadata.business_code = Some(1001);
+        let error = AppError::new("gateway_business", "禁止调用此接口")
+            .with_gateway(metadata)
+            .retryable();
+        assert_eq!(
+            classify_effect_error(&error),
+            EffectDispatchStatus::TerminalFailed
+        );
+    }
+
     #[test]
     fn connection_loop_never_schedules_member_roster_refreshes() {
         let source = include_str!("runtime.rs");
@@ -3708,6 +4585,161 @@ mod tests {
             .map(gateway_record_id)
             .collect::<HashSet<_>>();
         assert_eq!(contiguous_ack_sequence(&records, &ackable), 3);
+    }
+
+    #[test]
+    fn real_wang_mention_metadata_matches_logged_in_account() {
+        let mut message = Message {
+            id: 1,
+            account_id: "1667937946".into(),
+            group_id: 1143980,
+            server_message_id: "message".into(),
+            sequence: 1,
+            user_id: 31846829,
+            sender_name: "成员".into(),
+            kind: "text".into(),
+            text: "@迪奥 你好".into(),
+            sent_at: Utc::now(),
+            received_at: Utc::now(),
+            processed_at: None,
+            acknowledged_at: None,
+            processing_state: "pending".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: serde_json::json!({
+                "AiTeInfo": [{"end": 4, "nick": "迪奥", "uid": 1667937946_i64}],
+                "content": {"data": "@迪奥 你好", "maskWords": []}
+            })
+            .to_string(),
+            source_kind: Some("onmsg".into()),
+            flow: Some("in".into()),
+        };
+        assert!(message_explicitly_mentions(&message, "1667937946", 9798577));
+        assert!(!message_explicitly_mentions(&message, "other-account", 123));
+        message.mentions_json = serde_json::json!({
+            "AiTeInfo": [{"end": 4, "nick": "迪奥", "uid": 9798577_i64}],
+            "content": {"data": "@迪奥 你好", "maskWords": []}
+        })
+        .to_string();
+        assert!(message_explicitly_mentions(&message, "1667937946", 9798577));
+    }
+
+    #[test]
+    fn decoded_custom_text_is_classified_as_text() {
+        assert_eq!(normalized_message_kind(Some("custom"), 99, true), "text");
+        assert_eq!(normalized_message_kind(Some("custom"), 99, false), "other");
+        assert_eq!(normalized_message_kind(None, 0, false), "text");
+    }
+
+    #[tokio::test]
+    async fn raw_nim_sender_is_resolved_through_the_identity_alias() {
+        let (_directory, paths) = test_paths();
+        let database = Database::open(&paths).unwrap();
+        let now = Utc::now();
+        database
+            .upsert_account(&Account {
+                id: FIXTURE_ACCOUNT.into(),
+                display_name: "测试账号".into(),
+                role: "admin".into(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        database
+            .upsert_group(&Group {
+                account_id: FIXTURE_ACCOUNT.into(),
+                group_id: FIXTURE_GROUP,
+                name: "测试群".into(),
+                owner_user_id: 10001,
+                enabled: true,
+                ai_enabled: false,
+                moderation_enabled: true,
+                machine_rules_enabled: true,
+                ai_rules_enabled: false,
+                manual_takeover: false,
+                welcome_message: String::new(),
+                updated_at: now,
+            })
+            .unwrap();
+        database
+            .upsert_member(&Member {
+                account_id: FIXTURE_ACCOUNT.into(),
+                group_id: FIXTURE_GROUP,
+                user_id: 31846829,
+                nim_id: "1938341073".into(),
+                nickname: "其他成员".into(),
+                card_name: "其他成员".into(),
+                original_card_name: String::new(),
+                managed_card_name: String::new(),
+                card_suffix: String::new(),
+                role: "member".into(),
+                account_state: String::new(),
+                blacklisted: false,
+                present: true,
+                join_source: "baseline".into(),
+                prompt_read: true,
+                locked_card_name: String::new(),
+                violation_count: 0,
+                discovered_at: now,
+                joined_at: None,
+                last_seen_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let database = DatabaseExecutor::start(database).unwrap();
+        let runtime = BackendRuntime::new(
+            database.clone(),
+            Arc::new(FixtureGateway::new_default()),
+            SecretStore::new(&paths.secrets),
+            Arc::new(ShutdownSignal::default()),
+            Logger::new(&paths.logs),
+        );
+        let raw = serde_json::json!({
+            "seq": 1,
+            "groupId": FIXTURE_GROUP,
+            "idServer": "raw-nim-message",
+            "scene": "team",
+            "from": "1938341073",
+            "flow": "in",
+            "type": "text",
+            "content": "测试消息",
+            "decoded": null
+        });
+        let job = runtime
+            .normalize_message(FIXTURE_ACCOUNT, 10001, &raw)
+            .await
+            .unwrap();
+        assert_eq!(job.message.user_id, 31846829);
+        database.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn real_wang_mention_uses_readable_text_instead_of_encrypted_content() {
+        let raw = serde_json::json!({
+            "type": "custom",
+            "content": "ENCRYPTED_PAYLOAD",
+            "decoded": {
+                "mentions": {
+                    "AiTeInfo": [{"nick": "迪奥", "uid": 1667937946_i64}],
+                    "content": {"data": "@迪奥 你好", "maskWords": []}
+                }
+            }
+        });
+        assert_eq!(normalized_message_text(&raw["decoded"], &raw), "@迪奥 你好");
+
+        let legacy_raw = serde_json::json!({
+            "type": "custom",
+            "content": "ENCRYPTED_PAYLOAD",
+            "mentions": {
+                "AiTeInfo": [{"nick": "迪奥", "uid": 1667937946_i64}],
+                "content": {"data": "@迪奥 你好", "maskWords": []}
+            }
+        });
+        assert_eq!(
+            normalized_message_text(&Value::Null, &legacy_raw),
+            "@迪奥 你好"
+        );
     }
 
     #[test]
@@ -3827,6 +4859,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_machine_rule_recalls_another_members_message_once() {
+        let (_directory, paths) = test_paths();
+        let database = Database::open(&paths).unwrap();
+        let database = DatabaseExecutor::start(database).unwrap();
+        let fixture = Arc::new(FixtureGateway::new_default());
+        fixture
+            .emit_message(
+                FIXTURE_GROUP,
+                10006,
+                "请提供验证码",
+                Some(88),
+                Some("machine-rule-message".into()),
+            )
+            .await
+            .unwrap();
+        let runtime = BackendRuntime::new(
+            database.clone(),
+            fixture.clone(),
+            SecretStore::new(&paths.secrets),
+            Arc::new(ShutdownSignal::default()),
+            Logger::new(&paths.logs),
+        );
+        let message = Message {
+            id: 88,
+            account_id: FIXTURE_ACCOUNT.into(),
+            group_id: FIXTURE_GROUP,
+            server_message_id: "machine-rule-message".into(),
+            sequence: 88,
+            user_id: 10006,
+            sender_name: "普通成员".into(),
+            kind: "text".into(),
+            text: "请提供验证码".into(),
+            sent_at: Utc::now(),
+            received_at: Utc::now(),
+            processed_at: None,
+            acknowledged_at: None,
+            processing_state: "processing".into(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: "[]".into(),
+            source_kind: Some("onmsg".into()),
+            flow: Some("in".into()),
+        };
+        let intent = moderation::ActionIntent {
+            action: action("recall"),
+            contributors: vec![moderation::ActionContributor {
+                rule_id: 7,
+                rule_name: "验证码风险".into(),
+                priority: 3,
+            }],
+        };
+        let ai_intent = moderation::ActionIntent {
+            action: action("recall"),
+            contributors: vec![moderation::ActionContributor {
+                rule_id: 13,
+                rule_name: "AI 诈骗识别".into(),
+                priority: 3,
+            }],
+        };
+        for candidate in [&intent, &ai_intent] {
+            runtime
+                .execute_rule_actions(
+                    None,
+                    FIXTURE_ACCOUNT,
+                    10001,
+                    &message,
+                    std::slice::from_ref(candidate),
+                    true,
+                )
+                .await;
+        }
+        let items = database
+            .claim_effect_outbox(Some(FIXTURE_ACCOUNT.into()), 10)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        let permit = runtime.gateway.automatic_write_permit().await.unwrap();
+        runtime
+            .dispatch_effect_permitted(None, items[0].clone(), &permit)
+            .await;
+        let snapshot = fixture.snapshot().await;
+        let recalls = snapshot
+            .actions
+            .iter()
+            .filter(|item| item.kind == "recall")
+            .collect::<Vec<_>>();
+        assert_eq!(recalls.len(), 1);
+        assert_eq!(recalls[0].group_id, FIXTURE_GROUP);
+        assert_eq!(recalls[0].user_id, 10006);
+        assert_eq!(recalls[0].text, "machine-rule-message");
+        assert_eq!(
+            snapshot.recalled_messages,
+            vec!["machine-rule-message".to_string()]
+        );
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn roster_reconciliation_enqueues_offline_member_card_and_welcome_job() {
         let (_directory, paths) = test_paths();
         let database = Database::open(&paths).unwrap();
@@ -3895,10 +5026,15 @@ mod tests {
             .list_card_jobs(FIXTURE_ACCOUNT.into(), FIXTURE_GROUP, 20)
             .await
             .unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].user_id, 10017);
-        assert_eq!(jobs[0].state, "queued");
-        assert!(jobs[0].welcome_pending);
+        // The new member is queued with a welcome, while the existing `1`
+        // and `.` fixture cards are independently repaired as malformed
+        // group-card values.
+        assert_eq!(jobs.len(), 3);
+        let joined = jobs.iter().find(|job| job.user_id == 10017).unwrap();
+        assert_eq!(joined.state, "queued");
+        assert!(joined.welcome_pending);
+        assert!(jobs.iter().any(|job| job.user_id == 10004));
+        assert!(jobs.iter().any(|job| job.user_id == 10005));
         database.shutdown().await.unwrap();
     }
 

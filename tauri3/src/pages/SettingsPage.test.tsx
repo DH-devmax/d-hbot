@@ -24,7 +24,7 @@ describe('AI 助手离群测试', () => {
 
   it('passes the optional built-in knowledge flag and reports the source', async () => {
     render(<AiAssistantPanel
-      aiSettings={{ base_url: '', webhook_url: '', model: 'deepseek-v4-pro', api_key_configured: false }}
+      aiSettings={{ base_url: '', webhook_url: '', api_backend: 'chat_completions', model: 'deepseek-v4-pro', api_key_configured: false }}
       setAiSettings={vi.fn()}
       refresh={vi.fn()}
       onError={vi.fn()}

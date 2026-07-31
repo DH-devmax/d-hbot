@@ -9,7 +9,7 @@ DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管
 - 多群组与成员同步，以 `groupId` 识别群，以 `userId` / `nimId` 识别成员。
 - 确定性群管规则、群名片、黑名单、知识库、AI 回复、任务、每日摘要和定时开关群。
 - AI 群回复只由明确 `@DH` 或旺商聊提及元数据触发。
-- SQLite schema v6，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
+- SQLite schema v11，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
 - Windows 托盘、单实例、旺商聊 DevTools 启动、固定登录分区和 UAC 维护流程。
 
 ## 本地构建与测试
@@ -45,10 +45,17 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 - `package/DH-BOT-Default-Rules.json`：DH BOT 默认群管规则模板（兼容 ZCG 规则行为）。
 - `docs/DH使用手册.md`：中文使用手册。
 - `docs/DH-Manual-ZH.pdf`：当前 Tauri 界面图解手册。
+- `docs/DIAGNOSTICS-AND-SUPPORT.md`：日志、诊断包、隐私边界与用户上报说明。
+- `tools/verify_support_bundle.py`：维护人员只读校验诊断 ZIP 的路径、清单、大小和 SHA-256。
 - `docs/ARCHITECTURE.md`：React、Tauri、Rust、SQLite 与 CDP/NIM 数据流。
+- `docs/TECHNICAL-DESIGN.md`：模块地图、消息流水线、执行器、outbox、AI 和发布门禁。
+- `docs/DATABASE-SCHEMA.md`：schema v11 表、身份约束、状态恢复和备份边界。
+- `docs/PROTOCOL-CONTRACT.md`：ZCG 基线、旺商聊专有协议、能力探测和回执错误分类。
 - `docs/FEATURE-CATALOG.md`：功能入口、命令、默认开关、权限和能力状态。
 - `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互和测试规范。
 - `docs/ISOLATION.md`：生产/开发、端口、数据、凭据和发布仓库隔离。
+- `docs/WINDOWS-TEST-HANDOFF.md`：Windows 协作者可直接执行的当前上下文、测试顺序和结果模板。
+- `docs/WINDOWS-CODEX-PROMPT.md`：可直接交给 Windows Codex 的验收提示词。
 - `archive/go-2.7-final/`：旧 Go 2.7 只读源码 ZIP、说明和 SHA-256；当前工作树不保留 Go 源码。
 
 ## 数据与发布

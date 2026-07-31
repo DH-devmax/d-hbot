@@ -1,6 +1,6 @@
 # DH BOT Developer Build
 
-开发版有两个严格区分的运行环境：真实旺商聊用于 Contract v2 能力校准，Fixture 用于本地协议、成员、消息和自动化回归。只有经过真实旺商聊校准、状态恢复、脱敏和回放的能力才能加入生产能力表。
+开发版有两个严格区分的运行环境：真实旺商聊用于 Contract v2 与专有写能力校准，Fixture 用于本地协议、成员、消息和自动化回归。ZCG 基线能力由运行时只读探测逐项开放；旺商聊专有写能力只有在真实状态恢复、脱敏和回放证据完整后才进入生产能力表。
 
 ## 启动
 
@@ -50,10 +50,10 @@ pnpm package:windows:developer
 7. 每项保存请求、双层回执、回调和状态回读，确认原状态已经恢复。
 8. 生成脱敏 Contract v2，通过回放后更新生产能力校准表并重新构建生产版。
 
-Fixture 只能验证代码逻辑，不产生真实旺商聊校准证据，也不会让生产版能力显示为已校准。能力按项开放；未采集和回放的写能力继续保持 `Unverified`。
+Fixture 只能验证代码逻辑，不产生真实旺商聊写操作证据。生产能力按项开放：ZCG 基线能力以启动时路由、Electron IPC、双层回执和 NIM 只读探测为准；旺商聊专有写能力在没有真实回读证据时显示“待首次手工验证”，不会被 Fixture 直接标为可用。
 
 开发版“调试 → 真实 9222 能力校准”会把原始轨迹写入 `%APPDATA%\DH\developer\contracts\raw`，其中记录旺商聊文件版本、页面标题与地址、主脚本 SHA-256、IPC/NIM 请求、双层响应、回调和写后回读。原始文件只保留在本机，不提交、不打包。开发版只在 `real`、`127.0.0.1:9222` 且 NIM 已就绪时允许开始采集；Fixture、9233 和 51300 会被后端拒绝。
 
-提交前使用 `node scripts/sanitize-contract-capture.mjs INPUT OUTPUT` 生成确定性脱敏副本。脚本检测到 API Key、Authorization、Cookie、密码、Token 或私钥时会终止；输出中的账号、群、成员、NIM、消息标识、公告和测试文本会按首次出现顺序替换为稳定占位值。随后执行 `pnpm verify:calibration-capture -- contracts/TRACE.sanitized.json`；只有成功、回读和恢复证据完整的能力会输出 `supported`，移出成员始终保持 `unverified`。
+提交前使用 `node scripts/sanitize-contract-capture.mjs INPUT OUTPUT` 生成确定性脱敏副本。脚本检测到 API Key、Authorization、Cookie、密码、Token 或私钥时会终止；输出中的账号、群、成员、NIM、消息标识、公告和测试文本会按首次出现顺序替换为稳定占位值。随后执行 `pnpm verify:calibration-capture -- contracts/TRACE.sanitized.json`；只有成功、回读和恢复证据完整的旺商聊专有能力会输出 `supported`，移出成员仍只开放人工确认入口。
 
-能力状态只按旺商聊文件版本与主脚本 SHA-256 的精确组合校准。未知组合保留只读同步，写能力显示为 `Unverified`，完成 Contract v2 回放后再加入校准表。
+能力状态首先由启动时的只读运行时探测决定：旺商聊页面、Electron IPC、ZCG 基线路由、双层回执结构和 NIM 方法一致时，未知脚本 SHA 也可逐项开放对应能力。应用版本和主脚本 SHA-256 继续保存为诊断指纹；路由缺失、响应结构变化或解码失败才会把能力降为 `Unavailable`。旺商聊专有公告等写能力仍需 Contract v2 的真实回读证据，未完成首验时只开放人工验证入口。

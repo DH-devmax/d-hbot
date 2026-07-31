@@ -1,5 +1,10 @@
 # DH BOT 3.0 架构
 
+本文先回答“数据如何流动”。开发时的模块边界、并发和失败语义见
+[`TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md)；数据库表和唯一约束见
+[`DATABASE-SCHEMA.md`](DATABASE-SCHEMA.md)；协议、回执和能力状态见
+[`PROTOCOL-CONTRACT.md`](PROTOCOL-CONTRACT.md)。
+
 ## 分层
 
 | 层 | 主要代码 | 职责 |
@@ -20,7 +25,7 @@ flowchart LR
   B --> C["SQLite inbox + message 事务"]
   C --> D["确认连续 bridgeSeq"]
   C --> E["按群串行派发"]
-  E --> F["规则 / AI / 任务"]
+  E --> F["机器规则 / AI 控制规则 / AI 助手 / 任务"]
   F --> G["effect_outbox"]
   G --> H["协议动作"]
   H --> I["回执 + action + audit"]
@@ -46,9 +51,32 @@ flowchart LR
 ## AI、规则与人工操作
 
 - AI 只由明确 `@DH` 或旺商聊提及元数据触发。
-- 确定性规则与 AI 自动化独立，默认模板停用，默认动作仅撤回。
+- 机器规则只运行确定性 matcher，命中后直接进入 outbox，不调用 AI；没有规则冷却，连续消息会逐条判断，账号级协议队列仍保持至少 500ms 写入间隔。
+- AI 控制规则与机器规则使用独立群开关。一个消息只发起一次语义分类请求并同时判断全部启用类别；超时只记录失败，不回退为本地猜测。
+- AI 助手聊天、AI 控制规则、机器规则和人工群控分别记录审计来源。AI 助手返回的撤回建议不会绕过独立权限进入协议层。
+- 规则支持全局或多群绑定；成员白名单使用稳定 `userId`，可按当前名、原名、DH 名称、旺商号或 NIM 身份搜索选择。角色豁免不参与 v2 规则。
+- 其他成员消息撤回优先使用 `nim.getHistoryMsgs` 精确定位，再调用 `nim.recallMsg` 并等待撤回通知；HTTP `1001` 是永久失败，不进入重试。
 - 人工群控必须由使用者点击并确认，不受 AI 开关影响。
 - 所有高影响动作在执行前重新检查当前账号、群归属、角色和能力状态。
+
+### AI 性能与主备连接
+
+```mermaid
+flowchart LR
+  A["明确提及"] --> B["知识版本与 FAQ 缓存键"]
+  B -->|命中| C["内存文字回复缓存"]
+  B -->|未命中| D["Provider Pool"]
+  D --> E["主连接"]
+  E -->|连接失败 / 429 / 5xx| F["冷却并切换一个备用连接"]
+  E -->|成功| G["纯文字结果缓存"]
+  F --> G
+  G --> H["effect_outbox"]
+```
+
+- `AiProviderPool` 按账号配置指纹复用 `reqwest::Client`、TLS 会话和 keep-alive；连接超时 2 秒，单连接最多 60 秒，一次请求最多尝试两个连接且总预算 65 秒。
+- 最近上下文限制 8 条/2400 字，知识限制 3 条/3600 字；Chat Completions 输出限制 512 tokens，Responses 输出限制 1024 tokens；人格只在 system 消息注入一次。
+- FAQ 纯文字回复使用每账号语义边界内的 512 项、10 分钟内存缓存。上下文依赖、动作、任务、预测、处罚和摘要不进入缓存。
+- 知识命中缓存 60 秒，键包含文档内容哈希和群绑定版本；文档、状态或绑定变化会自然产生新键并立即失效旧结果。
 
 ## 业务应用与预测
 
@@ -57,18 +85,40 @@ flowchart LR
   A["明确 @DH 预测"] --> B["群、AI 回复权限与人工接管检查"]
   B --> C["BusinessAppRegistry 意图路由"]
   C --> D["PredictionApp 拉取并校验数据"]
-  D --> E["去重、时间/期号校验与确定性统计"]
-  E --> F["AI 仅润色规范化结果"]
-  F --> G["文字 effect_outbox"]
+  D --> E["10 秒最新 / 60 秒历史缓存与 single-flight"]
+  E --> F["去重、真实时间/期号校验与确定性统计"]
+  F --> G["即时中文模板；AI 润色不阻塞"]
   G --> H["business_app_runs 运行记录"]
 ```
 
 - `BusinessAppRegistry` 是唯一应用入口；运行时不再使用预测专用文本分支。
-- `PredictionApp` 默认停用，账号级开启后仅适用于已启用管理、AI 自动化和 `reply` 权限的群。
+- `ZcgLotterySource` 兼容 `pcdd/jnd/btc28/bj28/tx28` 以及四类历史字段形状；动态配置失效后按 `gsdatas`、`mbf52` 顺序回退。
+- 数据源 Token 只允许从运行环境的独立凭据读取，不编译进 EXE。没有可持续凭据、真实开奖时间或通过校验的响应时，应用保持停用。
+- `PredictionApp` 默认停用，账号级开启后仅适用于已启用管理、AI 自动化和 `reply` 权限的群。首次观测到新期号先立即发送统计模板，再由受退出信号管理的单一后台 worker 预热 AI 润色文本；缓存 30 分钟并按账号、彩种、期号、算法版本和 Provider 版本隔离。
 - AI 只接收规范化统计，不接收数据源地址、认证字段或原始响应；其动作和任务输出在该应用中被忽略。
 - 过期、缺期或数据异常时不给候选方向；AI 超时或非法输出时使用固定应用模板。
 - `business_app_runs` 以稳定运行键去重，记录数据新鲜度、AI 使用状态、耗时和错误。本地测试不发群消息、不创建任务、不执行群管动作。
 
-## 连接与能力校准
+## 连接与能力探测
 
-生产版固定连接 `127.0.0.1:9222`。`GatewayCapabilities` 使用 `Supported / Unverified / Unsupported`，并绑定旺商聊文件版本和主脚本 SHA-256。未知版本允许读取，自动写能力保持待校准状态。
+生产版固定连接 `127.0.0.1:9222`。启动后通过 `9222/CDP -> Electron xclient IPC -> NIM` 执行只读探测，检查 ZCG 已验证路由签名、双层响应结构、NIM 方法和成员回调入口。应用版本与主脚本 SHA-256 只参与诊断和协议指纹，不单独锁住写能力。
+
+`GatewayCapability` 使用 `Supported / ManualVerification / Unavailable / Unsupported`，同时记录 `ZcgContract / WangElectron / NimRuntime / ManualReceipt` 来源以及人工、自动执行边界。ZCG 基线能力探测通过后直接开放；公告只读通过后允许首次手工发布，写入与回读一致后才开放批量和自动公告。
+
+每账号写操作按至少 500ms 间隔串行；群列表缓存 10 秒、成员名单缓存 30 秒，重复读取使用同一刷新任务。写后验证绕过缓存，不确定回执进入人工确认。
+
+## 诊断日志与支持包
+
+```mermaid
+flowchart LR
+  A["Runtime / Tauri command"] --> B["Logger JSONL"]
+  B --> C["日期与大小轮转"]
+  D["数据库 quick_check + 审计摘要"] --> E["调试页：生成诊断包"]
+  C --> E
+  F["协议诊断与能力摘要"] --> E
+  E --> G["原子 ZIP + SHA256SUMS"]
+```
+
+`Logger` 只写入经过统一脱敏的 JSONL 记录，包含进程会话 ID、递增序号、时间、级别和错误文字。它不记录 API Key、Token、Cookie、Authorization、密码、旺商聊登录数据或原始消息正文。日志按日期和 8 MiB 分段，保留策略是 30 天且总量不超过 64 MiB。
+
+`export_support_bundle` 在独立阻塞线程中读取数据库状态、最近审计、连接诊断、能力摘要和近期日志，之后以临时文件写入 ZIP 并原子替换。导出前再次脱敏；审计内的账号、群和成员会替换成包内稳定别名。ZIP 不含 SQLite、秘密文件、Electron Profile、原始消息或源码，包内 `SHA256SUMS.txt` 用于逐文件完整性核对。

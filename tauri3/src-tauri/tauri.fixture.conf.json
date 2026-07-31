@@ -7,6 +7,7 @@
     "beforeBuildCommand": "pnpm build:developer"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -16,7 +17,9 @@
         "minWidth": 1180,
         "minHeight": 760,
         "resizable": true,
-        "decorations": false
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
       }
     ],
     "trayIcon": {

@@ -204,10 +204,12 @@ impl BusinessApp for PredictionApp {
                     id: game.id.into(),
                     name: game.name.into(),
                     status: "unavailable".into(),
-                    detail: if error.code == "prediction_http" {
-                        "数据源返回异常，请稍后重试".into()
-                    } else {
-                        "数据源连接失败，请稍后重试".into()
+                    detail: match error.code.as_str() {
+                        "prediction_not_configured" => "数据源凭据尚未配置".into(),
+                        "prediction_auth" => "数据源凭据无效或已过期".into(),
+                        "prediction_contract" => "数据结构变化，等待适配".into(),
+                        "prediction_http" => "数据源返回异常，请稍后重试".into(),
+                        _ => "数据源连接失败，请稍后重试".into(),
                     },
                 },
             };

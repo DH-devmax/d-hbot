@@ -115,6 +115,24 @@
       "business": {"code":0,"errno":0,"msg":"ok","data":{"noticeId":"NOTICE_001"}},
       "normalizedReceipt": {"route":"/v1/group/add-notice","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
       "expectedNormalizedState": {"action":"group_announcement","groupId":"GROUP_001","noticeId":"NOTICE_001"}
+    },
+    {
+      "name": "updateGroupAnnouncement",
+      "route": "/v1/group/notice-opt",
+      "request": {"kind":"request","params":{"groupId":10001,"noticeId":"NOTICE_001","noticeContent":"NOTICE_TEXT","noticeMode":"TOP_NOTICE"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_011"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/notice-opt","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"group_announcement_updated","groupId":"GROUP_001","noticeId":"NOTICE_001"}
+    },
+    {
+      "name": "deleteGroupAnnouncement",
+      "route": "/v1/group/notice-del",
+      "request": {"kind":"request","params":{"groupId":10001,"noticeId":"NOTICE_001"}},
+      "transport": {"transportCode":200,"errno":0,"requestId":"REQUEST_012"},
+      "business": {"code":0,"errno":0,"msg":"ok","data":{}},
+      "normalizedReceipt": {"route":"/v1/group/notice-del","status":"succeeded","transportCode":200,"transportErrno":0,"businessCode":0,"businessErrno":0,"businessMessage":"OK"},
+      "expectedNormalizedState": {"action":"group_announcement_deleted","groupId":"GROUP_001","noticeId":"NOTICE_001"}
     }
   ],
   "transportFailures": [

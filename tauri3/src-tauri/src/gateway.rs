@@ -8,6 +8,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -25,12 +26,13 @@ use crate::error::{
     AppError, AppResult, GatewayErrorKind, GatewayErrorLayer, GatewayErrorMetadata,
 };
 use crate::models::{
-    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, MemberSourceError, Message,
-    RosterCompleteness,
+    Group, GroupAnnouncement, GroupMuteState, Member, MemberRef, MemberRoster, MemberSourceError,
+    Message, RosterCompleteness,
 };
 
 const GROUP_LIST_ROUTE: &str = "/v1/group/get-group-list";
 const GROUP_MEMBERS_ROUTE: &str = "/v1/group/get-group-members";
+const GROUP_MEMBER_INFO_ROUTE: &str = "/v1/group/get-group-member-info";
 const GROUP_MUTE_ROUTE: &str = "/v1/group/set-group-mute";
 const MEMBER_MUTE_ROUTE: &str = "/v1/group/set-member-mute";
 const MEMBER_UNMUTE_ROUTE: &str = "/v1/group/member-mute-cancel";
@@ -40,7 +42,31 @@ const MESSAGE_RECALL_ROUTE: &str = "/v1/group/message-rollback";
 const GROUP_NOTICE_LIST_ROUTE: &str = "/v1/group/notice-list";
 const GROUP_NOTICE_ADD_ROUTE: &str = "/v1/group/add-notice";
 const GROUP_NOTICE_UPDATE_ROUTE: &str = "/v1/group/notice-opt";
+const GROUP_NOTICE_DELETE_ROUTE: &str = "/v1/group/notice-del";
 const MAX_GATEWAY_BATCH: usize = 100;
+
+/// Built-in protocol evidence recovered from the ZCG group-management path.
+/// It contains route names only; DH BOT still executes through WangShangLiao CDP/Electron/NIM.
+pub struct ZcgLegacyProfileV1;
+
+impl ZcgLegacyProfileV1 {
+    pub const ID: &'static str = "zcg-legacy-profile-v1";
+
+    pub fn route_signatures() -> &'static [&'static str] {
+        &[
+            GROUP_LIST_ROUTE,
+            GROUP_MEMBERS_ROUTE,
+            GROUP_MEMBER_INFO_ROUTE,
+            MEMBER_MUTE_ROUTE,
+            MEMBER_UNMUTE_ROUTE,
+            MEMBER_RENAME_ROUTE,
+            MEMBER_REMOVE_ROUTE,
+            MESSAGE_RECALL_ROUTE,
+            GROUP_MUTE_ROUTE,
+            "/v1/plugins/encode-msg",
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -215,12 +241,14 @@ struct CdpSession {
 }
 
 const GATE_MIN_INTERVAL: Duration = Duration::from_millis(150);
+const WRITE_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const GATE_MAX_WAITERS: usize = 64;
 const GATE_MAX_WAIT: Duration = Duration::from_secs(10);
 
 struct GatewayRequestGate {
     lock: Arc<tokio::sync::Mutex<()>>,
     state: SyncMutex<GatewayRequestGateState>,
+    min_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -230,39 +258,54 @@ struct GatewayRequestGateState {
 }
 
 impl GatewayRequestGate {
-    fn new() -> Self {
+    fn new(min_interval: Duration) -> Self {
         Self {
             lock: Arc::new(tokio::sync::Mutex::new(())),
             state: SyncMutex::new(GatewayRequestGateState {
                 waiters: 0,
                 last_started: None,
             }),
+            min_interval,
         }
     }
 
     async fn acquire(&self, route: &str) -> AppResult<tokio::sync::OwnedMutexGuard<()>> {
+        let queued_ahead;
         {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| AppError::new("gateway_busy", "网关请求闸门状态不可用"))?;
             if state.waiters >= GATE_MAX_WAITERS {
-                return Err(
-                    AppError::new("gateway_busy", format!("网关请求排队已满：{route}")).retryable(),
-                );
+                return Err(AppError::new(
+                    "gateway_busy",
+                    format!(
+                        "旺商聊请求队列已满：{route}；当前已有 {} 个任务等待",
+                        state.waiters
+                    ),
+                )
+                .retryable());
             }
+            queued_ahead = state.waiters;
             state.waiters += 1;
         }
 
         let guard = match timeout(GATE_MAX_WAIT, self.lock.clone().lock_owned()).await {
             Ok(guard) => guard,
             Err(_) => {
+                let mut remaining = 0;
                 if let Ok(mut state) = self.state.lock() {
                     state.waiters = state.waiters.saturating_sub(1);
+                    remaining = state.waiters;
                 }
-                return Err(
-                    AppError::new("gateway_busy", format!("网关请求排队超时：{route}")).retryable(),
-                );
+                return Err(AppError::new(
+                    "gateway_busy",
+                    format!(
+                        "旺商聊请求排队超时：{route}；已等待 {} 秒，进入时前方 {queued_ahead} 个任务，当前仍有 {remaining} 个任务等待",
+                        GATE_MAX_WAIT.as_secs()
+                    ),
+                )
+                .retryable());
             }
         };
 
@@ -271,7 +314,7 @@ impl GatewayRequestGate {
             .lock()
             .ok()
             .and_then(|state| state.last_started)
-            .and_then(|started| GATE_MIN_INTERVAL.checked_sub(started.elapsed()));
+            .and_then(|started| self.min_interval.checked_sub(started.elapsed()));
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
@@ -306,7 +349,7 @@ impl CdpClient {
                 .build()
                 .map_err(|error| AppError::new("devtools_client", error.to_string()))?,
             next_id: Arc::new(AtomicU64::new(1)),
-            request_gate: Arc::new(GatewayRequestGate::new()),
+            request_gate: Arc::new(GatewayRequestGate::new(GATE_MIN_INTERVAL)),
             page_cache: Arc::new(RwLock::new(None)),
             diagnostic_cache: Arc::new(RwLock::new(None)),
             session: Arc::new(tokio::sync::Mutex::new(None)),
@@ -388,7 +431,10 @@ impl CdpClient {
     }
 
     async fn evaluate_persistent(&self, expression: &str) -> AppResult<Value> {
-        let _gate = self.request_gate.acquire("Runtime.evaluate").await?;
+        let _gate = self
+            .request_gate
+            .acquire(cdp_operation_label(expression))
+            .await?;
         let page = self.page().await?;
         let websocket = page
             .web_socket_debugger_url
@@ -432,7 +478,9 @@ impl CdpClient {
 
     pub async fn diagnose(&self) -> DiagnosticSnapshot {
         if let Some((checked_at, snapshot)) = self.diagnostic_cache.read().await.clone() {
-            if checked_at.elapsed() < Duration::from_secs(2) {
+            // Keep concurrent health reads cheap without hiding a login, logout,
+            // or NIM state transition for an entire reconnect interval.
+            if checked_at.elapsed() < Duration::from_secs(1) {
                 return snapshot;
             }
         }
@@ -487,6 +535,36 @@ impl CdpClient {
         }
         snapshot
     }
+}
+
+fn cdp_operation_label(expression: &str) -> &'static str {
+    for (needle, label) in [
+        ("routeProfile:\"zcg-legacy-v1\"", "探测旺商聊协议能力"),
+        ("/v1/group/get-group-list", "读取群列表"),
+        ("/v1/group/get-group-members", "同步群成员名单"),
+        ("/v1/group/get-group-member-info", "读取成员详情"),
+        ("/v1/group/set-member-mute", "禁言成员"),
+        ("/v1/group/member-mute-cancel", "解除成员禁言"),
+        ("/v1/group/set-member-nickname", "修改群名片"),
+        ("/v1/group/remove-group-member", "移出成员"),
+        ("/v1/group/set-group-mute", "设置全群发言状态"),
+        ("/v1/group/notice-list", "读取群公告历史"),
+        ("/v1/group/add-notice", "发布群公告"),
+        ("/v1/group/notice-opt", "编辑群公告"),
+        ("/v1/group/notice-del", "删除群公告"),
+        ("/v1/plugins/encode-msg", "编码群消息"),
+        ("nim.sendCustomMsg", "发送群消息"),
+        ("nim.recallMsg", "撤回群消息"),
+        ("nim.updateNickInTeam", "通过 NIM 修改群名片"),
+        ("state.queue.slice(0,100)", "读取消息与成员事件队列"),
+        ("state.queue=state.queue.filter", "确认消息与成员事件队列"),
+        ("queueLimit:5000", "安装消息与成员事件监听"),
+    ] {
+        if expression.contains(needle) {
+            return label;
+        }
+    }
+    "执行旺商聊页面操作"
 }
 
 async fn evaluate_cdp_session(
@@ -559,8 +637,16 @@ pub trait GroupGateway: Send + Sync {
     ) -> AppResult<GatewayReceipt>;
     async fn remove_member(&self, group_id: i64, user_id: i64) -> AppResult<GatewayReceipt>;
     async fn set_group_mute(&self, group_id: i64, muted: bool) -> AppResult<GatewayReceipt>;
+    async fn get_group_mute_state(&self, group_id: i64) -> AppResult<GroupMuteState>;
     async fn get_group_announcement(&self, _group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
         Ok(None)
+    }
+    async fn list_group_announcements(&self, group_id: i64) -> AppResult<Vec<GroupAnnouncement>> {
+        Ok(self
+            .get_group_announcement(group_id)
+            .await?
+            .into_iter()
+            .collect())
     }
     async fn set_group_announcement(
         &self,
@@ -572,33 +658,245 @@ pub trait GroupGateway: Send + Sync {
             "当前协议未开放群公告功能",
         ))
     }
+    async fn update_group_announcement(
+        &self,
+        _group_id: i64,
+        _notice_id: &str,
+        _text: &str,
+        _mode: &str,
+    ) -> AppResult<GatewayReceipt> {
+        Err(AppError::new(
+            "capability_unsupported",
+            "当前协议未开放群公告编辑功能",
+        ))
+    }
+    async fn delete_group_announcement(
+        &self,
+        _group_id: i64,
+        _notice_id: &str,
+    ) -> AppResult<GatewayReceipt> {
+        Err(AppError::new(
+            "capability_unsupported",
+            "当前协议未开放群公告删除功能",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityStatus {
     Supported,
-    Unverified,
+    #[serde(alias = "unverified")]
+    ManualVerification,
+    Unavailable,
     Unsupported,
 }
 
 impl CapabilityStatus {
+    #[allow(non_upper_case_globals)]
+    pub const Unverified: Self = Self::ManualVerification;
+
     pub fn is_supported(&self) -> bool {
         matches!(self, Self::Supported)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilitySource {
+    ZcgContract,
+    WangElectron,
+    NimRuntime,
+    ManualReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCapability {
+    pub status: CapabilityStatus,
+    pub source: CapabilitySource,
+    pub manual_allowed: bool,
+    pub automatic_allowed: bool,
+    pub reason: String,
+    pub checked_at: String,
+    pub fingerprint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GatewayCapabilityInput {
+    Legacy(CapabilityStatus),
+    Detailed {
+        status: CapabilityStatus,
+        source: CapabilitySource,
+        #[serde(default)]
+        manual_allowed: bool,
+        #[serde(default)]
+        automatic_allowed: bool,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        checked_at: String,
+        #[serde(default)]
+        fingerprint: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for GatewayCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match GatewayCapabilityInput::deserialize(deserializer)? {
+            GatewayCapabilityInput::Legacy(status) => status.into(),
+            GatewayCapabilityInput::Detailed {
+                status,
+                source,
+                manual_allowed,
+                automatic_allowed,
+                reason,
+                checked_at,
+                fingerprint,
+            } => Self {
+                status,
+                source,
+                manual_allowed,
+                automatic_allowed,
+                reason,
+                checked_at,
+                fingerprint,
+            },
+        })
+    }
+}
+
+impl GatewayCapability {
+    pub fn new(
+        status: CapabilityStatus,
+        source: CapabilitySource,
+        manual_allowed: bool,
+        automatic_allowed: bool,
+        reason: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            source,
+            manual_allowed,
+            automatic_allowed,
+            reason: reason.into(),
+            checked_at: Utc::now().to_rfc3339(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    pub fn supported(
+        source: CapabilitySource,
+        reason: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            CapabilityStatus::Supported,
+            source,
+            true,
+            true,
+            reason,
+            fingerprint,
+        )
+    }
+
+    pub fn manual_verification(
+        source: CapabilitySource,
+        reason: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            CapabilityStatus::ManualVerification,
+            source,
+            true,
+            false,
+            reason,
+            fingerprint,
+        )
+    }
+
+    pub fn unavailable(
+        source: CapabilitySource,
+        reason: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            CapabilityStatus::Unavailable,
+            source,
+            false,
+            false,
+            reason,
+            fingerprint,
+        )
+    }
+
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self::new(
+            CapabilityStatus::Unsupported,
+            CapabilitySource::WangElectron,
+            false,
+            false,
+            reason,
+            String::new(),
+        )
+    }
+
+    pub fn is_supported(&self) -> bool {
+        self.status.is_supported()
+    }
+}
+
+impl From<CapabilityStatus> for GatewayCapability {
+    fn from(status: CapabilityStatus) -> Self {
+        match status {
+            CapabilityStatus::Supported => Self::supported(
+                CapabilitySource::ManualReceipt,
+                "已通过精确契约校准",
+                String::new(),
+            ),
+            CapabilityStatus::ManualVerification => Self::manual_verification(
+                CapabilitySource::WangElectron,
+                "等待运行时或人工验证",
+                String::new(),
+            ),
+            CapabilityStatus::Unavailable => Self::unavailable(
+                CapabilitySource::WangElectron,
+                "当前运行结构未通过探测",
+                String::new(),
+            ),
+            CapabilityStatus::Unsupported => Self::unsupported("当前协议未开放"),
+        }
+    }
+}
+
+impl PartialEq<CapabilityStatus> for GatewayCapability {
+    fn eq(&self, other: &CapabilityStatus) -> bool {
+        self.status == *other
+    }
+}
+
+impl PartialEq<GatewayCapability> for CapabilityStatus {
+    fn eq(&self, other: &GatewayCapability) -> bool {
+        *self == other.status
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayCapabilities {
-    pub announcement: CapabilityStatus,
-    pub send_text: CapabilityStatus,
-    pub mute: CapabilityStatus,
-    pub recall: CapabilityStatus,
-    pub rename: CapabilityStatus,
-    pub remove_member: CapabilityStatus,
-    pub group_mute: CapabilityStatus,
-    pub member_events: CapabilityStatus,
+    pub announcement: GatewayCapability,
+    pub send_text: GatewayCapability,
+    pub mute: GatewayCapability,
+    pub recall: GatewayCapability,
+    pub rename: GatewayCapability,
+    pub remove_member: GatewayCapability,
+    pub group_mute: GatewayCapability,
+    pub member_events: GatewayCapability,
 }
 
 #[async_trait]
@@ -632,6 +930,16 @@ pub trait RuntimeGateway: GroupGateway {
         _app_file_version: &str,
         _main_script_sha256: &str,
     ) -> GatewayCapabilities {
+        self.capabilities()
+    }
+    async fn probe_capabilities(
+        &self,
+        app_file_version: &str,
+        main_script_sha256: &str,
+    ) -> GatewayCapabilities {
+        self.calibrate_capabilities(app_file_version, main_script_sha256)
+    }
+    fn mark_capability_verified(&self, _capability: &str) -> GatewayCapabilities {
         self.capabilities()
     }
     fn capabilities(&self) -> GatewayCapabilities;
@@ -731,12 +1039,14 @@ impl Drop for DeveloperCalibrationFinalizationPermit {
 #[derive(Clone)]
 pub struct CdpGateway {
     cdp: CdpClient,
+    event_cdp: CdpClient,
     account_id: Arc<RwLock<String>>,
     sender_id: Arc<RwLock<i64>>,
     listener_session: Arc<RwLock<String>>,
     session_epoch: Arc<AtomicU64>,
     delivered_event_sequences: Arc<RwLock<BTreeMap<String, u64>>>,
     capabilities: Arc<SyncRwLock<GatewayCapabilities>>,
+    protocol_probe_gate: Arc<tokio::sync::Mutex<()>>,
     member_requests: Arc<RwLock<BTreeMap<i64, Arc<MemberRequest>>>>,
     member_transport_gate: Arc<tokio::sync::Mutex<()>>,
     member_throttle: Arc<SyncMutex<MemberThrottle>>,
@@ -745,6 +1055,7 @@ pub struct CdpGateway {
     group_cache: Arc<RwLock<GroupCache>>,
     group_refresh_gate: Arc<tokio::sync::Mutex<()>>,
     member_cache: Arc<RwLock<BTreeMap<i64, (Instant, MemberRoster)>>>,
+    write_gate: Arc<GatewayRequestGate>,
     automatic_write_gate: Arc<tokio::sync::RwLock<()>>,
     calibration_write_gate: Arc<tokio::sync::RwLock<()>>,
     #[cfg(feature = "fixture")]
@@ -764,14 +1075,20 @@ struct MemberRequest {
 
 impl CdpGateway {
     pub fn new(cdp: CdpClient) -> Self {
+        // Event polling must not wait behind a slow roster or write IPC call.
+        // Both clients still target the same local page and share its JS queue,
+        // but they use independent CDP WebSocket sessions and request gates.
+        let event_cdp = CdpClient::new(cdp.base_url.clone()).unwrap_or_else(|_| cdp.clone());
         Self {
             cdp,
+            event_cdp,
             account_id: Arc::new(RwLock::new(String::new())),
             sender_id: Arc::new(RwLock::new(0)),
             listener_session: Arc::new(RwLock::new(String::new())),
             session_epoch: Arc::new(AtomicU64::new(0)),
             delivered_event_sequences: Arc::new(RwLock::new(BTreeMap::new())),
             capabilities: Arc::new(SyncRwLock::new(unverified_production_capabilities())),
+            protocol_probe_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_requests: Arc::new(RwLock::new(BTreeMap::new())),
             member_transport_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_throttle: Arc::new(SyncMutex::new(MemberThrottle::default())),
@@ -780,6 +1097,7 @@ impl CdpGateway {
             group_cache: Arc::new(RwLock::new(None)),
             group_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_cache: Arc::new(RwLock::new(BTreeMap::new())),
+            write_gate: Arc::new(GatewayRequestGate::new(WRITE_MIN_INTERVAL)),
             automatic_write_gate: Arc::new(tokio::sync::RwLock::new(())),
             calibration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(feature = "fixture")]
@@ -844,6 +1162,249 @@ impl CdpGateway {
             .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
+    async fn runtime_protocol_probe(
+        &self,
+        app_file_version: &str,
+        main_script_sha256: &str,
+    ) -> GatewayCapabilities {
+        // Probing performs several IPC reads. Serialize it with the startup
+        // worker so an automatic effect cannot create a second concurrent
+        // group/member probe and trip WangShangLiao's rate protection.
+        let _probe_guard = self.protocol_probe_gate.lock().await;
+        let frozen = runtime_capabilities(app_file_version, main_script_sha256);
+        let previous = self
+            .capabilities
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| frozen.clone());
+        let runtime = match self.cdp.evaluate(PROTOCOL_PROBE_EXPRESSION).await {
+            Ok(value) => value,
+            Err(_) => {
+                // A busy CDP queue or a short-lived transport failure does not mean
+                // that the Electron routes changed. Keep the last structural result;
+                // connection diagnostics report the temporary outage separately.
+                return previous;
+            }
+        };
+        let fingerprint = protocol_fingerprint(app_file_version, main_script_sha256, &runtime);
+        let ipc_ready = runtime.get("ipcReady").and_then(Value::as_bool) == Some(true);
+        let nim_ready = runtime.get("nimReady").and_then(Value::as_bool) == Some(true);
+        let nim_send = runtime.get("sendCustomMsg").and_then(Value::as_bool) == Some(true);
+        let nim_members = runtime.get("getTeamMembers").and_then(Value::as_bool) == Some(true);
+        let nim_rename = runtime.get("updateNickInTeam").and_then(Value::as_bool) == Some(true);
+        let nim_history = runtime.get("getHistoryMsgs").and_then(Value::as_bool) == Some(true);
+        let nim_recall = runtime.get("recallMsg").and_then(Value::as_bool) == Some(true);
+        let nim_events = runtime.get("memberEvents").and_then(Value::as_bool) == Some(true);
+        let route_signatures = runtime
+            .get("routeSignatures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let has_routes = |routes: &[&str]| {
+            routes
+                .iter()
+                .all(|route| route_signatures.iter().any(|found| found == route))
+        };
+
+        if !ipc_ready {
+            return previous;
+        }
+        let groups = match self.group_infos().await {
+            Ok(groups) => Some(groups),
+            Err(_) => return previous,
+        };
+        let member_read_ok = match groups.as_ref().and_then(|items| items.first()) {
+            Some(group) => match self.list_http_members_page(group.group_id, None).await {
+                Ok(_) => true,
+                Err(_) => return previous,
+            },
+            None => groups.is_some(),
+        };
+        let zcg_ready = ipc_ready && groups.is_some() && member_read_ok;
+        let zcg = |name: &str, routes: &[&str], automatic_allowed: bool| {
+            if zcg_ready && has_routes(routes) {
+                GatewayCapability::new(
+                    CapabilityStatus::Supported,
+                    CapabilitySource::ZcgContract,
+                    true,
+                    automatic_allowed,
+                    format!("ZCG {name} 路由契约与当前 Electron IPC 响应结构匹配"),
+                    fingerprint.clone(),
+                )
+            } else {
+                GatewayCapability::unavailable(
+                    CapabilitySource::ZcgContract,
+                    format!("ZCG {name} 路由签名或只读响应结构未通过探测"),
+                    fingerprint.clone(),
+                )
+            }
+        };
+
+        let send_text = if zcg_ready && nim_ready && nim_send {
+            match self
+                .probe_message_encoding(groups.as_deref().unwrap_or_default())
+                .await
+            {
+                Ok(()) => GatewayCapability::supported(
+                    CapabilitySource::NimRuntime,
+                    "ZCG 消息编码与 NIM sendCustomMsg 已检测",
+                    fingerprint.clone(),
+                ),
+                Err(error) if error.retryable || error.delivery_outcome_unknown() => {
+                    previous.send_text.clone()
+                }
+                Err(error) => GatewayCapability::unavailable(
+                    CapabilitySource::NimRuntime,
+                    format!("消息编码结构探测失败：{}", error.message),
+                    fingerprint.clone(),
+                ),
+            }
+        } else {
+            GatewayCapability::unavailable(
+                CapabilitySource::NimRuntime,
+                "消息编码探测条件或 NIM sendCustomMsg 尚未就绪",
+                fingerprint.clone(),
+            )
+        };
+
+        let announcement = if frozen.announcement.is_supported() {
+            GatewayCapability::supported(
+                CapabilitySource::ManualReceipt,
+                "当前公告协议已有真实回执与回读证据",
+                fingerprint.clone(),
+            )
+        } else if let Some(group) = groups.as_ref().and_then(|items| items.first()) {
+            match self
+                .xclient(
+                    GROUP_NOTICE_LIST_ROUTE,
+                    json!({"groupId": group.group_id, "v": "0"}),
+                )
+                .await
+            {
+                Ok(_) => GatewayCapability::manual_verification(
+                    CapabilitySource::WangElectron,
+                    "公告只读协议已检测，首次手工发布并回读后开放自动化",
+                    fingerprint.clone(),
+                ),
+                Err(error) if error.retryable || error.delivery_outcome_unknown() => {
+                    previous.announcement.clone()
+                }
+                Err(error) => GatewayCapability::unavailable(
+                    CapabilitySource::WangElectron,
+                    format!("公告只读协议结构探测失败：{}", error.message),
+                    fingerprint.clone(),
+                ),
+            }
+        } else {
+            GatewayCapability::manual_verification(
+                CapabilitySource::WangElectron,
+                "当前账号没有可用于公告只读探测的群",
+                fingerprint.clone(),
+            )
+        };
+
+        let member_events = if nim_ready && nim_members && nim_events {
+            GatewayCapability::supported(
+                CapabilitySource::NimRuntime,
+                "NIM 成员事件监听入口已检测；快照同步继续作为兜底",
+                fingerprint.clone(),
+            )
+        } else {
+            GatewayCapability::unavailable(
+                CapabilitySource::NimRuntime,
+                "NIM 成员事件入口尚未就绪，当前使用快照同步",
+                fingerprint.clone(),
+            )
+        };
+
+        let rename_route_ready = zcg_ready && has_routes(&[MEMBER_RENAME_ROUTE]);
+        let rename = if rename_route_ready || (nim_ready && nim_rename) {
+            GatewayCapability::supported(
+                if rename_route_ready {
+                    CapabilitySource::ZcgContract
+                } else {
+                    CapabilitySource::NimRuntime
+                },
+                "ZCG 群名片路由或 NIM 回退方法已检测",
+                fingerprint.clone(),
+            )
+        } else {
+            GatewayCapability::unavailable(
+                CapabilitySource::ZcgContract,
+                "群名片路由和 NIM 回退方法均未通过探测",
+                fingerprint.clone(),
+            )
+        };
+
+        let recall = if nim_ready && nim_history && nim_recall {
+            GatewayCapability::supported(
+                CapabilitySource::NimRuntime,
+                "NIM 历史消息定位与撤回方法已检测；HTTP 撤回仅保留为诊断证据",
+                fingerprint.clone(),
+            )
+        } else {
+            GatewayCapability::unavailable(
+                CapabilitySource::NimRuntime,
+                "NIM getHistoryMsgs 或 recallMsg 尚未就绪；不回退到未经写入回读验证的 HTTP 撤回",
+                fingerprint.clone(),
+            )
+        };
+
+        let capabilities = GatewayCapabilities {
+            announcement,
+            send_text,
+            mute: zcg(
+                "成员禁言/解禁",
+                &[MEMBER_MUTE_ROUTE, MEMBER_UNMUTE_ROUTE],
+                true,
+            ),
+            recall,
+            rename,
+            remove_member: zcg("移出成员", &[MEMBER_REMOVE_ROUTE], false),
+            group_mute: zcg("全群禁言/解除", &[GROUP_MUTE_ROUTE], true),
+            member_events,
+        };
+        if let Ok(mut state) = self.capabilities.write() {
+            *state = capabilities.clone();
+        }
+        capabilities
+    }
+
+    async fn probe_message_encoding(&self, groups: &[GroupInfo]) -> AppResult<()> {
+        let Some(group) = groups.first() else {
+            return Err(AppError::new(
+                "protocol_probe",
+                "当前账号没有可用于消息编码探测的群",
+            ));
+        };
+        let sender = self.session_identity().await?.0;
+        let payload = json!({
+            "from":{"id":sender},
+            "to":{"id":group.group_id},
+            "msgDevice":1,
+            "createdAt":{"seconds":Utc::now().timestamp(),"nanos":0},
+            "msgSession":2,
+            "msgVersion":2,
+            "accountType":0,
+            "msgFormat":0,
+            "msgRole":0,
+            "msgRingtone":0,
+            "appoint":0,
+            "content":{"data":"DH_PROTOCOL_PROBE"}
+        });
+        let encoded = self
+            .cdp
+            .evaluate(&ipc_expression("encode", "/v1/plugins/encode-msg", payload))
+            .await?;
+        if decode_transport_response("/v1/plugins/encode-msg", &encoded)?.is_empty() {
+            return Err(AppError::new("protocol_probe", "消息编码结果为空"));
+        }
+        Ok(())
+    }
+
     fn calibration_write_permit(&self) -> AppResult<tokio::sync::OwnedRwLockReadGuard<()>> {
         self.calibration_write_gate
             .clone()
@@ -858,7 +1419,7 @@ impl CdpGateway {
 
     fn require_capability(
         &self,
-        status: CapabilityStatus,
+        capability_state: GatewayCapability,
         capability_key: &str,
         capability: &str,
     ) -> AppResult<()> {
@@ -875,9 +1436,9 @@ impl CdpGateway {
                 "正在执行最终恢复回读和原子导出，新的写操作已被拒绝",
             ));
         }
-        match status {
+        match capability_state.status {
             CapabilityStatus::Supported => Ok(()),
-            CapabilityStatus::Unverified => {
+            CapabilityStatus::ManualVerification => {
                 #[cfg(feature = "fixture")]
                 if self
                     .developer_calibration
@@ -886,11 +1447,19 @@ impl CdpGateway {
                 {
                     return Ok(());
                 }
-                Err(AppError::new(
-                    "capability_unverified",
-                    format!("当前旺商聊版本尚未完成{capability}能力校准"),
-                ))
+                if capability_state.manual_allowed {
+                    Ok(())
+                } else {
+                    Err(AppError::new(
+                        "capability_manual_verification",
+                        format!("{capability}需要先由管理员完成一次手工验证"),
+                    ))
+                }
             }
+            CapabilityStatus::Unavailable => Err(AppError::new(
+                "capability_unavailable",
+                format!("{capability}当前不可用：{}", capability_state.reason),
+            )),
             CapabilityStatus::Unsupported => Err(AppError::new(
                 "capability_unsupported",
                 format!("当前旺商聊版本不支持{capability}"),
@@ -982,7 +1551,12 @@ impl CdpGateway {
                     owner_user_id: int_field(value, &["ownerUserId", "groupOwnerId", "ownerId"]),
                     member_count: int_field(
                         value,
-                        &["memberCount", "groupMemberCount", "userCount"],
+                        &[
+                            "memberCount",
+                            "groupMemberCount",
+                            "groupMemberNum",
+                            "userCount",
+                        ],
                     )
                     .max(0) as usize,
                     relation: relation.into(),
@@ -1017,7 +1591,6 @@ impl CdpGateway {
             .read()
             .await
             .as_ref()
-            .filter(|(checked_at, _)| checked_at.elapsed() < Duration::from_secs(10))
             .map(|(_, groups)| groups.clone())
             .unwrap_or_default()
     }
@@ -1169,8 +1742,10 @@ impl CdpGateway {
                 continue;
             }
             let nickname = human_name_field(value, &["userNick", "nickname", "userName", "name"]);
-            let card_name =
-                human_name_field(value, &["groupMemberNick", "nick", "groupNick", "cardName"]);
+            let card_name = visible_nim_card_name(&human_name_field(
+                value,
+                &["groupMemberNick", "nick", "groupNick", "cardName"],
+            ));
             members.push(Member {
                 account_id: account_id.clone(),
                 group_id,
@@ -1220,6 +1795,7 @@ impl CdpGateway {
 
     async fn action(&self, route: &str, payload: Value) -> AppResult<GatewayReceipt> {
         require_object_payload(route, &payload)?;
+        let _write = self.write_gate.acquire(route).await?;
         let expression = ipc_expression("request", route, payload.clone());
         let result = self.cdp.evaluate(&expression).await?;
         #[cfg(feature = "fixture")]
@@ -1227,6 +1803,53 @@ impl CdpGateway {
             recorder.record_ipc(route, "request", payload, &result);
         }
         decode_action_receipt(route, &result)
+    }
+
+    async fn recall_message_via_nim(
+        &self,
+        team_id: &str,
+        message_id: &str,
+    ) -> AppResult<GatewayReceipt> {
+        let _write = self.write_gate.acquire("nim.recallMsg").await?;
+        let result = self
+            .cdp
+            .evaluate(&nim_recall_expression(team_id, message_id))
+            .await?;
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            let detail = result
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("NIM 撤回失败");
+            return Err(nim_response_error("nim.recallMsg", &result, detail));
+        }
+        let returned_id = text_field(&result, &["idServer", "messageId"]);
+        if returned_id != message_id {
+            return Err(AppError::new(
+                "write_verify_failed",
+                "NIM 撤回回执中的消息 ID 与目标不一致",
+            ));
+        }
+        let notification_verified =
+            result.get("recallNotified").and_then(Value::as_bool) == Some(true);
+        let history_verified = result.get("historyAbsent").and_then(Value::as_bool) == Some(true);
+        let verified = notification_verified || history_verified;
+        Ok(GatewayReceipt {
+            route: "nim.recallMsg".into(),
+            status: if verified { "succeeded" } else { "unknown" }.into(),
+            transport_code: None,
+            transport_errno: None,
+            business_code: Some(0),
+            business_errno: Some(0),
+            business_message: "OK".into(),
+            request_id: text_field(&result, &["requestId", "idClient"]),
+            message_id: returned_id,
+            session: String::new(),
+            acknowledged_through: 0,
+            acknowledged: 0,
+            remaining: 0,
+            dropped: 0,
+            verification: Some(if verified { "verified" } else { "unknown" }.into()),
+        })
     }
 
     async fn team_member_events(
@@ -1241,14 +1864,16 @@ impl CdpGateway {
         let now = Utc::now();
         let mut events = Vec::new();
         for record in records {
-            let team_id = text_field(&record.payload, &["teamId"]);
-            let group_id = int_field(&record.payload, &["groupId"]);
+            let team_id = text_field(&record.payload, &["teamId", "team_id"]);
+            let group_id = int_field(&record.payload, &["groupId", "group_id"]);
             let group_id = if group_id > 0 {
                 group_id
             } else {
                 groups
                     .iter()
-                    .find(|group| group.cloud_id == team_id)
+                    .find(|group| {
+                        group.cloud_id == team_id || group.group_id.to_string() == team_id
+                    })
                     .map(|group| group.group_id)
                     .unwrap_or(0)
             };
@@ -1257,18 +1882,28 @@ impl CdpGateway {
             }
             self.member_cache.write().await.remove(&group_id);
             self.group_cache.write().await.take();
-            for value in record
-                .payload
-                .get("members")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
+            let member_values = ["members", "teamMembers", "accounts", "memberList"]
+                .iter()
+                .find_map(|key| record.payload.get(*key).and_then(Value::as_array))
+                .map(|values| values.iter().collect::<Vec<_>>())
+                .or_else(|| {
+                    record
+                        .payload
+                        .get("member")
+                        .or_else(|| record.payload.get("account"))
+                        .filter(|value| value.is_object())
+                        .map(|value| vec![value])
+                })
+                .unwrap_or_default();
+            for value in member_values {
                 let nim_id = text_field(value, &["nimId", "account", "accid"]);
                 if nim_id.is_empty() {
                     continue;
                 }
-                let nickname = human_name_field(value, &["nickname", "nick", "cardName"]);
+                let nickname = visible_nim_card_name(&human_name_field(
+                    value,
+                    &["nickname", "nick", "cardName"],
+                ));
                 let user_id = int_field(value, &["userId"]);
                 let member = Member {
                     account_id: account_id.clone(),
@@ -1315,7 +1950,7 @@ impl CdpGateway {
     }
 
     pub async fn install_message_listener(&self) -> AppResult<Value> {
-        let value = self.cdp.evaluate(LISTENER_EXPRESSION).await?;
+        let value = self.event_cdp.evaluate(LISTENER_EXPRESSION).await?;
         if let Some(session) = value.get("session").and_then(Value::as_str) {
             let mut current = self.listener_session.write().await;
             if *current != session {
@@ -1337,7 +1972,7 @@ impl CdpGateway {
     }
 
     pub async fn read_batch(&self) -> AppResult<GatewayBatch> {
-        let value = self.cdp.evaluate(READ_BATCH_EXPRESSION).await?;
+        let value = self.event_cdp.evaluate(READ_BATCH_EXPRESSION).await?;
         let mut batch = parse_gateway_batch(value)?;
         let groups = self.cached_group_infos().await;
         for record in &mut batch.records {
@@ -1373,7 +2008,7 @@ impl CdpGateway {
             ));
         }
         let value = self
-            .cdp
+            .event_cdp
             .evaluate(&ack_expression(session, sequence))
             .await?;
         parse_gateway_receipt(session, sequence, value)
@@ -1459,6 +2094,42 @@ impl RuntimeGateway for CdpGateway {
             .read()
             .map(|value| value.clone())
             .unwrap_or_else(|_| unverified_production_capabilities())
+    }
+
+    async fn probe_capabilities(
+        &self,
+        app_file_version: &str,
+        main_script_sha256: &str,
+    ) -> GatewayCapabilities {
+        self.runtime_protocol_probe(app_file_version, main_script_sha256)
+            .await
+    }
+
+    fn mark_capability_verified(&self, capability: &str) -> GatewayCapabilities {
+        let mut capabilities = self.capabilities();
+        let selected = match capability {
+            "announcement" => Some(&mut capabilities.announcement),
+            "sendText" => Some(&mut capabilities.send_text),
+            "mute" => Some(&mut capabilities.mute),
+            "recall" => Some(&mut capabilities.recall),
+            "rename" => Some(&mut capabilities.rename),
+            "removeMember" => Some(&mut capabilities.remove_member),
+            "groupMute" => Some(&mut capabilities.group_mute),
+            "memberEvents" => Some(&mut capabilities.member_events),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            selected.status = CapabilityStatus::Supported;
+            selected.source = CapabilitySource::ManualReceipt;
+            selected.manual_allowed = true;
+            selected.automatic_allowed = true;
+            selected.reason = "人工写入与回读结果一致，已开放自动操作".into();
+            selected.checked_at = Utc::now().to_rfc3339();
+        }
+        if let Ok(mut state) = self.capabilities.write() {
+            *state = capabilities.clone();
+        }
+        capabilities
     }
 
     fn member_sync_paused(&self) -> bool {
@@ -1692,6 +2363,28 @@ impl RuntimeGateway for CdpGateway {
 }
 
 impl CdpGateway {
+    async fn verify_group_mute_state(&self, team_id: &str, expected: bool) -> bool {
+        if team_id.trim().is_empty() {
+            return false;
+        }
+        let expression = nim_team_mute_expression(team_id);
+        for _ in 0..8 {
+            if let Ok(value) = self.cdp.evaluate(&expression).await {
+                let actual = value.get("mute").and_then(Value::as_bool).or_else(|| {
+                    value
+                        .get("muteType")
+                        .and_then(Value::as_str)
+                        .map(|mode| !mode.eq_ignore_ascii_case("none"))
+                });
+                if actual == Some(expected) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        false
+    }
+
     async fn writable_member(&self, group_id: i64, user_id: i64) -> AppResult<Member> {
         require_positive("groupId", group_id)?;
         require_positive("userId", user_id)?;
@@ -1725,7 +2418,7 @@ impl CdpGateway {
                 "群主和管理员不能执行成员写操作",
             ));
         }
-        if member.user_id <= 0 || member.user_id == synthetic_nim_user_id(&member.nim_id) {
+        if !member_has_writable_identity(&member) {
             return Err(AppError::new(
                 "member_identity_incomplete",
                 "目标成员只有临时身份，不能执行成员写操作",
@@ -1765,10 +2458,10 @@ impl CdpGateway {
     ) -> AppResult<GatewayReceipt> {
         self.member_cache.write().await.remove(&group_id);
         let roster = self.list_members_with_backoff(group_id).await?;
-        let matches = roster.members.iter().any(|member| {
-            member.user_id == user_id
-                && (member.card_name == nickname || member.nickname == nickname)
-        });
+        let matches = roster
+            .members
+            .iter()
+            .any(|member| member.user_id == user_id && member.card_name == nickname);
         #[cfg(feature = "fixture")]
         self.calibration_restored_state(
             MEMBER_RENAME_ROUTE,
@@ -1867,6 +2560,8 @@ impl CdpGateway {
                 enabled: false,
                 ai_enabled: false,
                 moderation_enabled: false,
+                machine_rules_enabled: false,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -1941,6 +2636,12 @@ impl CdpGateway {
         }
         result
     }
+}
+
+fn member_has_writable_identity(member: &Member) -> bool {
+    member.user_id > 0
+        && !member.nim_id.trim().is_empty()
+        && member.user_id != synthetic_nim_user_id(&member.nim_id)
 }
 
 #[async_trait]
@@ -2129,11 +2830,10 @@ impl MemberRequestGateway for CdpGateway {
         let nim_returned_count = nim_values.len();
         for value in nim_values.iter() {
             let nim_id = text_field(value, &["nimId"]);
-            let card = human_name_field(value, &["cardName"]);
+            let card = visible_nim_card_name(&human_name_field(value, &["cardName"]));
             if let Some(member) = members.iter_mut().find(|member| member.nim_id == nim_id) {
-                if wire_name_missing(&member.card_name) && !wire_name_missing(&card) {
-                    member.card_name = card;
-                }
+                // 当前旺商聊用 NIM nickInTeam 保存内部映射值；群界面可见
+                // 名片以 HTTP groupMemberNick 为准。NIM 只补身份和禁言状态。
                 if value.get("mute").and_then(Value::as_bool) == Some(true) {
                     member.account_state = "NIM_MUTE".into();
                 }
@@ -2243,6 +2943,7 @@ impl GroupGateway for CdpGateway {
         if text.trim().is_empty() {
             return Err(AppError::new("invalid_argument", "发送内容为空"));
         }
+        let _write_slot = self.write_gate.acquire("/v1/plugins/encode-msg").await?;
         let sender = if *self.sender_id.read().await > 0 {
             *self.sender_id.read().await
         } else {
@@ -2334,32 +3035,10 @@ impl GroupGateway for CdpGateway {
         require_positive("userId", sender_user_id)?;
         require_non_empty("messageId", message_id)?;
         let cloud = self.resolve_cloud_id(group_id).await?;
-        let mut receipt = self
-            .action(
-                MESSAGE_RECALL_ROUTE,
-                json!({"groupCloudId":cloud,"userId":sender_user_id,"msgId":message_id}),
-            )
-            .await?;
-        if !receipt.message_id.is_empty() && receipt.message_id != message_id {
-            return Err(AppError::new(
-                "write_verify_failed",
-                "旺商聊撤回回执中的消息 ID 与目标不一致",
-            ));
-        }
-        receipt.verification = Some(
-            if receipt.message_id.is_empty() {
-                "unknown"
-            } else {
-                "verified"
-            }
-            .into(),
-        );
-        if receipt.message_id.is_empty() {
-            receipt.status = "unknown".into();
-        }
+        let receipt = self.recall_message_via_nim(&cloud, message_id).await?;
         #[cfg(feature = "fixture")]
         self.complete_calibration_operation(
-            MESSAGE_RECALL_ROUTE,
+            "nim.recallMsg",
             &receipt,
             json!({
                 "action": "recall",
@@ -2506,22 +3185,30 @@ impl GroupGateway for CdpGateway {
                 .await
             {
                 Ok(receipt) => {
-                    let receipt = self
+                    match self
                         .verify_renamed_member(group_id, target.user_id, nickname, receipt)
-                        .await?;
-                    #[cfg(feature = "fixture")]
-                    self.complete_calibration_operation(
-                        MEMBER_RENAME_ROUTE,
-                        &receipt,
-                        json!({
-                            "action": "rename",
-                            "groupId": group_id,
-                            "userId": target.user_id,
-                            "cardName": nickname,
-                            "verification": receipt.verification,
-                        }),
-                    );
-                    return Ok(receipt);
+                        .await
+                    {
+                        Ok(receipt) => {
+                            #[cfg(feature = "fixture")]
+                            self.complete_calibration_operation(
+                                MEMBER_RENAME_ROUTE,
+                                &receipt,
+                                json!({
+                                    "action": "rename",
+                                    "groupId": group_id,
+                                    "userId": target.user_id,
+                                    "cardName": nickname,
+                                    "verification": receipt.verification,
+                                }),
+                            );
+                            return Ok(receipt);
+                        }
+                        Err(error) if error.code == "write_verify_failed" => {
+                            http_error = Some(error)
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) if rename_fallback_allowed(&error) => http_error = Some(error),
                 Err(error) => return Err(error),
@@ -2632,6 +3319,13 @@ impl GroupGateway for CdpGateway {
         self.require_capability(self.capabilities().group_mute, "groupMute", "全群发言控制")?;
         require_positive("groupId", group_id)?;
         self.manager_roster(group_id).await?;
+        let group = self
+            .group_infos()
+            .await?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| AppError::new("group_not_found", "群聊不存在或当前账号不可见"))?;
+        let team_id = group.cloud_id.clone();
         #[cfg(feature = "fixture")]
         if let Some(group) = self
             .group_infos()
@@ -2654,27 +3348,17 @@ impl GroupGateway for CdpGateway {
             )
             .await?;
         *self.group_cache.write().await = None;
-        let expected = if muted { "MUTE_MEMBER" } else { "MUTE_NO" };
-        match self
-            .group_infos()
-            .await
-            .ok()
-            .and_then(|groups| groups.into_iter().find(|group| group.group_id == group_id))
-            .map(|group| group.mute_mode)
-        {
-            Some(mode) if !mode.is_empty() && mode.eq_ignore_ascii_case(expected) => {
-                #[cfg(feature = "fixture")]
-                self.calibration_restored_state(
-                    GROUP_MUTE_ROUTE,
-                    json!({"groupId": group_id}),
-                    json!({"muteMode": mode}),
-                );
-                receipt.verification = Some("verified".into());
-            }
-            Some(_) | None => {
-                receipt.status = "unknown".into();
-                receipt.verification = Some("unknown".into());
-            }
+        if self.verify_group_mute_state(&team_id, muted).await {
+            #[cfg(feature = "fixture")]
+            self.calibration_restored_state(
+                GROUP_MUTE_ROUTE,
+                json!({"groupId": group_id}),
+                json!({"muteMode": if muted { "MUTE_MEMBER" } else { "MUTE_NO" }}),
+            );
+            receipt.verification = Some("verified".into());
+        } else {
+            receipt.status = "unknown".into();
+            receipt.verification = Some("unknown".into());
         }
         #[cfg(feature = "fixture")]
         self.complete_calibration_operation(
@@ -2688,6 +3372,48 @@ impl GroupGateway for CdpGateway {
             }),
         );
         Ok(receipt)
+    }
+
+    async fn get_group_mute_state(&self, group_id: i64) -> AppResult<GroupMuteState> {
+        require_positive("groupId", group_id)?;
+        let group = self
+            .group_infos()
+            .await?
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| AppError::new("group_not_found", "群聊不存在或当前账号不可见"))?;
+        if group.cloud_id.trim().is_empty() {
+            return Err(AppError::new(
+                "group_state",
+                "群聊缺少 NIM 身份，暂时不能读取发言状态",
+            ));
+        }
+        let value = self
+            .cdp
+            .evaluate(&nim_team_mute_expression(&group.cloud_id))
+            .await?;
+        if value.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(AppError::new(
+                "group_state",
+                value
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("旺商聊没有返回群发言状态"),
+            ));
+        }
+        let muted = value.get("mute").and_then(Value::as_bool).or_else(|| {
+            value
+                .get("muteType")
+                .and_then(Value::as_str)
+                .map(|mode| !mode.is_empty() && !mode.eq_ignore_ascii_case("none"))
+        });
+        Ok(GroupMuteState {
+            group_id,
+            muted: muted.ok_or_else(|| AppError::new("group_state", "旺商聊群发言状态字段缺失"))?,
+            source: "nim.getTeam".into(),
+            checked_at: Utc::now(),
+        })
     }
 
     async fn get_group_announcement(&self, group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
@@ -2712,18 +3438,7 @@ impl GroupGateway for CdpGateway {
         } else {
             Vec::new()
         };
-        let selected = if owned.len() == 1 {
-            Some(owned[0])
-        } else if items.len() == 1 {
-            Some(&items[0])
-        } else if items.is_empty() {
-            None
-        } else {
-            return Err(AppError::new(
-                "notice_ambiguous",
-                "群公告存在多个候选，无法安全确定目标公告",
-            ));
-        };
+        let selected = owned.first().copied().or_else(|| items.first());
         Ok(selected.map(|value| GroupAnnouncement {
             group_id,
             notice_id: text_field(value, &["noticeId", "id"]),
@@ -2733,11 +3448,35 @@ impl GroupGateway for CdpGateway {
         }))
     }
 
+    async fn list_group_announcements(&self, group_id: i64) -> AppResult<Vec<GroupAnnouncement>> {
+        require_positive("groupId", group_id)?;
+        let data = self
+            .xclient(
+                GROUP_NOTICE_LIST_ROUTE,
+                json!({"groupId": group_id, "v": "0"}),
+            )
+            .await?;
+        Ok(data
+            .get("noticeInfoList")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|value| GroupAnnouncement {
+                group_id,
+                notice_id: text_field(value, &["noticeId", "id"]),
+                content: human_name_field(value, &["noticeContent", "content"]),
+                mode: text_field(value, &["noticeMode", "mode"]),
+                author_user_id: int_field(value, &["userId", "authorUserId"]),
+            })
+            .collect())
+    }
+
     async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
         let _calibration_write = self.calibration_write_permit()?;
         self.require_capability(self.capabilities().announcement, "announcement", "群公告")?;
         require_positive("groupId", group_id)?;
         require_non_empty("noticeContent", text)?;
+        let _write_slot = self.write_gate.acquire(GROUP_NOTICE_ADD_ROUTE).await?;
         self.manager_roster(group_id).await?;
         let sender = if *self.sender_id.read().await > 0 {
             *self.sender_id.read().await
@@ -2745,94 +3484,47 @@ impl GroupGateway for CdpGateway {
             self.session_identity().await?.0
         };
 
-        // 旺商聊只允许公告作者走 notice-opt；其他情况下页面会创建一条新公告。
-        let current = self
-            .xclient(
-                GROUP_NOTICE_LIST_ROUTE,
-                json!({"groupId": group_id, "v": "0"}),
-            )
-            .await?;
-        #[cfg(feature = "fixture")]
-        if let Some(baseline) = self.get_group_announcement(group_id).await? {
-            self.calibration_baseline(
-                GROUP_NOTICE_UPDATE_ROUTE,
-                json!({"groupId": group_id}),
-                json!({"noticeId": baseline.notice_id, "content": baseline.content}),
-            );
-        } else {
-            self.calibration_requires_baseline(
-                GROUP_NOTICE_UPDATE_ROUTE,
-                json!({"groupId": group_id}),
-            );
-        }
-        let notices = current
-            .get("noticeInfoList")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let own_notices = notices
-            .iter()
-            .filter(|value| int_field(value, &["userId", "authorUserId"]) == sender)
-            .collect::<Vec<_>>();
-        if own_notices.len() > 1 {
-            return Err(AppError::new(
-                "notice_ambiguous",
-                "当前账号存在多个群公告，拒绝更新不确定的公告",
-            ));
-        }
-        if let Some(existing) = own_notices.first() {
-            let notice_id = text_field(existing, &["noticeId", "id"]);
-            let content = human_name_field(existing, &["noticeContent", "content"]);
-            if !notice_id.is_empty() && content == text {
-                let mut receipt = GatewayReceipt::succeeded(GROUP_NOTICE_UPDATE_ROUTE);
-                receipt.request_id = notice_id;
-                receipt.business_message = "群公告内容已经保存，本次未重复广播".into();
-                receipt.verification = Some("not-applicable".into());
-                return Ok(receipt);
-            }
-        }
-        let own_notice_id = own_notices
-            .first()
-            .map(|value| text_field(value, &["noticeId", "id"]));
-        let (route, payload, notice_id) =
-            if let Some(notice_id) = own_notice_id.filter(|value| !value.is_empty()) {
-                (
-                    GROUP_NOTICE_UPDATE_ROUTE,
-                    json!({
-                        "groupId": group_id,
-                        "noticeId": notice_id,
-                        "noticeContent": text,
-                        "noticeMode": "COMMON_NOTICE"
-                    }),
-                    notice_id,
-                )
-            } else {
-                (
-                    GROUP_NOTICE_ADD_ROUTE,
-                    json!({
-                        "groupId": group_id,
-                        "noticeContent": text,
-                        "noticeMode": "COMMON_NOTICE"
-                    }),
-                    String::new(),
-                )
-            };
+        // “发布公告”始终创建新的历史记录；编辑旧公告必须使用带 noticeId 的独立入口。
+        let route = GROUP_NOTICE_ADD_ROUTE;
+        let payload = json!({
+            "groupId": group_id,
+            "noticeContent": text,
+            "noticeMode": "COMMON_NOTICE"
+        });
         let data = self.xclient(route, payload).await?;
-        let notice_id = if notice_id.is_empty() {
-            text_field(&data, &["noticeId", "id"])
-        } else {
-            notice_id
-        };
+        let notice_id = text_field(&data, &["noticeId", "id"]);
         if notice_id.is_empty() {
             return Err(AppError::new(
                 "notice_receipt_missing",
                 "群公告保存成功但未返回公告 ID",
             ));
         }
-        let confirmed = self
-            .get_group_announcement(group_id)
-            .await?
-            .ok_or_else(|| AppError::new("notice_verify", "群公告保存后读取不到公告"))?;
+        let notice_list = self
+            .xclient(
+                GROUP_NOTICE_LIST_ROUTE,
+                json!({"groupId": group_id, "v": "0"}),
+            )
+            .await?;
+        let notice_wire = notice_list
+            .get("noticeInfoList")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|value| text_field(value, &["noticeId", "id"]) == notice_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    "notice_verify",
+                    "群公告保存后未在公告列表中找到对应的完整公告对象",
+                )
+            })?;
+        let confirmed = GroupAnnouncement {
+            group_id,
+            notice_id: text_field(&notice_wire, &["noticeId", "id"]),
+            content: human_name_field(&notice_wire, &["noticeContent", "content"]),
+            mode: text_field(&notice_wire, &["noticeMode", "mode"]),
+            author_user_id: int_field(&notice_wire, &["userId", "authorUserId"]),
+        };
         if confirmed.notice_id != notice_id || confirmed.content != text {
             return Err(AppError::new(
                 "notice_verify",
@@ -2856,11 +3548,20 @@ impl GroupGateway for CdpGateway {
                 .map(|group| group.name)
                 .unwrap_or_default();
             let notice_payload = json!({
+                "msgDevice": 1,
+                "createdAt": {
+                    "seconds": Utc::now().timestamp(),
+                    "nanos": 0
+                },
+                "msgVersion": 2,
+                "accountType": 0,
                 "msgFormat": 8,
                 "msgSession": 2,
+                "msgRole": 0,
+                "appoint": 0,
                 "from": {"id": sender, "name": "", "avatar": ""},
-                "to": {"id": group_id, "groupCloudId": cloud, "groupName": group_name},
-                "groupNotice": {"content": text, "noticeId": notice_id}
+                "to": {"id": group_id, "name": group_name},
+                "groupNotice": notice_wire
             });
             let encoded = self
                 .cdp
@@ -2970,6 +3671,89 @@ impl GroupGateway for CdpGateway {
         );
         Ok(receipt)
     }
+
+    async fn update_group_announcement(
+        &self,
+        group_id: i64,
+        notice_id: &str,
+        text: &str,
+        mode: &str,
+    ) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
+        self.require_capability(self.capabilities().announcement, "announcement", "群公告")?;
+        require_positive("groupId", group_id)?;
+        require_non_empty("noticeId", notice_id)?;
+        require_non_empty("noticeContent", text)?;
+        let notice_mode = match mode {
+            "COMMON_NOTICE" | "TOP_NOTICE" => mode,
+            _ => return Err(AppError::new("notice_mode", "群公告模式只支持普通或置顶")),
+        };
+        let _write_slot = self.write_gate.acquire(GROUP_NOTICE_UPDATE_ROUTE).await?;
+        self.manager_roster(group_id).await?;
+        let data = self
+            .xclient(
+                GROUP_NOTICE_UPDATE_ROUTE,
+                json!({
+                    "groupId": group_id,
+                    "noticeId": notice_id,
+                    "noticeContent": text,
+                    "noticeMode": notice_mode,
+                }),
+            )
+            .await?;
+        let mut receipt = GatewayReceipt::succeeded(GROUP_NOTICE_UPDATE_ROUTE);
+        receipt.request_id = receipt_identifier(&data, &["requestId", "id", "traceId"]);
+        let confirmed = self
+            .list_group_announcements(group_id)
+            .await?
+            .into_iter()
+            .find(|notice| notice.notice_id == notice_id);
+        if confirmed
+            .as_ref()
+            .is_some_and(|notice| notice.content == text && notice.mode == notice_mode)
+        {
+            receipt.verification = Some("verified".into());
+        } else {
+            receipt.status = "unknown".into();
+            receipt.verification = Some("unknown".into());
+            receipt.business_message = "公告编辑回执已返回，但回读内容或置顶状态不一致".into();
+        }
+        Ok(receipt)
+    }
+
+    async fn delete_group_announcement(
+        &self,
+        group_id: i64,
+        notice_id: &str,
+    ) -> AppResult<GatewayReceipt> {
+        let _calibration_write = self.calibration_write_permit()?;
+        self.require_capability(self.capabilities().announcement, "announcement", "群公告")?;
+        require_positive("groupId", group_id)?;
+        require_non_empty("noticeId", notice_id)?;
+        let _write_slot = self.write_gate.acquire(GROUP_NOTICE_DELETE_ROUTE).await?;
+        self.manager_roster(group_id).await?;
+        let data = self
+            .xclient(
+                GROUP_NOTICE_DELETE_ROUTE,
+                json!({"groupId": group_id, "noticeId": notice_id}),
+            )
+            .await?;
+        let mut receipt = GatewayReceipt::succeeded(GROUP_NOTICE_DELETE_ROUTE);
+        receipt.request_id = receipt_identifier(&data, &["requestId", "id", "traceId"]);
+        let still_exists = self
+            .list_group_announcements(group_id)
+            .await?
+            .iter()
+            .any(|notice| notice.notice_id == notice_id);
+        if still_exists {
+            receipt.status = "unknown".into();
+            receipt.verification = Some("unknown".into());
+            receipt.business_message = "公告删除回执已返回，但公告历史中仍能读取到该公告".into();
+        } else {
+            receipt.verification = Some("verified".into());
+        }
+        Ok(receipt)
+    }
 }
 
 fn announcement_delivery_unknown(route: &str, notice_id: &str, detail: &str) -> GatewayReceipt {
@@ -3007,8 +3791,8 @@ struct GroupInfo {
     name: String,
     owner_user_id: i64,
     member_count: usize,
-    #[allow(dead_code)]
     relation: String,
+    #[cfg_attr(not(feature = "fixture"), allow(dead_code))]
     mute_mode: String,
 }
 
@@ -3021,6 +3805,22 @@ fn ipc_expression(kind: &str, route: &str, payload: Value) -> String {
     )
 }
 
+fn protocol_fingerprint(
+    app_file_version: &str,
+    main_script_sha256: &str,
+    runtime: &Value,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ZcgLegacyProfileV1::ID.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(app_file_version.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(main_script_sha256.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(runtime).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
+}
+
 fn nim_send_expression(target: &str, content: &str) -> String {
     let input = json!({"target":target,"content":content});
     format!(
@@ -3028,10 +3828,24 @@ fn nim_send_expression(target: &str, content: &str) -> String {
     )
 }
 
+fn nim_recall_expression(target: &str, message_id: &str) -> String {
+    let input = json!({"target":target,"messageId":message_id});
+    format!(
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{const requestId="dh-nim-recall-"+Date.now()+"-"+Math.random();let settled=false;let recallNotified=false;const restorers=[];const includesMessage=value=>{{if(value==null)return false;if(Array.isArray(value))return value.some(includesMessage);if(typeof value==="object"){{if(String(value.idServer||value.messageId||"")===String(input.messageId))return true;return Object.values(value).some(includesMessage);}}return false;}};const restore=()=>{{for(const item of restorers)item.options[item.name]=item.original;}};const finish=value=>{{if(settled)return;settled=true;restore();resolve({{requestId,...value}});}};if(!window.nim||typeof window.nim.getHistoryMsgs!=="function"||typeof window.nim.recallMsg!=="function"){{finish({{ok:false,errorMessage:"NIM recall unavailable",errorCode:503}});return;}}const history=()=>new Promise(done=>window.nim.getHistoryMsgs({{scene:"team",to:input.target,limit:100,done:(error,value)=>done({{error,messages:Array.isArray(value&&value.msgs)?value.msgs:Array.isArray(value)?value:[]}})}}));const locate=async()=>{{const deadline=Date.now()+2500;for(;;){{const current=await history();if(current.error)return{{error:current.error,message:null}};const message=current.messages.find(item=>String(item&&item.idServer||"")===String(input.messageId));if(message)return{{error:null,message}};if(Date.now()>=deadline)return{{error:null,message:null}};await new Promise(done=>setTimeout(done,100));}}}};const options=window.nim.options&&typeof window.nim.options==="object"?window.nim.options:null;if(options)for(const name of ["onrecallmsg","onRecallMsg","onrecallmsgs","onRecallMsgs"]){{const original=options[name];restorers.push({{options,name,original}});options[name]=function(...args){{if(args.some(includesMessage))recallNotified=true;if(typeof original==="function")return original.apply(this,args);}};}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM recall callback timeout",errorCode:504,timedOut:true}}),15000);locate().then(initial=>{{if(initial.error){{clearTimeout(timer);finish({{ok:false,errorMessage:initial.error.message||String(initial.error),errorCode:Number(initial.error.code||initial.error.status||0)}});return;}}const message=initial.message;if(!message){{clearTimeout(timer);finish({{ok:false,errorMessage:"未在旺商聊最近消息中找到待撤回消息",errorCode:404}});return;}}window.nim.recallMsg({{msg:message,done:error=>{{if(error){{clearTimeout(timer);finish({{ok:false,errorMessage:error.message||String(error),errorCode:Number(error.code||error.status||0),idClient:String(message.idClient||""),idServer:String(message.idServer||"")}});return;}}const deadline=Date.now()+1500;const verify=async()=>{{if(recallNotified){{clearTimeout(timer);finish({{ok:true,errorCode:0,idClient:String(message.idClient||""),idServer:String(message.idServer||""),recallNotified:true,historyAbsent:false}});return;}}if(Date.now()<deadline){{setTimeout(verify,25);return;}}const current=await history();const historyAbsent=!current.error&&!current.messages.some(item=>String(item&&item.idServer||"")===String(input.messageId));clearTimeout(timer);finish({{ok:true,errorCode:0,idClient:String(message.idClient||""),idServer:String(message.idServer||""),recallNotified:false,historyAbsent}});}};verify();}}}});}});}});}})()"#
+    )
+}
+
 fn nim_team_members_expression(team_id: &str, cursor: Option<&str>) -> String {
     let input = json!({"teamId":team_id,"cursor":cursor.unwrap_or_default()});
     format!(
         r#"(async()=>{{const input={input};return new Promise(resolve=>{{const requestId="dh-nim-members-"+Date.now()+"-"+Math.random();let settled=false;const finish=value=>{{if(settled)return;settled=true;resolve({{requestId,...value}});}};if(!window.nim){{finish({{ok:false,errorMessage:"NIM unavailable",errorCode:503,members:[]}});return;}}const timer=setTimeout(()=>finish({{ok:false,errorMessage:"NIM callback timeout",errorCode:504,members:[],timedOut:true}}),15000);const options={{teamId:input.teamId,done:(error,value)=>{{clearTimeout(timer);const object=value&&typeof value==="object"&&!Array.isArray(value)?value:null;const source=Array.isArray(value)?value:object&&Array.isArray(object.members)?object.members:[];const nextCursor=object&&(object.nextCursor||object.nextPageToken||object.cursor)||"";finish({{ok:!error,errorMessage:error&&(error.message||String(error)),errorCode:Number(error&&(error.code||error.status)||0),timedOut:Boolean(error&&error.timedOut),nextCursor:String(nextCursor),members:source.map(item=>({{nimId:String(item.account||item.accid||""),cardName:item.nickInTeam||item.nick||"",type:item.type||item.memberType||"normal",mute:item.mute===true,active:item.active!==false,valid:item.valid!==false}}))}});}}}};if(input.cursor)options.cursor=input.cursor;window.nim.getTeamMembers(options);}});}})()"#
+    )
+}
+
+fn nim_team_mute_expression(team_id: &str) -> String {
+    let input = json!({"teamId": team_id});
+    format!(
+        r#"(async()=>{{const input={input};return new Promise(resolve=>{{if(!window.nim||typeof window.nim.getTeam!=="function"){{resolve({{ok:false,errorMessage:"NIM getTeam unavailable"}});return;}}const timer=setTimeout(()=>resolve({{ok:false,errorMessage:"NIM getTeam timeout",timedOut:true}}),5000);window.nim.getTeam({{teamId:input.teamId,done:(error,team)=>{{clearTimeout(timer);resolve({{ok:!error,errorMessage:error&&(error.message||String(error)),mute:team&&team.mute===true,muteType:String(team&&team.muteType||"")}});}}}});}});}})()"#
     )
 }
 
@@ -3163,7 +3977,8 @@ fn decode_transport_response<'a>(route: &str, value: &'a Value) -> AppResult<&'a
             ),
         );
     };
-    if code != 200 || errno != 0 {
+    let transport_succeeded = code == 200 || (route == "/v1/plugins/encode-msg" && code == 0);
+    if !transport_succeeded || errno != 0 {
         let message = value
             .get("error")
             .and_then(Value::as_str)
@@ -3266,9 +4081,16 @@ fn nim_response_error(route: &str, value: &Value, message: &str) -> AppError {
     );
     if code == 503 || message.to_ascii_lowercase().contains("nim unavailable") {
         metadata.kind = GatewayErrorKind::NimNotReady;
+    } else if code == 404 {
+        metadata.kind = GatewayErrorKind::NotFound;
+    } else if matches!(code, 401 | 403) {
+        metadata.kind = GatewayErrorKind::Permission;
     }
-    let error =
-        AppError::new("nim_members", format!("NIM 成员请求失败：{message}")).with_gateway(metadata);
+    let (error_code, prefix) = match route {
+        "nim.recallMsg" => ("nim_recall", "NIM 撤回失败"),
+        _ => ("nim_members", "NIM 成员请求失败"),
+    };
+    let error = AppError::new(error_code, format!("{prefix}：{message}")).with_gateway(metadata);
     if matches!(code, 429 | 502 | 503 | 504)
         || value.get("timedOut").and_then(Value::as_bool) == Some(true)
     {
@@ -3512,16 +4334,22 @@ fn calibration_identity_i64(target: &CalibrationRestorationTarget, field: &str) 
         })
 }
 
-fn wire_name_missing(value: &str) -> bool {
-    matches!(value.trim(), "" | "1" | ".")
-}
-fn synthetic_nim_user_id(value: &str) -> i64 {
+pub(crate) fn synthetic_nim_user_id(value: &str) -> i64 {
     let mut hash: u64 = 14695981039346656037;
     for byte in value.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(1099511628211);
     }
     -((hash & 0x3fff_ffff_ffff_ffff) as i64) - 1
+}
+
+fn visible_nim_card_name(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() == 32 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn legacy_gateway_batch(value: Value) -> AppResult<GatewayBatch> {
@@ -3689,6 +4517,8 @@ fn parse_gateway_receipt(session: &str, sequence: u64, value: Value) -> AppResul
     Ok(receipt)
 }
 
+const PROTOCOL_PROBE_EXPRESSION: &str = r#"(async()=>{let ipc=globalThis.__dhIpc||null;try{if(!ipc&&typeof require==="function"){const electron=require("electron");ipc=electron&&electron.ipcRenderer;}}catch{}const nim=window.nim||null;const options=nim&&nim.options&&typeof nim.options==="object"?nim.options:null;const callbacks=["onaddteammembers","onAddTeamMembers","onremoveteammembers","onRemoveTeamMembers","onupdateteammember","onUpdateTeamMember","onupdateteammembers","onUpdateTeamMembers"];const routes=["/v1/group/get-group-list","/v1/group/get-group-members","/v1/group/get-group-member-info","/v1/group/set-member-mute","/v1/group/member-mute-cancel","/v1/group/set-member-nickname","/v1/group/remove-group-member","/v1/group/message-rollback","/v1/group/set-group-mute","/v1/plugins/encode-msg"];let source="";const protocolModules=[];try{const scripts=Array.from(document.scripts).map(item=>item.src).filter(Boolean);const main=scripts.find(value=>/main[^/]*\.js(?:\?|$)/i.test(value))||scripts[0];if(main){source=await(await fetch(main)).text();const modules=Array.from(new Set(Array.from(source.matchAll(/zh-cn-[a-z0-9]+\.js/gi),match=>match[0])));for(const moduleName of modules){try{const moduleUrl=new URL(moduleName,main).href;source+="\n"+await(await fetch(moduleUrl)).text();protocolModules.push(moduleUrl);}catch{}}}}catch{}const declared=Array.isArray(globalThis.__dhProtocolRoutes)?globalThis.__dhProtocolRoutes:[];return{ipcReady:!!(ipc&&typeof ipc.send==="function"&&typeof ipc.once==="function"),nimReady:!!nim,sendCustomMsg:!!(nim&&typeof nim.sendCustomMsg==="function"),getTeamMembers:!!(nim&&typeof nim.getTeamMembers==="function"),updateNickInTeam:!!(nim&&typeof nim.updateNickInTeam==="function"),getHistoryMsgs:!!(nim&&typeof nim.getHistoryMsgs==="function"),recallMsg:!!(nim&&typeof nim.recallMsg==="function"),memberEvents:!!options&&callbacks.some(name=>name in options),routeSignatures:routes.filter(route=>source.includes(route)||declared.includes(route)),protocolModules,routeProfile:"zcg-legacy-v1"};})()"#;
+
 fn legacy_message_value(record: &GatewayRecord) -> Value {
     let mut value = record.payload.clone();
     if let Some(object) = value.as_object_mut() {
@@ -3708,8 +4538,8 @@ fn ack_expression(session: &str, sequence: u64) -> String {
     )
 }
 
-const LISTENER_EXPRESSION: &str = r#"(()=>{const nim=window.nim;if(!nim)return{ok:false,error:"NIM_NOT_READY",queued:0};if(!window.__dhBridgeMessages||window.__dhBridgeMessages.version!==4){const session=globalThis.crypto&&typeof globalThis.crypto.randomUUID==="function"?globalThis.crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2);const state={version:4,session,queue:[],seen:new Set(),seenOrder:[],installed:[],queueLimit:5000,seenLimit:10000,nextSeq:1,dropped:0};const remember=key=>{if(state.seen.has(key))return false;state.seen.add(key);state.seenOrder.push(key);while(state.seenOrder.length>state.seenLimit){state.seen.delete(state.seenOrder.shift());}return true;};const enqueue=(kind,source,payload,key)=>{if(!remember(kind+":"+key))return;state.queue.push({session:state.session,seq:state.nextSeq++,kind,source,payload});if(state.queue.length>state.queueLimit){const overflow=state.queue.length-state.queueLimit;state.queue.splice(0,overflow);state.dropped+=overflow;}};const collectMessage=(value,source)=>{if(Array.isArray(value)){value.forEach(item=>collectMessage(item,source));return;}if(!value||typeof value!=="object")return;const id=String(value.idClient||value.idServer||[value.time||Date.now(),value.from||"",value.to||""].join("-"));enqueue("message",source,{idClient:value.idClient,idServer:value.idServer,scene:value.scene,from:value.from,to:value.to,time:value.time,type:value.type,flow:value.flow,content:value.content,attach:value.attach,custom:value.custom,msgFormat:value.msgFormat,mentions:value.mentions||value.aite,quote:value.quote,fromNick:typeof value.fromNick==="string"?value.fromNick:"",sessionId:value.sessionId},id);};const collectTeamEvent=(args,source,kind)=>{const root=args[0];if(!root)return;const team=root.team&&typeof root.team==="object"?root.team:root;const teamId=String(team.teamId||team.id||root.teamId||"");const raw=root.members||root.accounts||root.teamMembers||args[1]||[];const list=Array.isArray(raw)?raw:[raw];const members=list.map(item=>{if(typeof item==="string")return{nimId:item,nickname:"",type:"member"};if(!item||typeof item!=="object")return null;const nimId=String(item.account||item.accid||item.nimId||"");if(!nimId)return null;const name=item.nickInTeam??item.nick??item.nickname??"";return{nimId,userId:item.userId,nickname:typeof name==="string"?name:"",type:item.type||item.memberType||"member"};}).filter(Boolean);if(!teamId||members.length===0)return;const key=[teamId,...members.map(item=>item.nimId).sort(),team.updateTime||root.time||Date.now()].join(":");enqueue(kind,source,{teamId,members,confirmed:true},key);};const install=(name,collector)=>{const original=nim.options&&nim.options[name];if(!nim.options)return;nim.options[name]=function(...args){try{collector(args,name);}catch{}if(typeof original==="function")return original.apply(this,args);};state.installed.push(name);};["onmsg","onmsgs","onofflinemsgs","onroamingmsgs"].forEach(name=>install(name,(args,source)=>collectMessage(args[0],source)));["onaddteammembers","onAddTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberJoined")));["onremoveteammembers","onRemoveTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberLeft")));["onupdateteammember","onUpdateTeamMember","onupdateteammembers","onUpdateTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberUpdated")));window.__dhBridgeMessages=state;}const state=window.__dhBridgeMessages;return{ok:true,session:state.session,installed:state.installed,queued:state.queue.length,dropped:state.dropped};})()"#;
-const READ_BATCH_EXPRESSION: &str = r#"(async()=>{const state=window.__dhBridgeMessages;if(!state)return{ok:false,error:"LISTENER_NOT_READY",records:[]};const batch=state.queue.slice(0,100);let common=window.__dhBridgeCommon||null;try{if(!common){const main=Array.from(document.scripts).map(item=>item.src).find(name=>/\/main-[^/]+\.js(?:\?|$)/.test(name));if(main){const source=await(await fetch(main)).text();const match=source.match(/zh-cn-[a-z0-9]+\.js/);if(match){common=(await import(new URL(match[0],main).href)).D;window.__dhBridgeCommon=common;}}}}catch{}const records=[];for(const item of batch){let payload=item.payload;if(item.kind==="message"){let decoded=null,decodeError="";if(common&&payload.type==="custom"&&typeof payload.content==="string"){try{decoded=await common.decodeMsg(payload.content);if(decoded&&decoded.mentions===undefined&&decoded.aite!==undefined)decoded={...decoded,mentions:decoded.aite};}catch(error){decodeError=error&&error.message||String(error);}}payload={...payload,decoded,decodeError};}records.push({session:item.session,sequence:item.seq,kind:item.kind,source:item.source,payload});}return{ok:true,session:state.session,records,remaining:state.queue.length,dropped:state.dropped||0};})()"#;
+const LISTENER_EXPRESSION: &str = r#"(()=>{const nim=window.nim;if(!nim)return{ok:false,error:"NIM_NOT_READY",queued:0};const previous=window.__dhBridgeMessages;if(!previous||previous.version!==5){if(previous&&previous.reinstallTimer)clearInterval(previous.reinstallTimer);const session=globalThis.crypto&&typeof globalThis.crypto.randomUUID==="function"?globalThis.crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2);const state={version:5,session,queue:[],seen:new Set(),seenOrder:[],installed:[],hooks:[],queueLimit:5000,seenLimit:10000,nextSeq:1,dropped:0,reinstallCount:0,reinstallTimer:null,reinstall:null};const remember=key=>{if(state.seen.has(key))return false;state.seen.add(key);state.seenOrder.push(key);while(state.seenOrder.length>state.seenLimit){state.seen.delete(state.seenOrder.shift());}return true;};const enqueue=(kind,source,payload,key)=>{if(!remember(kind+":"+key))return;state.queue.push({session:state.session,seq:state.nextSeq++,kind,source,payload});if(state.queue.length>state.queueLimit){const overflow=state.queue.length-state.queueLimit;state.queue.splice(0,overflow);state.dropped+=overflow;}};const collectMessage=(value,source)=>{if(Array.isArray(value)){value.forEach(item=>collectMessage(item,source));return;}if(!value||typeof value!=="object")return;const id=String(value.idClient||value.idServer||[value.time||Date.now(),value.from||"",value.to||""].join("-"));enqueue("message",source,{idClient:value.idClient,idServer:value.idServer,scene:value.scene,from:value.from,to:value.to,time:value.time,type:value.type,flow:value.flow,content:value.content,attach:value.attach,custom:value.custom,msgFormat:value.msgFormat,mentions:value.mentions||value.aite,quote:value.quote,fromNick:typeof value.fromNick==="string"?value.fromNick:"",sessionId:value.sessionId},id);};const collectTeamEvent=(args,source,kind)=>{const root=args[0];if(!root)return;const team=root.team&&typeof root.team==="object"?root.team:root;const teamId=String(team.teamId||team.id||root.teamId||"");const raw=root.members||root.accounts||root.teamMembers||args[1]||[];const list=Array.isArray(raw)?raw:[raw];const members=list.map(item=>{if(typeof item==="string")return{nimId:item,nickname:"",type:"member"};if(!item||typeof item!=="object")return null;const nimId=String(item.account||item.accid||item.nimId||"");if(!nimId)return null;const name=item.nickInTeam??item.nick??item.nickname??"";return{nimId,userId:item.userId,nickname:typeof name==="string"?name:"",type:item.type||item.memberType||"member"};}).filter(Boolean);if(!teamId||members.length===0)return;const key=[teamId,...members.map(item=>item.nimId).sort(),team.updateTime||root.time||Date.now()].join(":");enqueue(kind,source,{teamId,members,confirmed:true},key);};const install=(name,collector)=>{if(!nim.options)return;const hook={name,wrapper:null};const wrapper=function(...args){try{collector(args,name);}catch{}const original=wrapper.original;if(typeof original==="function"&&original!==wrapper)return original.apply(this,args);};wrapper.original=nim.options[name];wrapper.__dhBridgeHook=true;wrapper.__dhBridgeSession=state.session;hook.wrapper=wrapper;nim.options[name]=wrapper;state.hooks.push(hook);state.installed.push(name);};["onmsg","onmsgs","onofflinemsgs","onroamingmsgs"].forEach(name=>install(name,(args,source)=>collectMessage(args[0],source)));["onaddteammembers","onAddTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberJoined")));["onremoveteammembers","onRemoveTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberLeft")));["onupdateteammember","onUpdateTeamMember","onupdateteammembers","onUpdateTeamMembers"].forEach(name=>install(name,(args,source)=>collectTeamEvent(args,source,"teamMemberUpdated")));state.reinstall=()=>{if(!window.nim||window.nim!==nim||!nim.options)return false;let changed=false;for(const hook of state.hooks){const current=nim.options[hook.name];if(current===hook.wrapper)continue;if(current&&current.__dhBridgeHook&&current.__dhBridgeSession===state.session)continue;hook.wrapper.original=current;nim.options[hook.name]=hook.wrapper;changed=true;}if(changed)state.reinstallCount++;return changed;};state.reinstallTimer=setInterval(()=>{try{state.reinstall();}catch{}},50);window.__dhBridgeMessages=state;}const state=window.__dhBridgeMessages;if(typeof state.reinstall==="function")state.reinstall();return{ok:true,session:state.session,installed:state.installed,queued:state.queue.length,dropped:state.dropped,reinstallCount:state.reinstallCount||0};})()"#;
+const READ_BATCH_EXPRESSION: &str = r#"(async()=>{const state=window.__dhBridgeMessages;if(!state)return{ok:false,error:"LISTENER_NOT_READY",records:[]};if(typeof state.reinstall==="function")state.reinstall();const batch=state.queue.slice(0,100);let common=window.__dhBridgeCommon||null;try{if(!common){const main=Array.from(document.scripts).map(item=>item.src).find(name=>/\/main-[^/]+\.js(?:\?|$)/.test(name));if(main){const source=await(await fetch(main)).text();const match=source.match(/zh-cn-[a-z0-9]+\.js/);if(match){common=(await import(new URL(match[0],main).href)).D;window.__dhBridgeCommon=common;}}}}catch{}const records=[];for(const item of batch){let payload=item.payload;if(item.kind==="message"){let decoded=null,decodeError="";if(common&&payload.type==="custom"&&typeof payload.content==="string"){try{decoded=await common.decodeMsg(payload.content);if(decoded&&decoded.mentions===undefined&&decoded.aite!==undefined)decoded={...decoded,mentions:decoded.aite};}catch(error){decodeError=error&&error.message||String(error);}}payload={...payload,decoded,decodeError};}records.push({session:item.session,sequence:item.seq,kind:item.kind,source:item.source,payload});}return{ok:true,session:state.session,records,remaining:state.queue.length,dropped:state.dropped||0,reinstallCount:state.reinstallCount||0};})()"#;
 
 #[cfg(test)]
 mod tests {
@@ -3719,6 +4549,30 @@ mod tests {
     fn only_loopback_devtools_is_accepted() {
         assert!(CdpClient::new("http://127.0.0.1:9222").is_ok());
         assert!(CdpClient::new("https://example.com").is_err());
+    }
+
+    #[test]
+    fn zcg_legacy_profile_routes_are_frozen() {
+        assert_eq!(ZcgLegacyProfileV1::route_signatures().len(), 10);
+        assert_eq!(GROUP_LIST_ROUTE, "/v1/group/get-group-list");
+        assert_eq!(GROUP_MEMBERS_ROUTE, "/v1/group/get-group-members");
+        assert_eq!(GROUP_MEMBER_INFO_ROUTE, "/v1/group/get-group-member-info");
+        assert_eq!(MEMBER_MUTE_ROUTE, "/v1/group/set-member-mute");
+        assert_eq!(MEMBER_UNMUTE_ROUTE, "/v1/group/member-mute-cancel");
+        assert_eq!(MEMBER_RENAME_ROUTE, "/v1/group/set-member-nickname");
+        assert_eq!(MEMBER_REMOVE_ROUTE, "/v1/group/remove-group-member");
+        assert_eq!(MESSAGE_RECALL_ROUTE, "/v1/group/message-rollback");
+        assert_eq!(GROUP_MUTE_ROUTE, "/v1/group/set-group-mute");
+        assert!(PROTOCOL_PROBE_EXPRESSION.contains("/v1/plugins/encode-msg"));
+        assert!(PROTOCOL_PROBE_EXPRESSION.contains("source.matchAll(/zh-cn-"));
+    }
+
+    #[test]
+    fn legacy_unverified_capability_deserializes_as_manual_verification() {
+        let capability: GatewayCapability = serde_json::from_str("\"unverified\"").unwrap();
+        assert_eq!(capability.status, CapabilityStatus::ManualVerification);
+        assert!(capability.manual_allowed);
+        assert!(!capability.automatic_allowed);
     }
 
     #[cfg(feature = "fixture")]
@@ -3878,6 +4732,47 @@ mod tests {
     }
 
     #[test]
+    fn nim_internal_card_hash_is_not_exposed_as_a_visible_group_card() {
+        assert_eq!(
+            visible_nim_card_name("270dbd1d10bfb72ffa0ce988028c8133"),
+            ""
+        );
+        assert_eq!(visible_nim_card_name("广州校长"), "广州校长");
+    }
+
+    #[test]
+    fn positive_orphan_member_is_not_treated_as_writable() {
+        let now = Utc::now();
+        let mut member = Member {
+            account_id: "a".into(),
+            group_id: 1,
+            user_id: 9,
+            nim_id: String::new(),
+            nickname: "member".into(),
+            card_name: "member".into(),
+            original_card_name: String::new(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: String::new(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: now,
+            joined_at: None,
+            last_seen_at: now,
+            updated_at: now,
+        };
+        member.nim_id.clear();
+        assert!(!member_has_writable_identity(&member));
+        member.nim_id = "9009".into();
+        assert!(member_has_writable_identity(&member));
+    }
+
+    #[test]
     fn devtools_targets_expose_an_explicit_page_type() {
         let page: DevToolsPage = serde_json::from_value(json!({
             "title": "旺商聊",
@@ -3976,6 +4871,18 @@ mod tests {
 
     #[test]
     fn transport_and_business_layers_require_code_and_errno_success() {
+        let encoded_transport = json!({"transportCode":0,"errno":0,"response":"encoded"});
+        let encoded =
+            decode_transport_response("/v1/plugins/encode-msg", &encoded_transport).unwrap();
+        assert_eq!(encoded, "encoded");
+
+        let non_encode_zero = decode_transport_response(
+            "/v1/group/get-group-list",
+            &json!({"transportCode":0,"errno":0,"response":"{}"}),
+        )
+        .unwrap_err();
+        assert_eq!(non_encode_zero.code, "gateway_transport");
+
         let transport_errno = json!({
             "transportCode": 200,
             "errno": 7,
@@ -4117,11 +5024,43 @@ mod tests {
 
     #[test]
     fn listener_contract_has_fixed_limits_and_confirmed_join_hook() {
+        assert!(LISTENER_EXPRESSION.contains("version!==5"));
         assert!(LISTENER_EXPRESSION.contains("queueLimit:5000"));
         assert!(LISTENER_EXPRESSION.contains("seenLimit:10000"));
         assert!(LISTENER_EXPRESSION.contains("onaddteammembers"));
         assert!(LISTENER_EXPRESSION.contains("confirmed:true"));
+        assert!(LISTENER_EXPRESSION.contains("reinstallTimer=setInterval"));
+        assert!(READ_BATCH_EXPRESSION.contains("state.reinstall"));
         assert!(READ_BATCH_EXPRESSION.contains("state.queue.slice(0,100)"));
         assert!(!ipc_expression("request", "/fixture", json!({})).contains("input.payload||"));
+    }
+
+    #[test]
+    fn cdp_queue_errors_name_the_business_operation() {
+        assert_eq!(
+            cdp_operation_label(READ_BATCH_EXPRESSION),
+            "读取消息与成员事件队列"
+        );
+        assert_eq!(
+            cdp_operation_label(PROTOCOL_PROBE_EXPRESSION),
+            "探测旺商聊协议能力"
+        );
+        assert_eq!(
+            cdp_operation_label("call('/v1/group/set-member-nickname')"),
+            "修改群名片"
+        );
+    }
+
+    #[test]
+    fn message_event_channel_has_an_independent_request_gate() {
+        let gateway = CdpGateway::new(CdpClient::new("http://127.0.0.1:9222").unwrap());
+        assert!(!Arc::ptr_eq(
+            &gateway.cdp.request_gate,
+            &gateway.event_cdp.request_gate
+        ));
+        assert!(!Arc::ptr_eq(
+            &gateway.cdp.session,
+            &gateway.event_cdp.session
+        ));
     }
 }

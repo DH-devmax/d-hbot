@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::gateway::{CapabilityStatus, GatewayCapabilities};
+use crate::gateway::{CapabilitySource, CapabilityStatus, GatewayCapabilities, GatewayCapability};
 
 const PRODUCTION_CAPABILITIES: &str =
     include_str!("../../contracts/wangshangliao_capabilities.json");
@@ -81,24 +81,34 @@ fn capabilities_from_registry(
                     .main_script_sha256
                     .eq_ignore_ascii_case(main_script_sha256)
         })
-        .map(|entry| {
-            let mut capabilities = entry.capabilities;
-            capabilities.remove_member = CapabilityStatus::Unsupported;
-            capabilities
-        })
+        .map(|entry| entry.capabilities)
         .unwrap_or_else(unverified_production_capabilities)
 }
 
 pub(crate) fn unverified_production_capabilities() -> GatewayCapabilities {
+    let pending = |reason: &str| {
+        GatewayCapability::manual_verification(
+            CapabilitySource::WangElectron,
+            reason,
+            String::new(),
+        )
+    };
     GatewayCapabilities {
-        announcement: CapabilityStatus::Unverified,
-        send_text: CapabilityStatus::Unverified,
-        mute: CapabilityStatus::Unverified,
-        recall: CapabilityStatus::Unverified,
-        rename: CapabilityStatus::Unverified,
-        remove_member: CapabilityStatus::Unsupported,
-        group_mute: CapabilityStatus::Unverified,
-        member_events: CapabilityStatus::Unverified,
+        announcement: pending("等待旺商聊公告协议只读探测"),
+        send_text: pending("等待消息编码与 NIM 方法探测"),
+        mute: pending("等待 ZCG 路由基线探测"),
+        recall: pending("等待 ZCG 路由基线探测"),
+        rename: pending("等待 ZCG 路由基线探测"),
+        remove_member: GatewayCapability::new(
+            CapabilityStatus::ManualVerification,
+            CapabilitySource::ZcgContract,
+            true,
+            false,
+            "等待 ZCG 移出成员路由基线探测",
+            String::new(),
+        ),
+        group_mute: pending("等待 ZCG 路由基线探测"),
+        member_events: pending("等待 NIM 成员事件监听探测"),
     }
 }
 
@@ -444,14 +454,14 @@ mod gateway_v2 {
 
     fn unverified_capabilities() -> GatewayCapabilities {
         GatewayCapabilities {
-            announcement: CapabilityStatus::Unverified,
-            send_text: CapabilityStatus::Unverified,
-            mute: CapabilityStatus::Unverified,
-            recall: CapabilityStatus::Unverified,
-            rename: CapabilityStatus::Unverified,
-            remove_member: CapabilityStatus::Unverified,
-            group_mute: CapabilityStatus::Unverified,
-            member_events: CapabilityStatus::Unverified,
+            announcement: CapabilityStatus::Unverified.into(),
+            send_text: CapabilityStatus::Unverified.into(),
+            mute: CapabilityStatus::Unverified.into(),
+            recall: CapabilityStatus::Unverified.into(),
+            rename: CapabilityStatus::Unverified.into(),
+            remove_member: CapabilityStatus::Unverified.into(),
+            group_mute: CapabilityStatus::Unverified.into(),
+            member_events: CapabilityStatus::Unverified.into(),
         }
     }
 
@@ -603,17 +613,17 @@ mod tests {
         assert_eq!(unknown.announcement, CapabilityStatus::Unverified);
         assert_eq!(unknown.send_text, CapabilityStatus::Unverified);
         assert_eq!(unknown.rename, CapabilityStatus::Unverified);
-        assert_eq!(unknown.remove_member, CapabilityStatus::Unsupported);
+        assert_eq!(unknown.remove_member, CapabilityStatus::Unverified);
 
         let expected = GatewayCapabilities {
-            announcement: CapabilityStatus::Unsupported,
-            send_text: CapabilityStatus::Supported,
-            mute: CapabilityStatus::Supported,
-            recall: CapabilityStatus::Supported,
-            rename: CapabilityStatus::Supported,
-            remove_member: CapabilityStatus::Supported,
-            group_mute: CapabilityStatus::Supported,
-            member_events: CapabilityStatus::Supported,
+            announcement: CapabilityStatus::Unsupported.into(),
+            send_text: CapabilityStatus::Supported.into(),
+            mute: CapabilityStatus::Supported.into(),
+            recall: CapabilityStatus::Supported.into(),
+            rename: CapabilityStatus::Supported.into(),
+            remove_member: CapabilityStatus::Supported.into(),
+            group_mute: CapabilityStatus::Supported.into(),
+            member_events: CapabilityStatus::Supported.into(),
         };
         let raw = serde_json::json!({
             "version": 1,
@@ -625,12 +635,10 @@ mod tests {
             }]
         })
         .to_string();
-        let mut hardened = expected;
-        hardened.remove_member = CapabilityStatus::Unsupported;
-        assert_eq!(
-            capabilities_from_registry(&raw, "2.6.3", &"a".repeat(64)),
-            hardened
-        );
+        let restored = capabilities_from_registry(&raw, "2.6.3", &"a".repeat(64));
+        assert_eq!(restored.announcement, CapabilityStatus::Unsupported);
+        assert_eq!(restored.send_text, CapabilityStatus::Supported);
+        assert_eq!(restored.remove_member, CapabilityStatus::Supported);
     }
 
     #[test]

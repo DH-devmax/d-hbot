@@ -41,3 +41,5 @@
 ## 日志边界
 
 日志和崩溃报告必须过滤 API Key、Webhook Token、Cookie、Authorization、账号会话与原始协议响应。真实群名、成员和消息不得进入仓库 fixture；测试数据统一使用占位身份。
+
+`调试 → 生成诊断包` 只在用户手工点击后于本机写入 `%APPDATA%\DH\3.0\support-bundles`。包内只允许脱敏连接状态、能力摘要、匿名化审计、脱敏近期日志、清单和校验和；禁止包含 `dh.db`、`secrets.dat`、旺商聊登录分区、Cookie、Token、API Key、原始消息、真实群名、成员名、原始协议或 Fixture 数据。诊断包以临时文件原子提交，同一秒连续生成自动编号，保留上限为 20 个、30 天和 128 MiB。生产包可使用诊断包功能，但不带 Fixture 端口、Fixture 命令或 Fixture 数据。

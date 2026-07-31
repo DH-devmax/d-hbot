@@ -18,7 +18,7 @@ body {
   height: 100vh;
   overflow: hidden;
   color: var(--dh-text);
-  background: var(--dh-bg);
+  background: transparent;
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", sans-serif;
 }
 
@@ -85,7 +85,8 @@ body {
   padding: 32px 44px 48px;
   border-top: 1px solid #eceff3;
   border-left: 1px solid #eceff3;
-  border-top-left-radius: 8px;
+  border-top-left-radius: 12px;
+  clip-path: inset(0 round 12px 0 0 0);
   background: var(--dh-bg);
 }
 
@@ -162,6 +163,70 @@ body {
   border: 0;
   background: var(--dh-surface);
 }
+
+.error-banner {
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.error-banner > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.error-banner-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  line-height: 1.45;
+}
+
+.error-banner-copy strong {
+  color: #7f1d1d;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.error-banner-copy span,
+.error-banner-copy small {
+  overflow-wrap: anywhere;
+}
+
+.error-banner-copy span {
+  color: #5f2a2a;
+  font-size: 12px;
+}
+
+.error-banner-copy small {
+  color: #8a5555;
+  font-size: 11px;
+}
+
+.error-banner > button {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px 0 2px 12px;
+  white-space: nowrap;
+}
+
+.error-banner--warning {
+  background: #fff9e8;
+  color: #8a6112;
+}
+
+.error-banner--warning .error-banner-copy strong { color: #6f4b08; }
+.error-banner--warning .error-banner-copy span { color: #6e572b; }
+.error-banner--warning .error-banner-copy small { color: #8a6d36; }
+.error-banner--warning > button { color: #76540d; }
+
+.error-banner--info {
+  background: #f3f7f4;
+  color: #23623d;
+}
+
+.error-banner--info .error-banner-copy strong { color: #185c35; }
+.error-banner--info .error-banner-copy span { color: #39654a; }
+.error-banner--info > button { color: #23623d; }
 
 .primary,
 .secondary,
@@ -344,8 +409,6 @@ button:focus-visible,
 .work-item,
 .document-item,
 .new-line,
-.check-chip,
-.action-checks label,
 .card-job {
   border-color: transparent;
   background: var(--dh-surface);
@@ -478,6 +541,32 @@ button:focus-visible,
   height: 1px;
   padding: 0;
   border: 0;
+}
+
+.knowledge-group-filter .check-chip-indicator {
+  display: grid;
+  place-items: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 1px solid #a8a8a8;
+  border-radius: 4px;
+  background: #fff;
+  color: transparent;
+}
+
+.knowledge-group-filter .check-chip-indicator svg {
+  display: block;
+}
+
+.knowledge-group-filter .check-chip.selected .check-chip-indicator {
+  border-color: #fff;
+  background: #fff;
+  color: #171717;
+}
+
+@media (max-width: 700px) {
+  .error-banner-copy small { display: none; }
 }
 
 @media (max-width: 1200px) {

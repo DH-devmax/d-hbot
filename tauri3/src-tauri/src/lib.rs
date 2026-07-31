@@ -45,16 +45,17 @@ use business_apps::{
 #[cfg(feature = "fixture")]
 use calibration::{CalibrationMetadata, DeveloperCalibrationStatus};
 use database::{Database, DatabaseExecutor, DatabaseStatus};
-use diagnostics::redact;
+use diagnostics::{redact, SupportBundleResult};
 use error::{AppError, AppResult};
 #[cfg(feature = "fixture")]
 use gateway::ConnectionStatus;
 use gateway::{CdpClient, CdpGateway, DiagnosticSnapshot, GatewayReceipt, RuntimeGateway};
 use models::{
-    ActionRecord, AuditEvent, BusinessAppRecord, BusinessAppRun, CardPlan, CardPreview,
-    CardRenameJob, DailySummary, Group, GroupAiPermissions, GroupAnnouncement, GroupSchedule,
-    KnowledgeBase, KnowledgeBinding, KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument,
-    Member, MemberRef, MemberRoster, Message, ModerationRule, Page, ScheduleRun, TaskItem,
+    ActionRecord, AiProviderEndpoint, AuditEvent, BusinessAppRecord, BusinessAppRun, CardPlan,
+    CardPreview, CardRenameJob, DailySummary, Group, GroupAiPermissions, GroupAnnouncement,
+    GroupMuteState, GroupSchedule, KnowledgeBase, KnowledgeBinding,
+    KnowledgeChunk as StoredKnowledgeChunk, KnowledgeDocument, Member, MemberRef, MemberRoster,
+    Message, ModerationRule, Page, ScheduleRun, TaskItem,
 };
 use paths::AppPaths;
 use secrets::SecretStore;
@@ -106,6 +107,28 @@ struct AiAutomationInput {
     mute: bool,
     remove: bool,
     manual_takeover: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiProviderEndpointInput {
+    id: i64,
+    account_id: String,
+    name: String,
+    base_url: String,
+    webhook_url: String,
+    #[serde(default)]
+    api_backend: String,
+    model: String,
+    #[serde(default = "default_reasoning_effort")]
+    reasoning_effort: String,
+    priority: i64,
+    enabled: bool,
+    api_key: Option<String>,
+}
+
+fn default_reasoning_effort() -> String {
+    "low".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,6 +389,8 @@ pub struct AppState {
     pub exit_started: Arc<AtomicBool>,
     pub tray_notice_shown: Arc<AtomicBool>,
     pub close_behavior: Arc<RwLock<String>>,
+    pub ai_pool: ai::AiProviderPool,
+    pub prediction_source: Arc<dyn PredictionSource>,
     startup_status: Arc<Mutex<Option<WangStartupEvent>>>,
     wang_start_lock: Arc<tokio::sync::Mutex<()>>,
     pub logger: diagnostics::Logger,
@@ -395,6 +420,8 @@ impl AppState {
         let devtools_url = paths.default_devtools_url().to_string();
         let gateway: Arc<dyn RuntimeGateway> =
             Arc::new(CdpGateway::new(CdpClient::new(devtools_url)?));
+        let prediction_source: Arc<dyn PredictionSource> =
+            Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?);
         Ok(Self {
             secrets: SecretStore::new(paths.secrets.clone()),
             paths,
@@ -405,6 +432,8 @@ impl AppState {
             exit_started: Arc::new(AtomicBool::new(false)),
             tray_notice_shown: Arc::new(AtomicBool::new(false)),
             close_behavior: Arc::new(RwLock::new("ask".into())),
+            ai_pool: ai::AiProviderPool::default(),
+            prediction_source,
             startup_status: Arc::new(Mutex::new(None)),
             wang_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             logger,
@@ -691,6 +720,28 @@ async fn database_status(state: State<'_, AppState>) -> AppResult<DatabaseStatus
 }
 
 #[tauri::command]
+async fn export_support_bundle(state: State<'_, AppState>) -> AppResult<SupportBundleResult> {
+    let database = state.database_executor.status().await?;
+    let audits = state.database_executor.list_support_audit(200).await?;
+    let diagnostic = state.gateway.diagnose().await;
+    let capabilities = state.gateway.capabilities();
+    let paths = state.paths.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        diagnostics::create_support_bundle(&paths, database, audits, diagnostic, capabilities)
+    })
+    .await
+    .map_err(|error| AppError::new("support_bundle", format!("生成诊断包任务异常：{error}")))??;
+    state.logger.write(
+        "INFO",
+        &format!(
+            "已生成可分享诊断包：{}，包含 {} 个脱敏文件",
+            result.path, result.included_files
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
 async fn get_close_behavior(state: State<'_, AppState>) -> AppResult<String> {
     Ok(cached_close_behavior(&state))
 }
@@ -887,7 +938,12 @@ async fn local_members(
 
 #[tauri::command]
 async fn get_ai_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
-    let keys = ["ai.base_url", "ai.webhook_url", "ai.model"];
+    let keys = [
+        "ai.base_url",
+        "ai.webhook_url",
+        "ai.api_backend",
+        "ai.model",
+    ];
     let mut values = serde_json::Map::new();
     for key in keys {
         values.insert(
@@ -1082,6 +1138,7 @@ async fn save_ai_settings(
     state: State<'_, AppState>,
     base_url: String,
     webhook_url: String,
+    api_backend: Option<String>,
     model: String,
     api_key: Option<String>,
 ) -> AppResult<()> {
@@ -1106,6 +1163,14 @@ async fn save_ai_settings(
     state
         .database_executor
         .set_setting(
+            "ai.api_backend".into(),
+            ai::normalize_api_backend(api_backend.as_deref().unwrap_or("chat_completions"))?,
+            false,
+        )
+        .await?;
+    state
+        .database_executor
+        .set_setting(
             "ai.model".into(),
             if model.trim().is_empty() {
                 "deepseek-v4-pro"
@@ -1124,12 +1189,220 @@ async fn save_ai_settings(
     Ok(())
 }
 
+fn validate_ai_endpoint_url(value: &str) -> AppResult<()> {
+    if value.trim().is_empty()
+        || value.starts_with("https://")
+        || value.starts_with("http://127.0.0.1")
+        || value.starts_with("http://localhost")
+    {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "url_policy",
+            "远程 AI 地址必须使用 HTTPS，本机服务只能使用回环 HTTP",
+        ))
+    }
+}
+
+async fn ai_endpoint_configs(
+    state: &AppState,
+    account_id: &str,
+    endpoint_id: Option<i64>,
+) -> AppResult<Vec<(AiProviderEndpoint, ai::AiConfig)>> {
+    state
+        .database_executor
+        .ensure_ai_provider_endpoints(account_id.to_string())
+        .await?;
+    let secrets = state.secrets.load()?;
+    let endpoints = state
+        .database_executor
+        .list_ai_provider_endpoints(account_id.to_string())
+        .await?;
+    Ok(endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.enabled && endpoint_id.is_none_or(|id| id == endpoint.id))
+        .map(|endpoint| {
+            let config = ai::AiConfig {
+                base_url: endpoint.base_url.clone(),
+                webhook_url: endpoint.webhook_url.clone(),
+                api_backend: endpoint.api_backend.clone(),
+                model: endpoint.model.clone(),
+                reasoning_effort: endpoint.reasoning_effort.clone(),
+                api_key: secrets
+                    .get(&endpoint.secret_ref)
+                    .cloned()
+                    .unwrap_or_default(),
+                timeout: ai::AI_PROVIDER_TIMEOUT,
+            };
+            (endpoint, config)
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn list_ai_provider_endpoints(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<Vec<AiProviderEndpoint>> {
+    state
+        .database_executor
+        .ensure_ai_provider_endpoints(account_id.clone())
+        .await?;
+    let secrets = state.secrets.load()?;
+    let mut endpoints = state
+        .database_executor
+        .list_ai_provider_endpoints(account_id)
+        .await?;
+    for endpoint in &mut endpoints {
+        endpoint.api_key_configured = secrets
+            .get(&endpoint.secret_ref)
+            .is_some_and(|value| !value.trim().is_empty());
+    }
+    Ok(endpoints)
+}
+
+#[tauri::command]
+async fn save_ai_provider_endpoint(
+    state: State<'_, AppState>,
+    input: AiProviderEndpointInput,
+) -> AppResult<i64> {
+    if input.account_id.trim().is_empty() || input.name.trim().is_empty() {
+        return Err(AppError::new("ai_endpoint_input", "连接名称和账号不能为空"));
+    }
+    validate_ai_endpoint_url(&input.base_url)?;
+    validate_ai_endpoint_url(&input.webhook_url)?;
+    if input.base_url.trim().is_empty() && input.webhook_url.trim().is_empty() {
+        return Err(AppError::new(
+            "ai_endpoint_input",
+            "请填写 Base URL 或 Webhook URL",
+        ));
+    }
+    let api_backend = ai::normalize_api_backend(&input.api_backend)?;
+    state
+        .database_executor
+        .ensure_ai_provider_endpoints(input.account_id.clone())
+        .await?;
+    let existing = state
+        .database_executor
+        .list_ai_provider_endpoints(input.account_id.clone())
+        .await?
+        .into_iter()
+        .find(|endpoint| endpoint.id == input.id);
+    let now = Utc::now();
+    let secret_ref = existing
+        .as_ref()
+        .map(|endpoint| endpoint.secret_ref.clone())
+        .unwrap_or_else(|| format!("ai.provider.{}.{}", input.account_id, uuid::Uuid::new_v4()));
+    let endpoint = AiProviderEndpoint {
+        id: input.id,
+        account_id: input.account_id,
+        name: input.name.trim().to_string(),
+        base_url: input.base_url.trim().to_string(),
+        webhook_url: input.webhook_url.trim().to_string(),
+        api_backend,
+        model: if input.model.trim().is_empty() {
+            "deepseek-v4-pro".into()
+        } else {
+            input.model.trim().to_string()
+        },
+        reasoning_effort: ai::normalize_reasoning_effort(&input.reasoning_effort)?,
+        secret_ref: secret_ref.clone(),
+        priority: input.priority.max(0),
+        enabled: input.enabled,
+        api_key_configured: existing
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.api_key_configured),
+        health_status: "unchecked".into(),
+        failure_count: 0,
+        cooldown_until: None,
+        last_error: String::new(),
+        last_checked_at: None,
+        created_at: existing
+            .as_ref()
+            .map(|endpoint| endpoint.created_at)
+            .unwrap_or(now),
+        updated_at: now,
+    };
+    let id = state
+        .database_executor
+        .save_ai_provider_endpoint(endpoint)
+        .await?;
+    if let Some(api_key) = input.api_key.filter(|value| !value.trim().is_empty()) {
+        let mut values = state.secrets.load()?;
+        values.insert(secret_ref, api_key.trim().to_string());
+        state.secrets.save(&values)?;
+    }
+    Ok(id)
+}
+
+#[tauri::command]
+async fn delete_ai_provider_endpoint(
+    state: State<'_, AppState>,
+    account_id: String,
+    endpoint_id: i64,
+) -> AppResult<()> {
+    let endpoints = state
+        .database_executor
+        .list_ai_provider_endpoints(account_id.clone())
+        .await?;
+    if endpoints.len() <= 1 {
+        return Err(AppError::new("ai_endpoint_delete", "至少保留一个 AI 连接"));
+    }
+    let secret_ref = endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == endpoint_id)
+        .map(|endpoint| endpoint.secret_ref.clone());
+    state
+        .database_executor
+        .delete_ai_provider_endpoint(account_id, endpoint_id)
+        .await?;
+    if let Some(secret_ref) = secret_ref.filter(|value| value != "ai.api_key") {
+        let mut values = state.secrets.load()?;
+        values.remove(&secret_ref);
+        state.secrets.save(&values)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn test_ai_provider_endpoint(
+    state: State<'_, AppState>,
+    account_id: String,
+    endpoint_id: i64,
+    message: String,
+) -> AppResult<ai::AiTestResult> {
+    let (_, config) = ai_endpoint_configs(&state, &account_id, Some(endpoint_id))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::new("ai_endpoint_missing", "没有找到已启用的 AI 连接"))?;
+    let result = state
+        .ai_pool
+        .provider(config)?
+        .test(&ai::AiRequest::testing(message, Vec::new()))
+        .await;
+    let _ = state
+        .database_executor
+        .update_ai_provider_health(
+            account_id,
+            endpoint_id,
+            result.is_ok(),
+            result
+                .as_ref()
+                .err()
+                .map(|error| error.message.clone())
+                .unwrap_or_default(),
+        )
+        .await;
+    result
+}
+
 #[tauri::command]
 async fn send_text(state: State<'_, AppState>, group_id: i64, text: String) -> AppResult<String> {
     require_manager(&state, group_id).await?;
-    let account_id = state.gateway.session_identity().await?.1;
+    let (sender_id, account_id) = state.gateway.session_identity().await?;
     let result = state.gateway.send_text(group_id, &text).await;
-    archive_manual_gateway_result(
+    let receipt = archive_manual_gateway_result(
         &state,
         &account_id,
         group_id,
@@ -1139,8 +1412,17 @@ async fn send_text(state: State<'_, AppState>, group_id: i64, text: String) -> A
         "人工发送群消息",
         result,
     )
-    .await
-    .map(|receipt| receipt.message_id)
+    .await?;
+    persist_outgoing_message(
+        &state,
+        &account_id,
+        group_id,
+        sender_id,
+        text.trim(),
+        &receipt.message_id,
+    )
+    .await?;
+    Ok(receipt.message_id)
 }
 
 #[tauri::command]
@@ -1155,7 +1437,7 @@ async fn send_text_batch(
     for group_id in &group_ids {
         require_manager(&state, *group_id).await?;
     }
-    let account_id = state.gateway.session_identity().await?.1;
+    let (sender_id, account_id) = state.gateway.session_identity().await?;
     let mut results = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
         let result = state.gateway.send_text(group_id, text.trim()).await;
@@ -1171,12 +1453,26 @@ async fn send_text_batch(
         )
         .await
         {
-            Ok(receipt) => results.push(BatchSendResult {
-                group_id,
-                success: true,
-                message_id: receipt.message_id,
-                error: String::new(),
-            }),
+            Ok(receipt) => {
+                let local_error = persist_outgoing_message(
+                    &state,
+                    &account_id,
+                    group_id,
+                    sender_id,
+                    text.trim(),
+                    &receipt.message_id,
+                )
+                .await
+                .err()
+                .map(|error| format!("消息已发送，本地记录失败：{}", error.message))
+                .unwrap_or_default();
+                results.push(BatchSendResult {
+                    group_id,
+                    success: true,
+                    message_id: receipt.message_id,
+                    error: local_error,
+                });
+            }
             Err(error) => results.push(BatchSendResult {
                 group_id,
                 success: false,
@@ -1186,6 +1482,49 @@ async fn send_text_batch(
         }
     }
     Ok(results)
+}
+
+async fn persist_outgoing_message(
+    state: &State<'_, AppState>,
+    account_id: &str,
+    group_id: i64,
+    sender_id: i64,
+    text: &str,
+    server_message_id: &str,
+) -> AppResult<()> {
+    if server_message_id.trim().is_empty() {
+        return Err(AppError::new(
+            "sent_message_id",
+            "消息已发送，但协议回执缺少服务器消息编号",
+        ));
+    }
+    let now = Utc::now();
+    state
+        .database_executor
+        .insert_message(Message {
+            id: 0,
+            account_id: account_id.into(),
+            group_id,
+            server_message_id: server_message_id.into(),
+            sequence: 0,
+            user_id: sender_id,
+            sender_name: "当前账号".into(),
+            kind: "text".into(),
+            text: text.into(),
+            sent_at: now,
+            received_at: now,
+            processed_at: Some(now),
+            acknowledged_at: Some(now),
+            processing_state: "processed".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: "[]".into(),
+            source_kind: Some("manual-send".into()),
+            flow: Some("out".into()),
+        })
+        .await
+        .map(|_| ())
 }
 
 fn validate_group_batch_input(
@@ -1228,7 +1567,7 @@ async fn execute_group_batch(
 
     let account_id = state.gateway.session_identity().await?.1;
     let (kind, reason) = match action {
-        GroupBatchAction::Announcement => ("announcement", "人工批量更新群公告"),
+        GroupBatchAction::Announcement => ("announcement", "人工批量发布新群公告"),
         GroupBatchAction::Mute => ("group_mute", "人工批量全员禁言"),
         GroupBatchAction::Unmute => ("group_mute", "人工批量解除全禁"),
     };
@@ -1353,10 +1692,87 @@ async fn list_rules(
 }
 
 #[tauri::command]
-async fn save_rule(state: State<'_, AppState>, rule: ModerationRule) -> AppResult<i64> {
+async fn set_group_rule_features(
+    state: State<'_, AppState>,
+    account_id: String,
+    group_id: i64,
+    machine_enabled: bool,
+    ai_enabled: bool,
+) -> AppResult<()> {
+    require_account(&state, &account_id).await?;
+    require_manager(&state, group_id).await?;
+    state
+        .database_executor
+        .set_group_rule_features(account_id, group_id, machine_enabled, ai_enabled)
+        .await
+}
+
+#[tauri::command]
+async fn search_rule_members(
+    state: State<'_, AppState>,
+    account_id: String,
+    group_ids: Vec<i64>,
+    keyword: String,
+    cursor: Option<String>,
+    limit: usize,
+) -> AppResult<Page<Member>> {
+    require_account(&state, &account_id).await?;
+    let mut selected = Vec::new();
+    let query = keyword.trim().to_lowercase();
+    let start = cursor
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    for group_id in group_ids.into_iter().filter(|value| *value > 0) {
+        // 白名单搜索只读当前账号的本地成员索引，避免逐群网络权限校验阻塞编辑器。
+        for member in state
+            .database_executor
+            .list_members(account_id.clone(), group_id)
+            .await?
+        {
+            if !member.present || !seen.insert(member.user_id) {
+                continue;
+            }
+            let haystack = format!(
+                "{} {} {} {} {} {}",
+                member.nickname,
+                member.card_name,
+                member.original_card_name,
+                member.managed_card_name,
+                member.user_id,
+                member.nim_id
+            )
+            .to_lowercase();
+            if query.is_empty() || haystack.contains(&query) {
+                selected.push(member);
+            }
+        }
+    }
+    selected.sort_by(|left, right| {
+        left.card_name
+            .cmp(&right.card_name)
+            .then(left.user_id.cmp(&right.user_id))
+    });
+    let page_limit = limit.clamp(1, 100);
+    let items = selected
+        .iter()
+        .skip(start)
+        .take(page_limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next = start + items.len();
+    Ok(Page {
+        items,
+        next_cursor: (next < selected.len()).then(|| next.to_string()),
+    })
+}
+
+#[tauri::command]
+async fn save_rule(state: State<'_, AppState>, mut rule: ModerationRule) -> AppResult<i64> {
     require_account(&state, &rule.account_id).await?;
-    if rule.group_id != 0 {
-        require_manager(&state, rule.group_id).await?;
+    normalize_and_validate_rule(&mut rule)?;
+    for group_id in &rule.group_ids {
+        require_manager(&state, *group_id).await?;
     }
     state.database_executor.save_rule(rule).await
 }
@@ -1377,7 +1793,7 @@ async fn delete_rule(
 #[tauri::command]
 async fn export_rules(state: State<'_, AppState>, account_id: String) -> AppResult<String> {
     let rules = state.database_executor.list_rules(account_id, None).await?;
-    serde_json::to_string_pretty(&serde_json::json!({"version":1,"rules":rules}))
+    serde_json::to_string_pretty(&serde_json::json!({"version":2,"rules":rules}))
         .map_err(|error| AppError::new("rules_export", error.to_string()))
 }
 
@@ -1395,24 +1811,47 @@ async fn import_rules(
     }
     let document: RulesFile = serde_json::from_str(&json)
         .map_err(|error| AppError::new("rules_import", format!("规则 JSON 格式错误：{error}")))?;
-    if document.version != 1 {
+    if !matches!(document.version, 1 | 2) {
         return Err(AppError::new(
             "rules_import_version",
-            "当前仅支持规则文件 v1",
+            "当前仅支持规则文件 v1 或 v2",
         ));
     }
     let mut rules = Vec::with_capacity(document.rules.len());
     for mut rule in document.rules {
         rule.id = 0;
         rule.account_id = account_id.clone();
-        if !matches!(rule.mode.as_str(), "observe" | "automatic") {
-            return Err(AppError::new(
-                "rules_import",
-                "规则执行模式必须为观察或自动",
-            ));
+        if document.version == 1 {
+            rule.rule_type = if rule.matcher == "semantic" {
+                "ai"
+            } else {
+                "machine"
+            }
+            .into();
+            rule.scope = if rule.group_id == 0 {
+                "global"
+            } else {
+                "selected"
+            }
+            .into();
+            rule.group_ids = (rule.group_id > 0)
+                .then_some(rule.group_id)
+                .into_iter()
+                .collect();
+            rule.priority_level = if rule.priority >= 200 {
+                "high"
+            } else if rule.priority < 100 {
+                "low"
+            } else {
+                "medium"
+            }
+            .into();
+            rule.whitelist_user_ids = rule.exempt_user_ids.clone();
         }
-        if rule.group_id != 0 {
-            require_manager(&state, rule.group_id).await?;
+        normalize_and_validate_rule(&mut rule)
+            .map_err(|error| AppError::new("rules_import", error.message))?;
+        for group_id in &rule.group_ids {
+            require_manager(&state, *group_id).await?;
         }
         rules.push(rule);
     }
@@ -1420,6 +1859,98 @@ async fn import_rules(
         .database_executor
         .import_rules(account_id, rules)
         .await
+}
+
+fn normalize_and_validate_rule(rule: &mut ModerationRule) -> AppResult<()> {
+    if rule.mode == "auto" {
+        rule.mode = "automatic".into();
+    }
+    if !matches!(rule.rule_type.as_str(), "machine" | "ai")
+        || !matches!(rule.scope.as_str(), "global" | "selected")
+        || !matches!(rule.priority_level.as_str(), "low" | "medium" | "high")
+    {
+        return Err(AppError::new(
+            "rule_validation",
+            "规则类型、范围或优先级无效",
+        ));
+    }
+    if !matches!(rule.mode.as_str(), "observe" | "automatic") {
+        return Err(AppError::new(
+            "rule_validation",
+            "规则执行模式必须为观察或自动",
+        ));
+    }
+    let valid_matcher = match rule.rule_type.as_str() {
+        "ai" => rule.matcher == "semantic",
+        _ => matches!(
+            rule.matcher.as_str(),
+            "contains"
+                | "exact"
+                | "prefix"
+                | "regex"
+                | "length"
+                | "lines"
+                | "image_count"
+                | "blacklist"
+                | "rename_count"
+        ),
+    };
+    if !valid_matcher {
+        return Err(AppError::new(
+            "rule_matcher",
+            "机器规则与 AI 控制规则的匹配方式不能混用",
+        ));
+    }
+    rule.name = rule.name.trim().to_string();
+    if rule.name.is_empty() || rule.name.chars().count() > 100 {
+        return Err(AppError::new(
+            "rule_name",
+            "规则名称不能为空且不能超过 100 个字符",
+        ));
+    }
+    if matches!(
+        rule.matcher.as_str(),
+        "contains" | "exact" | "prefix" | "regex" | "semantic"
+    ) && rule.pattern.trim().is_empty()
+    {
+        return Err(AppError::new("rule_pattern", "规则匹配内容不能为空"));
+    }
+    if rule.matcher == "regex" {
+        regex::Regex::new(&rule.pattern)
+            .map_err(|error| AppError::new("rule_regex", format!("正则表达式格式有误：{error}")))?;
+    }
+    if rule.rule_type == "ai" && !(0.0..=1.0).contains(&rule.semantic_threshold) {
+        return Err(AppError::new(
+            "rule_threshold",
+            "AI 置信度必须在 0 到 1 之间",
+        ));
+    }
+    let mut seen_groups = std::collections::HashSet::new();
+    rule.group_ids
+        .retain(|group_id| *group_id > 0 && seen_groups.insert(*group_id));
+    if rule.scope == "global" {
+        rule.group_ids.clear();
+    } else if rule.group_ids.is_empty() {
+        return Err(AppError::new("rule_groups", "指定群规则至少选择一个群"));
+    }
+    let mut seen_members = std::collections::HashSet::new();
+    rule.whitelist_user_ids
+        .retain(|user_id| *user_id > 0 && seen_members.insert(*user_id));
+    for action in &rule.actions {
+        if !matches!(
+            action.kind.as_str(),
+            "recall" | "mute" | "remove" | "blacklist" | "notify" | "reply"
+        ) {
+            return Err(AppError::new("rule_action", "规则包含不支持的动作"));
+        }
+        if action.kind == "mute" && action.duration_seconds <= 0 {
+            return Err(AppError::new("rule_action", "禁言时长必须大于 0 秒"));
+        }
+    }
+    rule.cooldown_seconds = 0;
+    rule.exempt_roles.clear();
+    rule.exempt_user_ids = rule.whitelist_user_ids.clone();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1688,19 +2219,35 @@ async fn export_audit(
     query.limit = Some(1000);
     let events = state.database_executor.query_audit(query).await?;
     if format.eq_ignore_ascii_case("json") {
-        return serde_json::to_string_pretty(&events)
+        let localized = events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "时间": event.created_at.to_rfc3339(),
+                    "账号": event.account_id,
+                    "群ID": event.group_id,
+                    "成员ID": event.user_id,
+                    "执行者": event.actor,
+                    "事件": audit_event_label(&event.event),
+                    "级别": audit_level_label(&event.level),
+                    "详情": localize_audit_details(&event.details),
+                })
+            })
+            .collect::<Vec<_>>();
+        return serde_json::to_string_pretty(&localized)
             .map_err(|error| AppError::new("audit_export", error.to_string()));
     }
-    let mut output = String::from("时间,群ID,成员ID,事件,级别,操作者,详情\n");
+    let mut output = String::from("时间,账号,群ID,成员ID,执行者,事件,级别,详情\n");
     for event in events {
         let cells = [
             event.created_at.to_rfc3339(),
+            event.account_id,
             event.group_id.to_string(),
             event.user_id.to_string(),
-            event.event,
-            event.level,
             event.actor,
-            event.details,
+            audit_event_label(&event.event).to_string(),
+            audit_level_label(&event.level).to_string(),
+            localize_audit_details(&event.details),
         ];
         output.push_str(
             &cells
@@ -1712,6 +2259,209 @@ async fn export_audit(
         output.push('\n');
     }
     Ok(output)
+}
+
+fn audit_event_label(value: &str) -> &str {
+    match value {
+        "message_received" => "收到群消息",
+        "message_processed" => "群消息处理完成",
+        "message_ignored" => "群消息未进入处理",
+        "member_event_fallback" => "成员事件转为名单对账",
+        "rule_matched" => "规则命中",
+        "machine_rule_evaluated" => "机器规则检测",
+        "ai_rule_evaluated" => "AI 规则检测",
+        "ai_rule_failed" => "AI 规则检测失败",
+        "action_executed" => "执行群管动作",
+        "effect_dispatched" => "协议动作执行结果",
+        "ai_reply" => "AI 回复",
+        "ai_reply_failed" => "AI 回复失败",
+        "member_joined" => "成员入群",
+        "member_left" => "成员离群",
+        "member_updated" => "成员资料变更",
+        "card_renamed" => "群名片修改",
+        "card_rename_job" => "群名片任务执行结果",
+        "locked_card_restore_queued" => "锁定名片恢复排队",
+        "blacklisted_member_rejoined" => "黑名单成员重新入群",
+        "schedule_open" | "schedule_open_group" => "定时开群",
+        "schedule_close" | "schedule_close_group" => "定时关群",
+        "daily_summary" => "生成每日摘要",
+        "daily_summary_failed" => "每日摘要失败",
+        "task_reminder_queued" => "任务提醒排队",
+        "semantic_classifier_fallback" => "语义分类降级",
+        "gateway_queue_overflow" => "消息队列溢出",
+        "automation_paused" => "自动化已暂停",
+        "人工更新群公告" => "人工发布新群公告",
+        _ => value,
+    }
+}
+
+fn audit_level_label(value: &str) -> &str {
+    match value {
+        "direction" => "消息方向",
+        "kind" => "消息类型",
+        "sequence" => "接收队列序号",
+        "serverMessageId" => "旺商聊消息编号",
+        "senderName" => "发送成员名称",
+        "contentPreview" => "内容摘要",
+        "processingState" => "处理状态",
+        "source" => "消息来源",
+        "flow" => "消息流向",
+        "result" => "处理结果",
+        "inserted" => "首次入库",
+        "duplicate" => "是否重复",
+        "expected" => "预期事件数",
+        "normalized" => "成功识别数",
+        "fallback" => "后续处理",
+        "jobId" => "任务编号",
+        "originalName" => "原群名片",
+        "desiredName" => "目标群名片",
+        "attempts" => "当前尝试次数",
+        "errorCode" => "错误代码",
+        "errorKind" => "错误类型",
+        "info" => "信息",
+        "warning" => "警告",
+        "error" => "错误",
+        "success" => "成功",
+        _ => value,
+    }
+}
+
+fn localize_audit_details(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return localize_plain_audit_details(raw);
+    };
+    render_localized_audit_value(&value, false)
+}
+
+fn localize_plain_audit_details(raw: &str) -> String {
+    let localized = raw
+        .replace("消息类型=text", "消息类型=文本")
+        .replace("消息类型=image", "消息类型=图片")
+        .replace("消息类型=card", "消息类型=名片")
+        .replace("消息类型=notice", "消息类型=通知")
+        .replace("消息类型=other", "消息类型=其他")
+        .replace("收到 NIM 入群事件", "收到旺商聊成员入群事件")
+        .replace("收到 NIM 离群事件", "收到旺商聊成员离群事件")
+        .replace("收到 NIM 成员资料更新事件", "收到旺商聊成员资料更新事件");
+    if localized.contains("消息类型=") && localized.contains("，序号=") {
+        format!(
+            "{}（旧版记录仅保存消息类型和队列序号）",
+            localized.replace("，序号=", "，接收队列序号=")
+        )
+    } else {
+        localized
+    }
+}
+
+fn render_localized_audit_value(value: &serde_json::Value, nested: bool) -> String {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| render_localized_audit_value(value, true))
+            .collect::<Vec<_>>()
+            .join("、"),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .filter(|(_, value)| !value.is_null() && value.as_str() != Some(""))
+            .map(|(key, value)| {
+                format!(
+                    "{}：{}",
+                    audit_detail_key_label(key),
+                    render_localized_audit_value(value, true)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(if nested { "；" } else { "　" }),
+        serde_json::Value::String(value) => audit_detail_value_label(value).to_string(),
+        serde_json::Value::Bool(value) => if *value { "是" } else { "否" }.to_string(),
+        serde_json::Value::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
+fn audit_detail_key_label(value: &str) -> &str {
+    match value {
+        "status" => "状态",
+        "success" => "是否成功",
+        "effect" => "自动动作",
+        "error" => "错误",
+        "receipt" => "协议回执",
+        "route" => "协议路由",
+        "transportCode" => "传输状态码",
+        "transportErrno" => "传输错误码",
+        "businessCode" => "业务状态码",
+        "businessErrno" => "业务错误码",
+        "businessMessage" => "业务说明",
+        "requestId" => "请求编号",
+        "messageId" => "本地消息编号",
+        "session" => "会话",
+        "verification" => "回读验证",
+        "acknowledged" => "本次确认数量",
+        "acknowledgedThrough" => "已确认至序号",
+        "remaining" => "剩余数量",
+        "dropped" => "丢弃数量",
+        "retryable" => "可重试",
+        "unknown" => "结果待确认",
+        "groupId" => "群",
+        "userId" => "成员",
+        "durationSeconds" => "时长（秒）",
+        "action" => "操作",
+        "muted" => "全员禁言",
+        "noticeId" => "公告编号",
+        "content" => "内容",
+        "actionKind" => "动作",
+        "ruleId" => "规则编号",
+        "matchedRuleIds" => "命中规则",
+        "contributorRuleIds" => "动作来源规则",
+        "automatic" => "自动执行",
+        "elapsedMs" => "耗时（毫秒）",
+        "scores" => "语义置信度",
+        "confidence" => "置信度",
+        "decision" => "执行决定",
+        "mode" => "执行模式",
+        "reason" => "原因",
+        _ => value,
+    }
+}
+
+fn audit_detail_value_label(value: &str) -> &str {
+    match value {
+        "incoming" => "收到",
+        "outgoing" => "发出",
+        "text" => "文本",
+        "image" => "图片",
+        "card" => "名片",
+        "notice" => "通知",
+        "other" => "其他",
+        "pending" => "待处理",
+        "queued" => "已入库并排队",
+        "processing" => "处理中",
+        "processed" => "已处理",
+        "ignored" => "已忽略",
+        "rules-and-ai-evaluated" => "规则与 AI 检查完成",
+        "persisted-and-acknowledged" => "已保存并确认源队列",
+        "roster-reconciliation" => "由 60 秒成员名单对账补齐",
+        "succeeded" => "成功",
+        "failed" => "失败",
+        "unknown" => "待人工确认",
+        "verified" => "已回读确认",
+        "unsupported" => "未开放",
+        "not-applicable" => "无需回读",
+        "group_mute" => "全群发言控制",
+        "automatic" => "自动执行",
+        "observe" => "观察",
+        "recall" => "撤回",
+        "mute" => "禁言",
+        "unmute" => "解除禁言",
+        "remove" => "移出成员",
+        "blacklist" => "加入黑名单",
+        "notify" => "提示",
+        "send_text" => "发送文字",
+        "OK" => "正常",
+        "true" => "是",
+        "false" => "否",
+        _ => value,
+    }
 }
 
 #[tauri::command]
@@ -1819,39 +2569,30 @@ async fn generate_daily_summary(
         .take(200)
         .collect::<Vec<_>>();
     if messages.is_empty() {
-        return Err(AppError::new(
-            "summary_empty",
-            "当前群今天还没有可供总结的消息",
-        ));
+        let error = AppError::new("summary_empty", "当前群今天还没有可供总结的消息");
+        let _ = state
+            .database_executor
+            .record_audit(AuditEvent {
+                id: 0,
+                account_id,
+                group_id,
+                user_id: 0,
+                actor: "当前管理员".into(),
+                event: "daily_summary_failed".into(),
+                level: "error".into(),
+                details: error.message.clone(),
+                created_at: Utc::now(),
+            })
+            .await;
+        return Err(error);
     }
-    let base_url = state
-        .database_executor
-        .get_setting("ai.base_url".into())
-        .await?
-        .unwrap_or_default();
-    let webhook_url = state
-        .database_executor
-        .get_setting("ai.webhook_url".into())
-        .await?
-        .unwrap_or_default();
-    let model = state
-        .database_executor
-        .get_setting("ai.model".into())
-        .await?
-        .unwrap_or_else(|| "deepseek-v4-pro".into());
-    let api_key = state
-        .secrets
-        .load()?
-        .get("ai.api_key")
-        .cloned()
-        .unwrap_or_default();
-    let provider = ai::ConfiguredProvider::new(ai::AiConfig {
-        base_url,
-        webhook_url,
-        model,
-        api_key,
-        timeout: Duration::from_secs(30),
-    })?;
+    let provider = state.ai_pool.chain(
+        ai_endpoint_configs(&state, &account_id, None)
+            .await?
+            .into_iter()
+            .map(|(_, config)| config)
+            .collect(),
+    )?;
     let group_name = state
         .database_executor
         .list_groups(Some(account_id.clone()))
@@ -1883,7 +2624,26 @@ async fn generate_daily_summary(
             .collect(),
         knowledge: Vec::new(),
     };
-    let decision = ai::AiProvider::decide(&provider, &request).await?;
+    let decision = match ai::AiProvider::decide(provider.as_ref(), &request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            let _ = state
+                .database_executor
+                .record_audit(AuditEvent {
+                    id: 0,
+                    account_id,
+                    group_id,
+                    user_id: 0,
+                    actor: "当前管理员".into(),
+                    event: "daily_summary_failed".into(),
+                    level: "error".into(),
+                    details: error.message.clone(),
+                    created_at: Utc::now(),
+                })
+                .await;
+            return Err(error);
+        }
+    };
     let summary = DailySummary {
         id: 0,
         account_id,
@@ -1897,51 +2657,118 @@ async fn generate_daily_summary(
         .database_executor
         .save_daily_summary(summary.clone())
         .await?;
+    let _ = state
+        .database_executor
+        .record_audit(AuditEvent {
+            id: 0,
+            account_id: summary.account_id.clone(),
+            group_id,
+            user_id: 0,
+            actor: "当前管理员".into(),
+            event: "daily_summary".into(),
+            level: "success".into(),
+            details: format!("已生成 {} 的本机每日摘要", summary.local_date),
+            created_at: Utc::now(),
+        })
+        .await;
     Ok(DailySummary { id, ..summary })
 }
 
 #[tauri::command]
 async fn test_ai(
     state: State<'_, AppState>,
+    account_id: Option<String>,
     message: String,
     recent_context: Vec<ai::AiContextMessage>,
     include_built_in_knowledge: Option<bool>,
 ) -> AppResult<ai::AiTestResult> {
-    let base_url = state
-        .database_executor
-        .get_setting("ai.base_url".into())
-        .await?
-        .unwrap_or_default();
-    let webhook_url = state
-        .database_executor
-        .get_setting("ai.webhook_url".into())
-        .await?
-        .unwrap_or_default();
-    let model = state
-        .database_executor
-        .get_setting("ai.model".into())
-        .await?
+    let pairs = if let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) {
+        ai_endpoint_configs(&state, &account_id, None).await?
+    } else {
+        let settings = get_ai_settings(state.clone()).await?;
+        let values = settings.as_object().cloned().unwrap_or_default();
+        vec![(
+            AiProviderEndpoint {
+                id: 0,
+                account_id: "local-test".into(),
+                name: "当前连接".into(),
+                base_url: String::new(),
+                webhook_url: String::new(),
+                api_backend: values
+                    .get("api_backend")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("chat_completions")
+                    .into(),
+                model: String::new(),
+                reasoning_effort: "low".into(),
+                secret_ref: "ai.api_key".into(),
+                priority: 0,
+                enabled: true,
+                api_key_configured: false,
+                health_status: "unchecked".into(),
+                failure_count: 0,
+                cooldown_until: None,
+                last_error: String::new(),
+                last_checked_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            ai::AiConfig {
+                base_url: values
+                    .get("base_url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                webhook_url: values
+                    .get("webhook_url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                api_backend: values
+                    .get("api_backend")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("chat_completions")
+                    .into(),
+                model: values
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("deepseek-v4-pro")
+                    .into(),
+                reasoning_effort: "low".into(),
+                api_key: state
+                    .secrets
+                    .load()?
+                    .get("ai.api_key")
+                    .cloned()
+                    .unwrap_or_default(),
+                timeout: ai::AI_PROVIDER_TIMEOUT,
+            },
+        )]
+    };
+    let model = pairs
+        .first()
+        .map(|(_, config)| config.model.clone())
         .unwrap_or_else(|| "deepseek-v4-pro".into());
-    let api_key = state
-        .secrets
-        .load()?
-        .get("ai.api_key")
-        .cloned()
-        .unwrap_or_default();
-    let provider = ai::ConfiguredProvider::new(ai::AiConfig {
-        base_url,
-        webhook_url,
+    let provider = state
+        .ai_pool
+        .chain(pairs.into_iter().map(|(_, config)| config).collect())?;
+    let request = ai::AiRequest::testing_with_knowledge(
+        message,
+        recent_context,
+        include_built_in_knowledge.unwrap_or(false),
+    );
+    let started = std::time::Instant::now();
+    let decision = ai::AiProvider::decide(provider.as_ref(), &request).await?;
+    Ok(ai::AiTestResult {
+        decision,
         model,
-        api_key,
-        timeout: Duration::from_secs(30),
-    })?;
-    provider
-        .test(&ai::AiRequest::testing_with_knowledge(
-            message,
-            recent_context,
-            include_built_in_knowledge.unwrap_or(false),
-        ))
-        .await
+        elapsed_ms: started.elapsed().as_millis(),
+        knowledge_source: if request.knowledge.is_empty() {
+            "空上下文".into()
+        } else {
+            "DH 默认群规与 FAQ".into()
+        },
+    })
 }
 
 #[tauri::command]
@@ -1967,6 +2794,33 @@ async fn set_business_app_enabled(
     if app_id != PREDICTION_APP_ID {
         return Err(business_apps::app_not_available(&app_id));
     }
+    if enabled {
+        let registry = BusinessAppRegistry::new(state.prediction_source.clone());
+        let app = registry
+            .by_id(&app_id)
+            .ok_or_else(|| business_apps::app_not_available(&app_id))?;
+        let health = app.health(Utc::now()).await?;
+        state
+            .database_executor
+            .update_business_app_health(
+                account_id.clone(),
+                app_id.clone(),
+                health.status.clone(),
+                health.detail.clone(),
+                health.checked_at,
+            )
+            .await?;
+        if health.status != "ready" {
+            state
+                .database_executor
+                .set_business_app_enabled(account_id, app_id, false)
+                .await?;
+            return Err(AppError::new(
+                "business_app_unavailable",
+                format!("预测应用尚未通过数据校验：{}", health.detail),
+            ));
+        }
+    }
     state
         .database_executor
         .set_business_app_enabled(account_id, app_id, enabled)
@@ -1983,10 +2837,7 @@ async fn get_business_app_health(
     if app_id != PREDICTION_APP_ID {
         return Err(business_apps::app_not_available(&app_id));
     }
-    let source = Arc::new(prediction::HttpPredictionSource::new(Duration::from_secs(
-        8,
-    ))?);
-    let registry = BusinessAppRegistry::new(source);
+    let registry = BusinessAppRegistry::new(state.prediction_source.clone());
     let app = registry
         .by_id(&app_id)
         .ok_or_else(|| business_apps::app_not_available(&app_id))?;
@@ -1994,13 +2845,19 @@ async fn get_business_app_health(
     state
         .database_executor
         .update_business_app_health(
-            account_id,
-            app_id,
+            account_id.clone(),
+            app_id.clone(),
             health.status.clone(),
             health.detail.clone(),
             health.checked_at,
         )
         .await?;
+    if health.status != "ready" {
+        state
+            .database_executor
+            .set_business_app_enabled(account_id, app_id, false)
+            .await?;
+    }
     Ok(health)
 }
 
@@ -2032,10 +2889,7 @@ async fn test_business_app(
         ));
     }
     let started = std::time::Instant::now();
-    let source = Arc::new(prediction::HttpPredictionSource::new(Duration::from_secs(
-        8,
-    ))?);
-    let registry = BusinessAppRegistry::new(source);
+    let registry = BusinessAppRegistry::new(state.prediction_source.clone());
     let app = registry
         .by_id(&input.app_id)
         .ok_or_else(|| business_apps::app_not_available(&input.app_id))?;
@@ -2048,6 +2902,8 @@ async fn test_business_app(
         enabled: true,
         ai_enabled: true,
         moderation_enabled: false,
+        machine_rules_enabled: false,
+        ai_rules_enabled: false,
         manual_takeover: false,
         welcome_message: String::new(),
         updated_at: now,
@@ -2116,30 +2972,13 @@ async fn test_business_app(
     let mut ai_used = false;
     let mut error = String::new();
     if let Some(data) = outcome.narration.as_ref() {
-        let provider = ai::ConfiguredProvider::new(ai::AiConfig {
-            base_url: state
-                .database_executor
-                .get_setting("ai.base_url".into())
+        let provider = state.ai_pool.chain(
+            ai_endpoint_configs(&state, &input.account_id, None)
                 .await?
-                .unwrap_or_default(),
-            webhook_url: state
-                .database_executor
-                .get_setting("ai.webhook_url".into())
-                .await?
-                .unwrap_or_default(),
-            model: state
-                .database_executor
-                .get_setting("ai.model".into())
-                .await?
-                .unwrap_or_else(|| "deepseek-v4-pro".into()),
-            api_key: state
-                .secrets
-                .load()?
-                .get("ai.api_key")
-                .cloned()
-                .unwrap_or_default(),
-            timeout: Duration::from_secs(20),
-        })?;
+                .into_iter()
+                .map(|(_, config)| config)
+                .collect(),
+        )?;
         let request = ai::AiRequest {
             version: "1",
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -2154,7 +2993,7 @@ async fn test_business_app(
             recent_context: Vec::new(),
             knowledge: Vec::new(),
         };
-        match ai::AiProvider::decide(&provider, &request).await {
+        match ai::AiProvider::decide(provider.as_ref(), &request).await {
             Ok(decision) if !decision.reply.trim().is_empty() => {
                 reply = decision.reply.trim().into();
                 ai_used = true;
@@ -2540,6 +3379,14 @@ async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) 
 }
 
 #[tauri::command]
+async fn get_group_mute_state(
+    state: State<'_, AppState>,
+    group_id: i64,
+) -> AppResult<GroupMuteState> {
+    state.gateway.get_group_mute_state(group_id).await
+}
+
+#[tauri::command]
 async fn set_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
@@ -2554,17 +3401,36 @@ async fn set_group_announcement(
         .gateway
         .set_group_announcement(group_id, text.trim())
         .await;
-    archive_manual_gateway_result(
+    let receipt = archive_manual_gateway_result(
         &state,
         &account_id,
         group_id,
         0,
         "announcement",
         0,
-        "人工发布或更新群公告",
+        "人工发布新群公告",
         result,
     )
-    .await
+    .await?;
+    if receipt.verification.as_deref() == Some("verified") {
+        let capability = state
+            .gateway
+            .mark_capability_verified("announcement")
+            .announcement;
+        let _ = state
+            .database_executor
+            .save_gateway_capability_verification(
+                capability.fingerprint.clone(),
+                "announcement".into(),
+                "manualReceipt".into(),
+                "supported".into(),
+                true,
+                capability.fingerprint,
+                String::new(),
+            )
+            .await;
+    }
+    Ok(receipt)
 }
 
 #[tauri::command]
@@ -2573,6 +3439,105 @@ async fn get_group_announcement(
     group_id: i64,
 ) -> AppResult<Option<GroupAnnouncement>> {
     state.gateway.get_group_announcement(group_id).await
+}
+
+#[tauri::command]
+async fn list_group_announcements(
+    state: State<'_, AppState>,
+    group_id: i64,
+) -> AppResult<Vec<GroupAnnouncement>> {
+    state.gateway.list_group_announcements(group_id).await
+}
+
+#[tauri::command]
+async fn update_group_announcement(
+    state: State<'_, AppState>,
+    group_id: i64,
+    notice_id: String,
+    text: String,
+    mode: String,
+) -> AppResult<GatewayReceipt> {
+    let _roster = require_member_manager(&state, group_id).await?;
+    if notice_id.trim().is_empty() || text.trim().is_empty() || text.chars().count() > 1000 {
+        return Err(AppError::new(
+            "announcement_invalid",
+            "请选择有效公告，并将内容控制在 1 到 1000 个字符",
+        ));
+    }
+    let (sender_id, account_id) = state.gateway.session_identity().await?;
+    let existing = state
+        .gateway
+        .list_group_announcements(group_id)
+        .await?
+        .into_iter()
+        .find(|announcement| announcement.notice_id == notice_id)
+        .ok_or_else(|| AppError::new("announcement_not_found", "公告历史中没有找到该公告"))?;
+    if existing.author_user_id > 0 && existing.author_user_id != sender_id {
+        return Err(AppError::new(
+            "announcement_author",
+            "旺商聊只允许公告作者编辑这条公告",
+        ));
+    }
+    let result = state
+        .gateway
+        .update_group_announcement(group_id, notice_id.trim(), text.trim(), mode.trim())
+        .await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        0,
+        "announcement_update",
+        0,
+        if mode == "TOP_NOTICE" {
+            "人工编辑并置顶群公告"
+        } else {
+            "人工编辑群公告"
+        },
+        result,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn delete_group_announcement(
+    state: State<'_, AppState>,
+    group_id: i64,
+    notice_id: String,
+) -> AppResult<GatewayReceipt> {
+    let _roster = require_member_manager(&state, group_id).await?;
+    if notice_id.trim().is_empty() {
+        return Err(AppError::new("announcement_invalid", "请选择要删除的公告"));
+    }
+    let (sender_id, account_id) = state.gateway.session_identity().await?;
+    let existing = state
+        .gateway
+        .list_group_announcements(group_id)
+        .await?
+        .into_iter()
+        .find(|announcement| announcement.notice_id == notice_id)
+        .ok_or_else(|| AppError::new("announcement_not_found", "公告历史中没有找到该公告"))?;
+    if existing.author_user_id > 0 && existing.author_user_id != sender_id {
+        return Err(AppError::new(
+            "announcement_author",
+            "旺商聊只允许公告作者删除这条公告",
+        ));
+    }
+    let result = state
+        .gateway
+        .delete_group_announcement(group_id, notice_id.trim())
+        .await;
+    archive_manual_gateway_result(
+        &state,
+        &account_id,
+        group_id,
+        0,
+        "announcement_delete",
+        0,
+        "人工删除群公告",
+        result,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2604,9 +3569,10 @@ async fn get_group_management_context(
     let announcement_status = if calibration_allows_announcement {
         "可用"
     } else {
-        match capabilities.announcement {
+        match capabilities.announcement.status {
             gateway::CapabilityStatus::Supported => "可用",
-            gateway::CapabilityStatus::Unverified => "当前版本待校准",
+            gateway::CapabilityStatus::ManualVerification => "待首次手工验证",
+            gateway::CapabilityStatus::Unavailable => "当前协议结构不可用",
             gateway::CapabilityStatus::Unsupported => "功能未开放",
         }
     };
@@ -2808,7 +3774,9 @@ fn manual_event_name(kind: &str) -> &'static str {
         "blacklist" => "人工加入黑名单",
         "unblacklist" => "人工移出黑名单",
         "group_mute" => "人工设置全群发言",
-        "announcement" => "人工更新群公告",
+        "announcement" => "人工发布新群公告",
+        "announcement_update" => "人工编辑群公告",
+        "announcement_delete" => "人工删除群公告",
         _ => "人工群管操作",
     }
 }
@@ -3003,6 +3971,7 @@ macro_rules! dh_handlers {
         tauri::generate_handler![
             health,
             database_status,
+            export_support_bundle,
             get_close_behavior,
             reset_close_behavior,
             resolve_close_action,
@@ -3018,6 +3987,10 @@ macro_rules! dh_handlers {
             save_card_settings,
             save_group_welcome,
             save_ai_settings,
+            list_ai_provider_endpoints,
+            save_ai_provider_endpoint,
+            delete_ai_provider_endpoint,
+            test_ai_provider_endpoint,
             send_text,
             send_text_batch,
             execute_group_batch,
@@ -3025,6 +3998,8 @@ macro_rules! dh_handlers {
             recent_messages,
             set_group_features,
             list_rules,
+            set_group_rule_features,
+            search_rule_members,
             save_rule,
             delete_rule,
             export_rules,
@@ -3077,8 +4052,12 @@ macro_rules! dh_handlers {
             rename_member,
             remove_member,
             set_group_mute,
+            get_group_mute_state,
             set_group_announcement,
             get_group_announcement,
+            list_group_announcements,
+            update_group_announcement,
+            delete_group_announcement,
             get_group_management_context,
             execute_member_batch,
             preview_card_names,
@@ -3192,6 +4171,7 @@ async fn capability_calibration_loop(
     shutdown: Arc<ShutdownSignal>,
 ) {
     let mut calibrated_identity: Option<(String, String)> = None;
+    let mut probe_ticks = 60_u8;
     loop {
         let configured_path = database
             .get_setting("wangshangliao.path".into())
@@ -3209,15 +4189,67 @@ async fn capability_calibration_loop(
             }
             _ => None,
         };
-        if identity != calibrated_identity {
-            let capabilities = match &identity {
+        // Structural capability probing performs several IPC reads. Re-run it
+        // immediately when the process identity changes, otherwise every five
+        // minutes; message and member workers already monitor connection health.
+        if identity != calibrated_identity || probe_ticks >= 60 {
+            let mut capabilities = match &identity {
                 Some((version, script_hash)) => {
-                    gateway.calibrate_capabilities(version, script_hash)
+                    gateway.probe_capabilities(version, script_hash).await
                 }
-                None => gateway.calibrate_capabilities("", ""),
+                None => gateway.probe_capabilities("", "").await,
             };
+            if capabilities.announcement.status == gateway::CapabilityStatus::ManualVerification
+                && !capabilities.announcement.fingerprint.is_empty()
+                && database
+                    .is_gateway_capability_verified(
+                        capabilities.announcement.fingerprint.clone(),
+                        "announcement".into(),
+                    )
+                    .await
+                    .unwrap_or(false)
+            {
+                capabilities = gateway.mark_capability_verified("announcement");
+            }
+            for (name, capability) in [
+                ("announcement", &capabilities.announcement),
+                ("sendText", &capabilities.send_text),
+                ("mute", &capabilities.mute),
+                ("recall", &capabilities.recall),
+                ("rename", &capabilities.rename),
+                ("removeMember", &capabilities.remove_member),
+                ("groupMute", &capabilities.group_mute),
+                ("memberEvents", &capabilities.member_events),
+            ] {
+                let source = serde_json::to_value(capability.source)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "wangElectron".into());
+                let status = serde_json::to_value(capability.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unavailable".into());
+                let _ = database
+                    .save_gateway_capability_verification(
+                        capability.fingerprint.clone(),
+                        name.into(),
+                        source,
+                        status,
+                        capability.automatic_allowed,
+                        capability.fingerprint.clone(),
+                        if capability.status == gateway::CapabilityStatus::Unavailable {
+                            capability.reason.clone()
+                        } else {
+                            String::new()
+                        },
+                    )
+                    .await;
+            }
             let _ = app.emit("gateway-capabilities", capabilities);
             calibrated_identity = identity;
+            probe_ticks = 0;
+        } else {
+            probe_ticks = probe_ticks.saturating_add(1);
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {},
@@ -3537,12 +4569,14 @@ pub fn run() {
                 _ => {}
             });
             let runtime_gateway: Arc<dyn RuntimeGateway> = app.state::<AppState>().gateway.clone();
-            let mut runtime_tasks = runtime::BackendRuntime::new(
+            let mut runtime_tasks = runtime::BackendRuntime::new_with_ai_pool(
                 app.state::<AppState>().database_executor.clone(),
                 runtime_gateway,
                 app.state::<AppState>().secrets.clone(),
                 app.state::<AppState>().shutdown.clone(),
                 app.state::<AppState>().logger.clone(),
+                app.state::<AppState>().ai_pool.clone(),
+                app.state::<AppState>().prediction_source.clone(),
             )
             .spawn(app_handle.clone());
             runtime_tasks.push(bridge::spawn(
@@ -3605,10 +4639,43 @@ pub fn run() {
 #[cfg(test)]
 mod close_behavior_tests {
     use super::{
-        manual_event_name, normalize_close_behavior, redact_archived_receipt,
-        validate_group_batch_input, wang_auto_start_enabled, GroupBatchAction, GroupBatchInput,
+        audit_event_label, localize_audit_details, manual_event_name, normalize_and_validate_rule,
+        normalize_close_behavior, redact_archived_receipt, validate_group_batch_input,
+        wang_auto_start_enabled, GroupBatchAction, GroupBatchInput,
     };
     use crate::gateway::GatewayReceipt;
+    use crate::models::{ModerationRule, RuleAction};
+
+    fn test_rule(rule_type: &str, matcher: &str) -> ModerationRule {
+        ModerationRule {
+            id: 0,
+            account_id: "ACCOUNT".into(),
+            rule_type: rule_type.into(),
+            scope: "selected".into(),
+            group_ids: vec![100, 100, -1],
+            priority_level: "medium".into(),
+            whitelist_user_ids: vec![200, 200, 0],
+            group_id: 100,
+            name: " 测试规则 ".into(),
+            matcher: matcher.into(),
+            pattern: "测试".into(),
+            threshold: 0,
+            count: 0,
+            window_seconds: 0,
+            cooldown_seconds: 600,
+            priority: 100,
+            mode: "auto".into(),
+            enabled: false,
+            semantic_threshold: 0.8,
+            exempt_roles: vec!["owner".into(), "admin".into()],
+            exempt_user_ids: vec![200],
+            actions: vec![RuleAction {
+                kind: "recall".into(),
+                duration_seconds: 0,
+                message: String::new(),
+            }],
+        }
+    }
 
     #[test]
     fn accepts_only_persisted_close_choices() {
@@ -3676,5 +4743,48 @@ mod close_behavior_tests {
             text: None,
         })
         .is_err());
+    }
+
+    #[test]
+    fn audit_exports_use_chinese_events_fields_and_values() {
+        assert_eq!(audit_event_label("effect_dispatched"), "协议动作执行结果");
+        let details = localize_audit_details(
+            r#"{"effect":"group_mute","success":true,"receipt":{"status":"succeeded","verification":"verified","transportErrno":0}}"#,
+        );
+        assert!(details.contains("自动动作：全群发言控制"));
+        assert!(details.contains("是否成功：是"));
+        assert!(details.contains("状态：成功"));
+        assert!(details.contains("回读验证：已回读确认"));
+        assert!(details.contains("传输错误码：0"));
+        assert!(!details.contains("effect"));
+        assert!(!details.contains("verification"));
+        assert_eq!(
+            localize_audit_details("消息类型=other，序号=71"),
+            "消息类型=其他，接收队列序号=71（旧版记录仅保存消息类型和队列序号）"
+        );
+        assert_eq!(
+            localize_audit_details("收到 NIM 离群事件"),
+            "收到旺商聊成员离群事件"
+        );
+    }
+
+    #[test]
+    fn rule_v2_normalization_removes_legacy_exemptions_and_cooldown() {
+        let mut rule = test_rule("machine", "contains");
+        normalize_and_validate_rule(&mut rule).unwrap();
+        assert_eq!(rule.name, "测试规则");
+        assert_eq!(rule.mode, "automatic");
+        assert_eq!(rule.group_ids, vec![100]);
+        assert_eq!(rule.whitelist_user_ids, vec![200]);
+        assert_eq!(rule.exempt_user_ids, vec![200]);
+        assert!(rule.exempt_roles.is_empty());
+        assert_eq!(rule.cooldown_seconds, 0);
+    }
+
+    #[test]
+    fn machine_and_ai_matchers_are_strictly_separated() {
+        assert!(normalize_and_validate_rule(&mut test_rule("machine", "semantic")).is_err());
+        assert!(normalize_and_validate_rule(&mut test_rule("ai", "contains")).is_err());
+        assert!(normalize_and_validate_rule(&mut test_rule("ai", "semantic")).is_ok());
     }
 }

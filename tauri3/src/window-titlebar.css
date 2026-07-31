@@ -34,6 +34,12 @@
   background: transparent;
 }
 
+html,
+body,
+#root {
+  background: transparent;
+}
+
 #root,
 .app-window {
   min-height: 100vh;
@@ -44,7 +50,28 @@
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
+  border: 1px solid #d9d9d9;
+  border-radius: 12px;
   background: var(--dh-window-chrome, #fff);
+  clip-path: inset(0 round 12px);
+}
+
+html.style-preview {
+  box-sizing: border-box;
+  padding: 10px;
+  background: #e9ebef;
+}
+
+html.style-preview body,
+html.style-preview #root {
+  min-height: 0;
+  height: calc(100vh - 20px);
+}
+
+html.style-preview .app-window {
+  min-height: 0;
+  height: 100%;
+  box-shadow: 0 12px 32px rgba(17, 24, 39, 0.12);
 }
 
 .window-titlebar {

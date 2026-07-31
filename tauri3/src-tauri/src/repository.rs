@@ -67,9 +67,21 @@ impl Database {
         moderation_enabled: bool,
         manual_takeover: bool,
     ) -> AppResult<()> {
-        self.with_connection(|connection| connection.execute("UPDATE groups SET enabled=?,ai_enabled=?,moderation_enabled=?,manual_takeover=?,updated_at=? WHERE account_id=? AND group_id=?", params![bool_i(enabled),bool_i(ai_enabled),bool_i(moderation_enabled),bool_i(manual_takeover),Utc::now().to_rfc3339(),account_id,group_id]))
+        self.with_connection(|connection| connection.execute("UPDATE groups SET enabled=?,ai_enabled=?,moderation_enabled=?,machine_rules_enabled=?,manual_takeover=?,updated_at=? WHERE account_id=? AND group_id=?", params![bool_i(enabled),bool_i(ai_enabled),bool_i(moderation_enabled),bool_i(moderation_enabled),bool_i(manual_takeover),Utc::now().to_rfc3339(),account_id,group_id]))
             .and_then(|changed| if changed == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) })
             .map_err(|error| AppError::new("group_update", error.to_string()))
+    }
+
+    pub fn set_group_rule_features(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        machine_enabled: bool,
+        ai_enabled: bool,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| connection.execute("UPDATE groups SET moderation_enabled=?,machine_rules_enabled=?,ai_rules_enabled=?,updated_at=? WHERE account_id=? AND group_id=?", params![bool_i(machine_enabled),bool_i(machine_enabled),bool_i(ai_enabled),Utc::now().to_rfc3339(),account_id,group_id]))
+            .and_then(|changed| if changed == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) })
+            .map_err(|error| AppError::new("group_rule_features", error.to_string()))
     }
 
     pub fn set_group_welcome(
@@ -206,14 +218,21 @@ impl Database {
         group_id: Option<i64>,
     ) -> AppResult<Vec<ModerationRule>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare("SELECT id,account_id,group_id,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json FROM rules WHERE account_id=? AND (?2 IS NULL OR group_id=0 OR group_id=?2) ORDER BY priority DESC,id")?;
-            let mut rules = statement.query_map(params![account_id, group_id], |row| {
-                let roles: String = row.get(14)?; let users: String = row.get(15)?;
-                Ok(ModerationRule { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, name: row.get(3)?, matcher: row.get(4)?, pattern: row.get(5)?, threshold: row.get(6)?, count: row.get(7)?, window_seconds: row.get(8)?, cooldown_seconds: row.get(9)?, priority: row.get(10)?, mode: row.get(11)?, enabled: row.get::<_, i64>(12)? != 0, semantic_threshold: row.get(13)?, exempt_roles: serde_json::from_str(&roles).unwrap_or_default(), exempt_user_ids: serde_json::from_str(&users).unwrap_or_default(), actions: Vec::new() })
+            let mut statement = connection.prepare("SELECT id,account_id,group_id,rule_type,scope,priority_level,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json FROM rules WHERE account_id=? ORDER BY CASE priority_level WHEN 'high' THEN 3 WHEN 'low' THEN 1 ELSE 2 END DESC,id")?;
+            let mut rules = statement.query_map(params![account_id], |row| {
+                let roles: String = row.get(17)?; let users: String = row.get(18)?;
+                Ok(ModerationRule { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, rule_type: row.get(3)?, scope: row.get(4)?, group_ids: Vec::new(), priority_level: row.get(5)?, whitelist_user_ids: Vec::new(), name: row.get(6)?, matcher: row.get(7)?, pattern: row.get(8)?, threshold: row.get(9)?, count: row.get(10)?, window_seconds: row.get(11)?, cooldown_seconds: row.get(12)?, priority: row.get(13)?, mode: row.get(14)?, enabled: row.get::<_, i64>(15)? != 0, semantic_threshold: row.get(16)?, exempt_roles: serde_json::from_str(&roles).unwrap_or_default(), exempt_user_ids: serde_json::from_str(&users).unwrap_or_default(), actions: Vec::new() })
             })?.collect::<Result<Vec<_>, _>>()?;
             for rule in &mut rules {
+                let mut group_statement = connection.prepare("SELECT group_id FROM rule_groups WHERE rule_id=? ORDER BY group_id")?;
+                rule.group_ids = group_statement.query_map(params![rule.id], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                let mut whitelist_statement = connection.prepare("SELECT user_id FROM rule_whitelist_members WHERE rule_id=? ORDER BY user_id")?;
+                rule.whitelist_user_ids = whitelist_statement.query_map(params![rule.id], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
                 let mut action_statement = connection.prepare("SELECT kind,duration_seconds,message FROM rule_actions WHERE rule_id=? ORDER BY position,id")?;
                 rule.actions = action_statement.query_map(params![rule.id], |row| Ok(RuleAction { kind: row.get(0)?, duration_seconds: row.get(1)?, message: row.get(2)? }))?.collect::<Result<Vec<_>, _>>()?;
+            }
+            if let Some(group_id) = group_id {
+                rules.retain(|rule| rule.scope == "global" || rule.group_ids.contains(&group_id));
             }
             Ok(rules)
         }).map_err(|error| AppError::new("rules_read", error.to_string()))
@@ -223,15 +242,26 @@ impl Database {
         self.with_connection(|connection| {
             let transaction = connection.transaction()?;
             let now = Utc::now().to_rfc3339();
-            let roles = serde_json::to_string(&rule.exempt_roles).unwrap_or_else(|_| "[]".into());
-            let users = serde_json::to_string(&rule.exempt_user_ids).unwrap_or_else(|_| "[]".into());
+            let legacy_group_id = if rule.scope == "selected" { rule.group_ids.first().copied().unwrap_or(0) } else { 0 };
+            let priority = match rule.priority_level.as_str() { "high" => 300, "low" => 1, _ => 100 };
+            let users = serde_json::to_string(&rule.whitelist_user_ids).unwrap_or_else(|_| "[]".into());
             let id = if rule.id > 0 {
-                transaction.execute("UPDATE rules SET group_id=?,name=?,matcher=?,pattern=?,threshold=?,count=?,window_seconds=?,cooldown_seconds=?,priority=?,mode=?,enabled=?,semantic_threshold=?,exempt_roles_json=?,exempt_user_ids_json=?,updated_at=? WHERE id=? AND account_id=?", params![rule.group_id,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,rule.cooldown_seconds,rule.priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,roles,users,now,rule.id,rule.account_id])?;
+                transaction.execute("UPDATE rules SET group_id=?,rule_type=?,scope=?,priority_level=?,name=?,matcher=?,pattern=?,threshold=?,count=?,window_seconds=?,cooldown_seconds=0,priority=?,mode=?,enabled=?,semantic_threshold=?,exempt_roles_json='[]',exempt_user_ids_json=?,updated_at=? WHERE id=? AND account_id=?", params![legacy_group_id,rule.rule_type,rule.scope,rule.priority_level,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,users,now,rule.id,rule.account_id])?;
                 rule.id
             } else {
-                transaction.execute("INSERT INTO rules(account_id,group_id,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![rule.account_id,rule.group_id,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,rule.cooldown_seconds,rule.priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,roles,users,now,now])?;
+                transaction.execute("INSERT INTO rules(account_id,group_id,rule_type,scope,priority_level,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?, '[]',?,?,?)", params![rule.account_id,legacy_group_id,rule.rule_type,rule.scope,rule.priority_level,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,users,now,now])?;
                 transaction.last_insert_rowid()
             };
+            transaction.execute("DELETE FROM rule_groups WHERE rule_id=?", params![id])?;
+            if rule.scope == "selected" {
+                for group_id in rule.group_ids.iter().copied().filter(|value| *value > 0) {
+                    transaction.execute("INSERT OR IGNORE INTO rule_groups(rule_id,account_id,group_id) VALUES(?,?,?)", params![id,rule.account_id,group_id])?;
+                }
+            }
+            transaction.execute("DELETE FROM rule_whitelist_members WHERE rule_id=?", params![id])?;
+            for user_id in rule.whitelist_user_ids.iter().copied().filter(|value| *value > 0) {
+                transaction.execute("INSERT OR IGNORE INTO rule_whitelist_members(rule_id,user_id) VALUES(?,?)", params![id,user_id])?;
+            }
             transaction.execute("DELETE FROM rule_actions WHERE rule_id=?", params![id])?;
             for (position, action) in rule.actions.iter().enumerate() { transaction.execute("INSERT INTO rule_actions(rule_id,kind,duration_seconds,message,position) VALUES(?,?,?,?,?)", params![id,action.kind,action.duration_seconds,action.message,position as i64])?; }
             transaction.commit()?;
@@ -244,10 +274,13 @@ impl Database {
             let transaction = connection.transaction()?;
             let now = Utc::now().to_rfc3339();
             for rule in rules {
-                let roles = serde_json::to_string(&rule.exempt_roles).unwrap_or_else(|_| "[]".into());
-                let users = serde_json::to_string(&rule.exempt_user_ids).unwrap_or_else(|_| "[]".into());
-                transaction.execute("INSERT INTO rules(account_id,group_id,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![account_id,rule.group_id,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,rule.cooldown_seconds,rule.priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,roles,users,now,now])?;
+                let legacy_group_id = if rule.scope == "selected" { rule.group_ids.first().copied().unwrap_or(0) } else { 0 };
+                let priority = match rule.priority_level.as_str() { "high" => 300, "low" => 1, _ => 100 };
+                let users = serde_json::to_string(&rule.whitelist_user_ids).unwrap_or_else(|_| "[]".into());
+                transaction.execute("INSERT INTO rules(account_id,group_id,rule_type,scope,priority_level,name,matcher,pattern,threshold,count,window_seconds,cooldown_seconds,priority,mode,enabled,semantic_threshold,exempt_roles_json,exempt_user_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?, '[]',?,?,?)", params![account_id,legacy_group_id,rule.rule_type,rule.scope,rule.priority_level,rule.name,rule.matcher,rule.pattern,rule.threshold,rule.count,rule.window_seconds,priority,rule.mode,bool_i(rule.enabled),rule.semantic_threshold,users,now,now])?;
                 let rule_id = transaction.last_insert_rowid();
+                if rule.scope == "selected" { for group_id in rule.group_ids.iter().copied().filter(|value| *value > 0) { transaction.execute("INSERT OR IGNORE INTO rule_groups(rule_id,account_id,group_id) VALUES(?,?,?)", params![rule_id,account_id,group_id])?; } }
+                for user_id in rule.whitelist_user_ids.iter().copied().filter(|value| *value > 0) { transaction.execute("INSERT OR IGNORE INTO rule_whitelist_members(rule_id,user_id) VALUES(?,?)", params![rule_id,user_id])?; }
                 for (position, action) in rule.actions.iter().enumerate() {
                     transaction.execute("INSERT INTO rule_actions(rule_id,kind,duration_seconds,message,position) VALUES(?,?,?,?,?)", params![rule_id, action.kind, action.duration_seconds, action.message, position as i64])?;
                 }
@@ -266,6 +299,26 @@ impl Database {
         })
         .map(|_| ())
         .map_err(|error| AppError::new("rule_delete", error.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_rule_evaluation(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        message_id: i64,
+        rule_id: i64,
+        rule_type: &str,
+        matched: bool,
+        confidence: Option<f64>,
+        mode: &str,
+        decision: &str,
+        reason: &str,
+        elapsed_ms: i64,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| connection.execute("INSERT INTO rule_evaluations(account_id,group_id,user_id,message_id,rule_id,rule_type,matched,confidence,mode,decision,reason,elapsed_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,message_id,rule_id) DO UPDATE SET matched=excluded.matched,confidence=excluded.confidence,mode=excluded.mode,decision=excluded.decision,reason=excluded.reason,elapsed_ms=excluded.elapsed_ms", params![account_id,group_id,user_id,message_id,rule_id,rule_type,bool_i(matched),confidence,mode,decision,reason,elapsed_ms,Utc::now().to_rfc3339()]))
+            .map(|_| ()).map_err(|error| AppError::new("rule_evaluation_write", error.to_string()))
     }
 
     pub fn create_knowledge_base(&self, base: &KnowledgeBase) -> AppResult<i64> {
@@ -859,6 +912,10 @@ impl Database {
                     "UPDATE effect_outbox SET state='unknown',claimed_at=NULL,next_attempt_at=NULL,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
                     params![error, receipt_json, outbox_id],
                 )?,
+                "failed-terminal" => transaction.execute(
+                    "UPDATE effect_outbox SET state='failed',completed_at=?,claimed_at=NULL,next_attempt_at=NULL,last_error=?,receipt_json=? WHERE id=? AND state='processing'",
+                    params![now.to_rfc3339(), error, receipt_json, outbox_id],
+                )?,
                 _ => {
                     let attempts: i64 = transaction
                         .query_row(
@@ -907,6 +964,33 @@ impl Database {
 
     pub fn list_audit(&self, account_id: &str, limit: usize) -> AppResult<Vec<AuditEvent>> {
         self.with_connection(|connection| { let mut statement = connection.prepare("SELECT id,account_id,group_id,user_id,actor,event,level,details,created_at FROM audit_events WHERE account_id=? ORDER BY created_at DESC,id DESC LIMIT ?")?; let rows = statement.query_map(params![account_id,limit.clamp(1,1000) as i64], |row| Ok(AuditEvent { id: row.get(0)?, account_id: row.get(1)?, group_id: row.get(2)?, user_id: row.get(3)?, actor: row.get(4)?, event: row.get(5)?, level: row.get(6)?, details: row.get(7)?, created_at: parse_time(row.get(8)?) }))?; rows.collect::<Result<Vec<_>,_>>() }).map_err(|error| AppError::new("audit_read", error.to_string()))
+    }
+
+    /// Support bundles are produced locally and need a small, cross-account
+    /// audit window even when the currently logged-in account is unavailable.
+    /// The caller aliases every identity before the data leaves this process.
+    pub fn list_support_audit(&self, limit: usize) -> AppResult<Vec<AuditEvent>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,account_id,group_id,user_id,actor,event,level,details,created_at \
+                 FROM audit_events ORDER BY id DESC LIMIT ?",
+            )?;
+            let rows = statement.query_map([limit.clamp(1, 500) as i64], |row| {
+                Ok(AuditEvent {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    group_id: row.get(2)?,
+                    user_id: row.get(3)?,
+                    actor: row.get(4)?,
+                    event: row.get(5)?,
+                    level: row.get(6)?,
+                    details: row.get(7)?,
+                    created_at: parse_time(row.get(8)?),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| AppError::new("audit_read", error.to_string()))
     }
 
     pub(crate) fn query_audit(&self, query: &crate::AuditQuery) -> AppResult<Vec<AuditEvent>> {
@@ -995,6 +1079,19 @@ impl DatabaseExecutor {
         .await
     }
 
+    pub async fn set_group_rule_features(
+        &self,
+        account_id: String,
+        group_id: i64,
+        machine_enabled: bool,
+        ai_enabled: bool,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_rule_features(&account_id, group_id, machine_enabled, ai_enabled)
+        })
+        .await
+    }
+
     pub async fn set_group_welcome(
         &self,
         account_id: String,
@@ -1029,6 +1126,41 @@ impl DatabaseExecutor {
     ) -> AppResult<usize> {
         self.execute(move |database| database.import_rules(&account_id, &rules))
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_rule_evaluation(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        message_id: i64,
+        rule_id: i64,
+        rule_type: String,
+        matched: bool,
+        confidence: Option<f64>,
+        mode: String,
+        decision: String,
+        reason: String,
+        elapsed_ms: i64,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.record_rule_evaluation(
+                &account_id,
+                group_id,
+                user_id,
+                message_id,
+                rule_id,
+                &rule_type,
+                matched,
+                confidence,
+                &mode,
+                &decision,
+                &reason,
+                elapsed_ms,
+            )
+        })
+        .await
     }
 
     pub async fn list_knowledge_bases(&self, account_id: String) -> AppResult<Vec<KnowledgeBase>> {
@@ -1153,6 +1285,11 @@ impl DatabaseExecutor {
 
     pub async fn list_audit(&self, account_id: String, limit: usize) -> AppResult<Vec<AuditEvent>> {
         self.execute(move |database| database.list_audit(&account_id, limit))
+            .await
+    }
+
+    pub async fn list_support_audit(&self, limit: usize) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.list_support_audit(limit))
             .await
     }
 
@@ -1392,6 +1529,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: true,
                 moderation_enabled: true,
+                machine_rules_enabled: true,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -1606,6 +1745,11 @@ mod tests {
             id: 0,
             account_id: "a".into(),
             group_id: 0,
+            rule_type: "machine".into(),
+            scope: "global".into(),
+            group_ids: Vec::new(),
+            priority_level: "medium".into(),
+            whitelist_user_ids: Vec::new(),
             name: "关键词".into(),
             matcher: "contains".into(),
             pattern: "广告".into(),
@@ -1617,7 +1761,7 @@ mod tests {
             mode: "observe".into(),
             enabled: true,
             semantic_threshold: 0.8,
-            exempt_roles: vec!["admin".into()],
+            exempt_roles: Vec::new(),
             exempt_user_ids: vec![],
             actions: vec![RuleAction {
                 kind: "recall".into(),
@@ -1694,15 +1838,19 @@ mod tests {
     }
 
     #[test]
-    fn rule_cooldown_starts_only_after_a_successful_effect() {
+    fn legacy_cooldown_value_does_not_change_v2_rule_shape() {
         let database = database();
-        let now = Utc::now();
         let rule_id = database
             .save_rule(&ModerationRule {
                 id: 0,
                 account_id: "a".into(),
                 group_id: 1,
-                name: "cooldown".into(),
+                rule_type: "machine".into(),
+                scope: "selected".into(),
+                group_ids: vec![1],
+                priority_level: "high".into(),
+                whitelist_user_ids: vec![7],
+                name: "legacy-cooldown".into(),
                 matcher: "contains".into(),
                 pattern: "x".into(),
                 threshold: 0,
@@ -1718,21 +1866,17 @@ mod tests {
                 actions: Vec::new(),
             })
             .unwrap();
-        assert!(database
-            .rule_cooldown_allows(rule_id, "a", 1, 2, now, 60)
-            .unwrap());
-        assert!(database
-            .rule_cooldown_allows(rule_id, "a", 1, 2, now, 60)
-            .unwrap());
-        database
-            .mark_rule_executed(rule_id, "a", 1, 2, now)
+        let rule = database
+            .list_rules("a", Some(1))
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.id == rule_id)
             .unwrap();
-        assert!(!database
-            .rule_cooldown_allows(rule_id, "a", 1, 2, now + chrono::Duration::seconds(59), 60,)
-            .unwrap());
-        assert!(database
-            .rule_cooldown_allows(rule_id, "a", 1, 2, now + chrono::Duration::seconds(60), 60,)
-            .unwrap());
+        assert_eq!(rule.rule_type, "machine");
+        assert_eq!(rule.scope, "selected");
+        assert_eq!(rule.group_ids, vec![1]);
+        assert_eq!(rule.priority_level, "high");
+        assert_eq!(rule.whitelist_user_ids, vec![7]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, type ReactNode } from 'rea
 import { createRoot } from 'react-dom/client'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { Activity, BookOpen, Bug, CalendarClock, CircleAlert, LoaderCircle, MessagesSquare, Settings2, ShieldCheck, Users } from 'lucide-react'
+import { Activity, BookOpen, Bug, CalendarClock, LayoutDashboard, LoaderCircle, MessagesSquare, Settings2, ShieldCheck, Users } from 'lucide-react'
 import './styles.css'
 import './window-titlebar.css'
 import './brand.css'
@@ -10,6 +10,7 @@ import './runtime.css'
 import './pages.css'
 import './close-dialog.css'
 import './button-help.css'
+import './select-field.css'
 import './premium.css'
 import './about.css'
 import GroupMembersPage from './GroupMembersPage'
@@ -25,6 +26,7 @@ import CloseDialog from './components/CloseDialog'
 import ButtonHelp from './components/ButtonHelp'
 import AboutDialog from './components/AboutDialog'
 import WindowTitlebar from './components/WindowTitlebar'
+import ErrorBanner from './components/ErrorBanner'
 import type { Diagnostic } from './runtimeTypes'
 import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
 import { api, readableError } from './api/client'
@@ -36,7 +38,7 @@ class AppErrorBoundary extends React.Component<{ children: ReactNode }, { messag
 }
 
 const nav: [PageName, typeof Activity][] = [
-  ['总览', Activity], ['群组与成员', Users], ['消息台', MessagesSquare], ['规则', ShieldCheck],
+  ['总览', LayoutDashboard], ['群组与成员', Users], ['消息台', MessagesSquare], ['规则', ShieldCheck],
   ['知识与 AI', BookOpen], ['任务与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
 ]
 
@@ -109,7 +111,7 @@ function App() {
   const [database, setDatabase] = useState<DatabaseStatus | null>(null)
   const [groups, setGroups] = useState<Group[]>([])
   const [accountId, setAccountId] = useState('')
-  const [aiSettings, setAiSettings] = useState<AiSettings>({ base_url: '', webhook_url: '', model: 'deepseek-v4-pro', api_key_configured: false })
+  const [aiSettings, setAiSettings] = useState<AiSettings>({ base_url: '', webhook_url: '', api_backend: 'chat_completions', model: 'deepseek-v4-pro', api_key_configured: false })
   const [overviewAudits, setOverviewAudits] = useState<Audit[]>([])
   const [summaries, setSummaries] = useState<DailySummary[]>([])
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null)
@@ -316,14 +318,14 @@ function App() {
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}
       <WangStatusBanner diagnostic={diagnostic} startup={wangStartup} />
-      {error && <div className="error-banner"><CircleAlert size={16} /><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
+      {error && <ErrorBanner message={error} onClose={() => setError('')} />}
       {page === '总览' && <OverviewPage diagnostic={diagnostic} database={database} groups={groups} audits={overviewAudits} summaries={summaries} loading={loading} refresh={() => void refresh(true)} />}
       {page === '群组与成员' && <GroupMembersPage groups={groups} selectedGroup={selectedGroup} setSelectedGroup={setSelectedGroup} activeGroup={activeGroup} onError={setError} refresh={refresh} />}
-      {page === '消息台' && <MessagesPage key={`messages-${accountId}-${pageEpoch}`} groups={groups} accountId={accountId} onError={setError} />}
-      {page === '规则' && <RulesPage key={`rules-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
-      {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
-      {page === '任务与计划' && <PlansPage key={`plans-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
-      {page === '审计' && <AuditPage key={`audit-${accountId}-${pageEpoch}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '消息台' && <MessagesPage key={`messages-${accountId}`} groups={groups} accountId={accountId} onError={setError} />}
+      {page === '规则' && <RulesPage key={`rules-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}`} accountId={accountId} groups={groups} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
+      {page === '任务与计划' && <PlansPage key={`plans-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '审计' && <AuditPage key={`audit-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>

@@ -1,7 +1,18 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, Schedule, ScheduleRun, SendResult, SummarySettings, TaskItem } from '../types'
+import type { AiProviderEndpoint, Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, RuleMember, Schedule, ScheduleRun, SendResult, SummarySettings, SupportBundleResult, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {
+  const raw = typeof reason === 'string'
+    ? reason
+    : reason && typeof reason === 'object' && 'message' in reason
+      ? String(reason.message)
+      : reason && typeof reason === 'object' && 'detail' in reason
+        ? String(reason.detail)
+        : String(reason)
+  if (/timed? ?out|timeout|请求超时/i.test(raw)) return '请求超时，请稍后重试'
+  if (/error sending request|network request failed|network error/i.test(raw)) return '网络请求失败，请检查网络或服务地址'
+  if (/connection refused|连接被拒绝/i.test(raw)) return '连接被拒绝，请确认服务已启动'
+  if (/AI 请求失败|AI 服务连接失败|AI 网络请求失败/i.test(raw) && /https?:\/\//i.test(raw)) return 'AI 服务连接失败，请检查网络、代理或服务地址'
   if (typeof reason === 'string') return reason
   if (reason && typeof reason === 'object') {
     if ('message' in reason) return String(reason.message)
@@ -25,6 +36,7 @@ export function matchesMessageFilters(message: Message, filters: MessageFilters)
 
 export const api = {
   invoke,
+  exportSupportBundle: () => invoke<SupportBundleResult>('export_support_bundle'),
   listGroups: () => invoke<Group[]>('list_groups'),
   listCachedGroups: () => invoke<Group[]>('list_cached_groups'),
   recentMessages: (accountId: string, groupId?: number, limit = 500) => invoke<Message[]>('recent_messages', { accountId, groupId: groupId ?? null, limit }),
@@ -58,12 +70,14 @@ export const api = {
   recallMessage: (message: Message) => invoke<void>('recall_message', { groupId: message.groupId, senderUserId: message.userId, messageId: message.serverMessageId }),
   listRules: (accountId: string, groupId?: number) => invoke<Rule[]>('list_rules', { accountId, groupId: groupId ?? null }),
   saveRule: (rule: Rule) => invoke<number>('save_rule', { rule }),
+  setGroupRuleFeatures: (accountId: string, groupId: number, machineEnabled: boolean, aiEnabled: boolean) => invoke<void>('set_group_rule_features', { accountId, groupId, machineEnabled, aiEnabled }),
+  searchRuleMembers: (accountId: string, groupIds: number[], keyword: string, cursor?: string, limit = 50) => invoke<PageResult<RuleMember>>('search_rule_members', { accountId, groupIds, keyword, cursor: cursor ?? null, limit }),
   deleteRule: (accountId: string, ruleId: number) => invoke<void>('delete_rule', { accountId, ruleId }),
   async exportRules(accountId: string, rules: Rule[]) {
     try { return await invoke<string>('export_rules', { accountId }) }
     catch (reason) {
       if (!missingCommand(reason)) throw reason
-      return JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), rules }, null, 2)
+      return JSON.stringify({ version: 2, exportedAt: new Date().toISOString(), rules }, null, 2)
     }
   },
   async importRules(accountId: string, json: string) {
@@ -79,6 +93,10 @@ export const api = {
   deleteKnowledgeDocument: (baseId: number, documentId: number) => invoke<void>('delete_knowledge_document', { baseId, documentId }),
   bindKnowledgeBase: (baseId: number, accountId: string, groupIds: number[]) => invoke<void>('bind_knowledge_base', { baseId, accountId, groupIds }),
   listKnowledgeBindings: (accountId: string, baseId?: number) => invoke<Array<{ baseId: number; accountId: string; groupId: number; enabled: boolean }>>('list_knowledge_bindings', { accountId, baseId: baseId ?? null }),
+  listAiProviderEndpoints: (accountId: string) => invoke<AiProviderEndpoint[]>('list_ai_provider_endpoints', { accountId }),
+  saveAiProviderEndpoint: (input: Pick<AiProviderEndpoint, 'id' | 'accountId' | 'name' | 'baseUrl' | 'webhookUrl' | 'apiBackend' | 'model' | 'reasoningEffort' | 'priority' | 'enabled'> & { apiKey?: string | null }) => invoke<number>('save_ai_provider_endpoint', { input }),
+  deleteAiProviderEndpoint: (accountId: string, endpointId: number) => invoke<void>('delete_ai_provider_endpoint', { accountId, endpointId }),
+  testAiProviderEndpoint: (accountId: string, endpointId: number, message: string) => invoke<{ decision: { reply: string; reason: string; confidence: number }; elapsedMs: number; model: string }>('test_ai_provider_endpoint', { accountId, endpointId, message }),
   listBusinessApps: (accountId: string) => invoke<BusinessAppRecord[]>('list_business_apps', { accountId }),
   setBusinessAppEnabled: (accountId: string, appId: string, enabled: boolean) => invoke<void>('set_business_app_enabled', { accountId, appId, enabled }),
   getBusinessAppHealth: (accountId: string, appId: string) => invoke<BusinessAppHealth>('get_business_app_health', { accountId, appId }),

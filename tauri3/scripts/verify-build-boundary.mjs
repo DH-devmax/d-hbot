@@ -8,6 +8,7 @@ const packageJson = await readJson('package.json')
 const production = await readJson('src-tauri/tauri.conf.json')
 const developer = await readJson('src-tauri/tauri.fixture.conf.json')
 const cargoToml = await readFile(path.join(root, 'src-tauri/Cargo.toml'), 'utf8')
+const windowStyles = await readFile(path.join(root, 'src/window-titlebar.css'), 'utf8')
 const scripts = packageJson.scripts || {}
 
 function assert(condition, message) {
@@ -23,6 +24,11 @@ const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
 
 assert(production.productName === 'DH BOT', '生产产品名必须为 DH BOT')
 assert(production.identifier === 'cloud.daha6.dhbot', '生产 identifier 不正确')
+assert(production.app?.macOSPrivateApi === true, '生产窗口未启用 macOS 原生透明背景能力')
+assert(developer.app?.macOSPrivateApi === true, '开发窗口未启用 macOS 原生透明背景能力')
+assert(production.app?.windows?.every(window => window.transparent === true && window.decorations === false), '生产窗口必须使用透明无边框配置')
+assert(/\.app-window\s*\{[\s\S]*?border-radius:\s*12px;[\s\S]*?clip-path:\s*inset\(0 round 12px\);/.test(windowStyles), '应用外壳未同时启用圆角与裁切')
+assert(!windowStyles.includes('html.window-maximized .app-window'), '最大化状态不得清除窗口圆角')
 assert(packageJson.version === production.version, 'package.json 与 Tauri 版本不一致')
 assert(packageJson.version === cargoVersion, 'package.json 与 Cargo 版本不一致')
 if (process.env.GITHUB_REF?.startsWith('refs/tags/v3.')) {

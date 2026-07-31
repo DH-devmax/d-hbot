@@ -65,7 +65,6 @@ pub struct WangMaintenanceStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct WangMaintenanceResult {
     pub request_id: String,
     pub operation: String,
@@ -307,7 +306,6 @@ pub fn run_maintenance_if_requested() -> bool {
 }
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
 pub fn ensure_webview2_runtime() -> bool {
     true
 }
@@ -1282,7 +1280,6 @@ pub fn maintenance_result(request_id: &str) -> AppResult<Option<WangMaintenanceR
 }
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
 pub fn maintenance_result(_request_id: &str) -> AppResult<Option<WangMaintenanceResult>> {
     Ok(None)
 }

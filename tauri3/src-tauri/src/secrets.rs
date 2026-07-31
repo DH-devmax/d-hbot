@@ -47,6 +47,12 @@ impl SecretStore {
         let temporary = self.path.with_extension("tmp");
         fs::write(&temporary, protected)
             .map_err(|error| AppError::new("secret_write", error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+                .map_err(|error| AppError::new("secret_write", error.to_string()))?;
+        }
         fs::rename(&temporary, &self.path)
             .map_err(|error| AppError::new("secret_write", error.to_string()))
     }
@@ -156,5 +162,13 @@ mod tests {
             store.load().unwrap().get("ai.api_key").map(String::as_str),
             Some("TOKEN")
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

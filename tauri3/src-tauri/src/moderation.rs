@@ -236,21 +236,16 @@ fn evaluate_with_scores(
     let mut sorted = rules.iter().filter(|rule| rule.enabled).collect::<Vec<_>>();
     sorted.sort_by(|left, right| {
         right
-            .priority
-            .cmp(&left.priority)
+            .priority_rank()
+            .cmp(&left.priority_rank())
             .then(left.id.cmp(&right.id))
     });
     let mut matches = Vec::new();
     for rule in sorted {
-        if rule.group_id != 0 && rule.group_id != input.member.group_id {
+        if !rule.applies_to_group(input.member.group_id) {
             continue;
         }
-        if rule
-            .exempt_roles
-            .iter()
-            .any(|role| role == &input.member.role)
-            || rule.exempt_user_ids.contains(&input.member.user_id)
-        {
+        if rule.whitelist_user_ids.contains(&input.member.user_id) {
             continue;
         }
         if let Some(reason) = matches_rule(rule, input, semantic_scores) {
@@ -269,7 +264,7 @@ fn evaluate_with_scores(
         .any(|matched| RuleMode::parse(&matched.mode).is_automatic());
     let priorities = rules
         .iter()
-        .map(|rule| (rule.id, rule.priority))
+        .map(|rule| (rule.id, rule.priority_rank()))
         .collect::<HashMap<_, _>>();
     let executable = matches
         .iter()
@@ -344,7 +339,9 @@ fn matches_rule(
             (count >= rule.count.max(1)).then(|| format!("时间窗内图片达到 {count} 次"))
         }
         "blacklist" if input.member.blacklisted => Some("黑名单成员".into()),
-        "rename_count" if input.rename_violations >= rule.count.max(1) => {
+        "rename_count"
+            if input.kind == "member_updated" && input.rename_violations >= rule.count.max(1) =>
+        {
             Some(format!("改名次数达到 {}", input.rename_violations))
         }
         "semantic" => {
@@ -397,22 +394,22 @@ fn line_count(value: &str) -> usize {
     }
 }
 
-pub(crate) fn merge_actions(actions: Vec<RuleAction>) -> Vec<RuleAction> {
-    merge_action_intents(
-        actions
-            .into_iter()
-            .map(|action| ActionIntent {
-                action,
-                contributors: Vec::new(),
-            })
-            .collect(),
-    )
-    .into_iter()
-    .map(|intent| intent.action)
-    .collect()
-}
-
 pub fn merge_action_intents(actions: Vec<ActionIntent>) -> Vec<ActionIntent> {
+    let highest_priority = actions
+        .iter()
+        .flat_map(|intent| intent.contributors.iter().map(|value| value.priority))
+        .max()
+        .unwrap_or_default();
+    let actions = actions
+        .into_iter()
+        .filter(|intent| {
+            intent.contributors.is_empty()
+                || intent
+                    .contributors
+                    .iter()
+                    .any(|value| value.priority == highest_priority)
+        })
+        .collect::<Vec<_>>();
     let has_remove = actions.iter().any(|intent| intent.action.kind == "remove");
     let has_mute = actions.iter().any(|intent| intent.action.kind == "mute");
     let mut seen = HashSet::new();
@@ -497,6 +494,16 @@ mod tests {
             id: 1,
             account_id: "a".into(),
             group_id: 0,
+            rule_type: if matcher == "semantic" {
+                "ai"
+            } else {
+                "machine"
+            }
+            .into(),
+            scope: "global".into(),
+            group_ids: Vec::new(),
+            priority_level: "medium".into(),
+            whitelist_user_ids: Vec::new(),
             name: "规则".into(),
             matcher: matcher.into(),
             pattern: String::new(),
@@ -569,24 +576,82 @@ mod tests {
         );
     }
     #[test]
-    fn admins_are_exempt_when_configured() {
+    fn legacy_role_exemptions_do_not_disable_machine_rules() {
         let mut current = member();
         current.role = "admin".into();
         let mut configured = rule("length", 0, vec![]);
         configured.exempt_roles.push("admin".into());
-        assert!(evaluate(
-            &[configured],
+        assert_eq!(
+            evaluate(
+                &[configured],
+                &ModerationInput {
+                    member: &current,
+                    kind: "text",
+                    text: "x",
+                    now: Utc::now(),
+                    recent: &[],
+                    rename_violations: 0
+                }
+            )
+            .matches
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn high_priority_rule_wins_and_same_priority_uses_longer_mute() {
+        let current = member();
+        let now = Utc::now();
+        let mut low_remove = rule(
+            "contains",
+            0,
+            vec![RuleAction {
+                kind: "remove".into(),
+                duration_seconds: 0,
+                message: String::new(),
+            }],
+        );
+        low_remove.id = 1;
+        low_remove.pattern = "测试".into();
+        low_remove.priority_level = "low".into();
+        let mut high_short_mute = rule(
+            "contains",
+            0,
+            vec![RuleAction {
+                kind: "mute".into(),
+                duration_seconds: 60,
+                message: String::new(),
+            }],
+        );
+        high_short_mute.id = 2;
+        high_short_mute.pattern = "测试".into();
+        high_short_mute.priority_level = "high".into();
+        let mut high_long_mute = high_short_mute.clone();
+        high_long_mute.id = 3;
+        high_long_mute.actions[0].duration_seconds = 600;
+        let result = evaluate(
+            &[low_remove, high_short_mute, high_long_mute],
             &ModerationInput {
                 member: &current,
                 kind: "text",
-                text: "x",
-                now: Utc::now(),
+                text: "测试",
+                now,
                 recent: &[],
-                rename_violations: 0
-            }
-        )
-        .matches
-        .is_empty());
+                rename_violations: 0,
+            },
+        );
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(result.actions[0].kind, "mute");
+        assert_eq!(result.actions[0].duration_seconds, 600);
+        assert_eq!(
+            result.action_intents[0]
+                .contributors
+                .iter()
+                .map(|value| value.rule_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     fn image_events(current: &Member, now: DateTime<Utc>, count: usize) -> Vec<RecentEvent> {
@@ -758,5 +823,36 @@ mod tests {
         assert_eq!(boundary.matches.len(), 1);
         assert!(!boundary.automatic);
         assert!(boundary.actions.is_empty());
+    }
+
+    #[test]
+    fn rename_count_only_matches_member_update_events() {
+        let current = member();
+        let configured = rule(
+            "rename_count",
+            0,
+            vec![RuleAction {
+                kind: "recall".into(),
+                duration_seconds: 0,
+                message: String::new(),
+            }],
+        );
+        let message = ModerationInput {
+            member: &current,
+            kind: "text",
+            text: "普通群消息",
+            now: Utc::now(),
+            recent: &[],
+            rename_violations: 5,
+        };
+        assert!(evaluate(std::slice::from_ref(&configured), &message)
+            .matches
+            .is_empty());
+
+        let member_update = ModerationInput {
+            kind: "member_updated",
+            ..message
+        };
+        assert_eq!(evaluate(&[configured], &member_update).matches.len(), 1);
     }
 }

@@ -1,8 +1,10 @@
 #![cfg(feature = "fixture")]
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
@@ -17,11 +19,70 @@ use dh_bot_lib::{
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
-struct FixtureProcess(Option<Child>);
+struct FixtureProcess {
+    child: Option<Child>,
+    http_port: u16,
+}
+
+fn request_fixture_shutdown(port: u16) {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let request = format!(
+        "POST /fixture/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_ok() {
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.read(&mut [0_u8; 256]);
+    }
+}
+
+fn terminate_fixture_browser_children(fixture_pid: u32) {
+    let profile_prefix = format!("dh-fixture-browser-{fixture_pid}-");
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$prefix = [regex]::Escape('{profile_prefix}'); Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -match $prefix }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let _ = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", &profile_prefix])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 
 impl Drop for FixtureProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
+            let fixture_pid = child.id();
+            request_fixture_shutdown(self.http_port);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            terminate_fixture_browser_children(fixture_pid);
+            if exited {
+                return;
+            }
             #[cfg(windows)]
             {
                 let process_id = child.id().to_string();
@@ -86,7 +147,7 @@ struct FixedAiFactory;
 impl AiProviderFactory for FixedAiFactory {
     fn create(
         &self,
-        _config: RuntimeAiConfig,
+        _configs: Vec<RuntimeAiConfig>,
     ) -> dh_bot_lib::error::AppResult<Arc<dyn RuntimeAiProvider>> {
         Ok(Arc::new(FixedAiProvider))
     }
@@ -97,14 +158,17 @@ async fn real_cdp_gateway_runs_through_headless_runtime_and_sqlite_effects() {
     let binary = env!("CARGO_BIN_EXE_dh-fixture");
     let http_base = "http://127.0.0.1:51302";
     let devtools_base = "http://127.0.0.1:9235";
-    let _process = FixtureProcess(Some(
-        Command::new(binary)
-            .env("DH_FIXTURE_HTTP_PORT", "51302")
-            .env("DH_FIXTURE_DEVTOOLS_PORT", "9235")
-            .env("DH_FIXTURE_HEADLESS", "1")
-            .spawn()
-            .unwrap(),
-    ));
+    let _process = FixtureProcess {
+        child: Some(
+            Command::new(binary)
+                .env("DH_FIXTURE_HTTP_PORT", "51302")
+                .env("DH_FIXTURE_DEVTOOLS_PORT", "9235")
+                .env("DH_FIXTURE_HEADLESS", "1")
+                .spawn()
+                .unwrap(),
+        ),
+        http_port: 51302,
+    };
     let gateway = Arc::new(CdpGateway::new(CdpClient::new(devtools_base).unwrap()));
     gateway.calibrate_capabilities(
         "3.0.0-fixture",

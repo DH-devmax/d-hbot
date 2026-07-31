@@ -211,6 +211,23 @@ fn rule(account_id: &str, spec: DefaultRuleSpec) -> ModerationRule {
     ModerationRule {
         id: 0,
         account_id: account_id.into(),
+        rule_type: if spec.matcher == "semantic" {
+            "ai"
+        } else {
+            "machine"
+        }
+        .into(),
+        scope: "global".into(),
+        group_ids: Vec::new(),
+        priority_level: if spec.priority >= 200 {
+            "high"
+        } else if spec.priority < 100 {
+            "low"
+        } else {
+            "medium"
+        }
+        .into(),
+        whitelist_user_ids: Vec::new(),
         group_id: 0,
         name: spec.name.into(),
         matcher: spec.matcher.into(),
@@ -218,12 +235,12 @@ fn rule(account_id: &str, spec: DefaultRuleSpec) -> ModerationRule {
         threshold: spec.threshold,
         count: spec.count,
         window_seconds: spec.window_seconds,
-        cooldown_seconds: 600,
+        cooldown_seconds: 0,
         priority: spec.priority,
         mode: spec.mode.into(),
         enabled: false,
         semantic_threshold: spec.semantic_threshold,
-        exempt_roles: vec!["owner".into(), "admin".into()],
+        exempt_roles: Vec::new(),
         exempt_user_ids: Vec::new(),
         actions: recall_action(),
     }

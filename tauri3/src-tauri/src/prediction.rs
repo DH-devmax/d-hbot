@@ -1,8 +1,9 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -80,34 +81,33 @@ pub struct Game {
     pub id: &'static str,
     pub name: &'static str,
     pub aliases: &'static [&'static str],
-    #[serde(skip_serializing)]
-    endpoint: &'static str,
 }
 
 pub const GAMES: &[Game] = &[
     Game {
-        id: "pc28",
+        id: "pcdd",
         name: "PC28",
-        aliases: &["pc蛋蛋", "PC蛋蛋"],
-        endpoint: "http://www.pceggs.com/play/pc28.aspx",
+        aliases: &["pc蛋蛋", "PC蛋蛋", "pcdd"],
     },
     Game {
-        id: "jnd28",
+        id: "jnd",
         name: "加拿大28",
-        aliases: &["加拿大"],
-        endpoint: "http://www.ok1116.com/play/jnd28/",
+        aliases: &["加拿大", "jnd28"],
+    },
+    Game {
+        id: "btc28",
+        name: "比特币28",
+        aliases: &["比特币", "BTC28"],
     },
     Game {
         id: "bj28",
         name: "北京28",
         aliases: &["北京"],
-        endpoint: "https://hao123wc.obs.ap-southeast-1.myhuaweicloud.com/zcs/duoduo_2.txt",
     },
     Game {
-        id: "bit",
-        name: "比特",
-        aliases: &["比特彩"],
-        endpoint: "",
+        id: "tx28",
+        name: "腾讯分分彩28",
+        aliases: &["腾讯分分彩", "腾讯28"],
     },
 ];
 
@@ -199,64 +199,216 @@ pub trait PredictionSource: Send + Sync {
     }
 }
 
-pub struct HttpPredictionSource {
-    client: reqwest::Client,
-    stale_after: Duration,
+const DYNAMIC_CONFIG_URL: &str =
+    "https://hao123wc.obs.ap-southeast-1.myhuaweicloud.com/zcs/duoduo_2.txt";
+const FALLBACK_BASES: &[&str] = &[
+    "https://api1.gsdatas.com",
+    "https://api2.gsdatas.com",
+    "https://api1.mbf52.com",
+    "https://api2.mbf52.com",
+];
+
+#[derive(Clone)]
+struct CachedPrediction {
+    stored_at: Instant,
+    result: PredictionSourceResult,
 }
 
-impl HttpPredictionSource {
+type SourceBaseCache = Option<(Instant, Vec<String>)>;
+
+pub struct ZcgLotterySource {
+    client: reqwest::Client,
+    stale_after: Duration,
+    token: String,
+    live_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedPrediction>>>,
+    history_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedPrediction>>>,
+    base_cache: Arc<tokio::sync::Mutex<SourceBaseCache>>,
+    request_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    test_bases: Vec<String>,
+}
+
+impl ZcgLotterySource {
     pub fn new(timeout: Duration) -> AppResult<Self> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(timeout.min(Duration::from_secs(8)))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .map_err(|error| AppError::new("prediction_client", error.to_string()))?;
+            .map_err(|_| AppError::new("prediction_client", "开奖数据客户端初始化失败"))?;
         Ok(Self {
             client,
             stale_after: Duration::from_secs(15 * 60),
+            token: std::env::var("DH_PREDICTION_TOKEN").unwrap_or_default(),
+            live_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            history_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            base_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            request_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            test_bases: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = token.into();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_base(mut self, base: impl Into<String>) -> Self {
+        self.test_bases = vec![base.into()];
+        self
+    }
+
+    async fn bases(&self) -> Vec<String> {
+        #[cfg(test)]
+        if !self.test_bases.is_empty() {
+            return self.test_bases.clone();
+        }
+        let mut cache = self.base_cache.lock().await;
+        if let Some((stored_at, bases)) = cache.as_ref() {
+            if stored_at.elapsed() < Duration::from_secs(10 * 60) {
+                return bases.clone();
+            }
+        }
+        let mut bases = Vec::new();
+        if let Ok(response) = self.client.get(DYNAMIC_CONFIG_URL).send().await {
+            if let Ok(value) = response.json::<serde_json::Value>().await {
+                for key in ["api1", "api2"] {
+                    if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
+                        let normalized = value.replace("http://", "https://");
+                        if normalized.starts_with("https://") {
+                            bases.push(normalized.trim_end_matches('/').to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(value) = std::env::var("DH_PREDICTION_BASE_URL") {
+            if value.starts_with("https://") {
+                bases.insert(0, value.trim_end_matches('/').to_string());
+            }
+        }
+        bases.extend(FALLBACK_BASES.iter().map(|value| (*value).to_string()));
+        let mut seen = HashSet::new();
+        bases.retain(|value| seen.insert(value.clone()));
+        *cache = Some((Instant::now(), bases.clone()));
+        bases
+    }
+
+    async fn fetch_network(&self, game: &Game) -> AppResult<PredictionSourceResult> {
+        if self.token.trim().is_empty() {
+            return Err(AppError::new(
+                "prediction_not_configured",
+                "开奖数据源尚未配置独立凭据，预测应用保持停用",
+            ));
+        }
+        let mut last_error = None;
+        for base in self.bases().await {
+            let response = match self
+                .client
+                .get(format!("{base}/api/datas/index"))
+                .query(&[("token", self.token.trim()), ("name", game.id)])
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    last_error = Some(AppError::new(
+                        "prediction_request",
+                        "开奖数据服务连接失败，正在尝试备用服务",
+                    ));
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                last_error = Some(AppError::new(
+                    "prediction_http",
+                    format!("开奖数据服务返回 HTTP {}", response.status()),
+                ));
+                continue;
+            }
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    last_error = Some(AppError::new("prediction_response", "开奖数据响应读取失败"));
+                    continue;
+                }
+            };
+            if token_rejected(&bytes) {
+                return Err(AppError::new("prediction_auth", "开奖数据凭据无效或已过期"));
+            }
+            let Some(snapshot) = parse_zcg_snapshot(game, &bytes) else {
+                last_error = Some(AppError::new(
+                    "prediction_contract",
+                    "开奖数据结构已变化，预测暂时停用",
+                ));
+                continue;
+            };
+            return Ok(PredictionSourceResult::from_snapshot(
+                snapshot,
+                Utc::now(),
+                self.stale_after,
+            ));
+        }
+        Err(last_error
+            .unwrap_or_else(|| AppError::new("prediction_unavailable", "开奖数据暂不可用"))
+            .retryable())
     }
 }
 
 #[async_trait]
-impl PredictionSource for HttpPredictionSource {
+impl PredictionSource for ZcgLotterySource {
     async fn fetch_live(&self, game: &Game) -> AppResult<PredictionSourceResult> {
-        if game.endpoint.is_empty() {
-            return Ok(PredictionSourceResult::missing());
+        if let Some(cached) = self.live_cache.lock().await.get(game.id).cloned() {
+            if cached.stored_at.elapsed() < Duration::from_secs(10) {
+                return Ok(cached.result);
+            }
         }
-        let response = self
-            .client
-            .get(game.endpoint)
-            .send()
+        let _request = self.request_lock.lock().await;
+        if let Some(cached) = self.live_cache.lock().await.get(game.id).cloned() {
+            if cached.stored_at.elapsed() < Duration::from_secs(10) {
+                return Ok(cached.result);
+            }
+        }
+        let result = self.fetch_network(game).await?;
+        let cached = CachedPrediction {
+            stored_at: Instant::now(),
+            result: result.clone(),
+        };
+        self.live_cache
+            .lock()
             .await
-            .map_err(|error| {
-                AppError::new("prediction_request", format!("读取预测数据失败：{error}"))
-                    .retryable()
-            })?;
-        if !response.status().is_success() {
-            return Err(AppError::new(
-                "prediction_http",
-                format!("预测数据暂不可用（HTTP {}）", response.status()),
-            )
-            .retryable());
-        }
-        let bytes = response
-            .bytes()
+            .insert(game.id.to_string(), cached.clone());
+        self.history_cache
+            .lock()
             .await
-            .map_err(|error| AppError::new("prediction_response", error.to_string()))?;
-        let snapshot = parse_game_snapshot(game, &bytes);
-        if snapshot.result.is_empty() || snapshot.period == "待更新" {
-            return Ok(PredictionSourceResult::missing());
+            .insert(game.id.to_string(), cached);
+        Ok(result)
+    }
+
+    async fn fetch_history(&self, game: &Game, limit: usize) -> AppResult<Vec<Vec<i64>>> {
+        if let Some(cached) = self.history_cache.lock().await.get(game.id).cloned() {
+            if cached.stored_at.elapsed() < Duration::from_secs(60) {
+                return Ok(cached
+                    .result
+                    .snapshot
+                    .map(|snapshot| snapshot.history.into_iter().take(limit).collect())
+                    .unwrap_or_default());
+            }
         }
-        Ok(PredictionSourceResult::from_snapshot(
-            snapshot,
-            Utc::now(),
-            self.stale_after,
-        ))
+        Ok(self
+            .fetch_live(game)
+            .await?
+            .snapshot
+            .map(|snapshot| snapshot.history.into_iter().take(limit).collect())
+            .unwrap_or_default())
     }
 }
 
 #[cfg(any(feature = "fixture", test))]
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FixturePredictionSource {
     snapshots: HashMap<String, PredictionSnapshot>,
@@ -265,7 +417,6 @@ pub struct FixturePredictionSource {
 }
 
 #[cfg(any(feature = "fixture", test))]
-#[allow(dead_code)]
 impl FixturePredictionSource {
     pub fn new(snapshots: impl IntoIterator<Item = PredictionSnapshot>) -> Self {
         let snapshots = snapshots
@@ -343,6 +494,7 @@ pub fn format_reply(result: &PredictionResult) -> String {
     format!("{} 第{}期\n最新结果：{}\n更新时间：{}\n趋势摘要：{}\n候选方向：{}\n参考度：{}，仅作信息参考。", result.game, result.period, join(&result.latest_result, " + "), result.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"), result.trend, if result.candidates.is_empty() { "暂无".into() } else { join(&result.candidates, "、") }, confidence_text(result.confidence))
 }
 
+#[cfg(test)]
 pub fn parse_snapshot(game: &str, body: &[u8]) -> PredictionSnapshot {
     let text = String::from_utf8_lossy(body);
     let pattern = Regex::new(r"(?im)(?:期号|期数|period|issue|expect)[^0-9]{0,12}([0-9]{2,20})[^0-9]{0,20}([0-9]{1,3})[+,:，、 ]+([0-9]{1,3})[+,:，、 ]+([0-9]{1,3})").unwrap();
@@ -385,36 +537,124 @@ pub fn parse_snapshot(game: &str, body: &[u8]) -> PredictionSnapshot {
             period
         },
         result,
-        updated_at: Utc::now(),
+        updated_at: Utc.timestamp_opt(0, 0).single().unwrap(),
         history,
         freshness: PredictionFreshness::Fresh.as_str().into(),
     }
 }
 
-fn parse_game_snapshot(game: &Game, body: &[u8]) -> PredictionSnapshot {
-    match game.id {
-        "pc28" => parse_pc28(body),
-        "jnd28" => parse_jnd28(body),
-        "bj28" => parse_bj28(body),
-        "bit" => parse_bit(body),
-        _ => parse_snapshot(game.name, body),
+#[derive(Debug, Clone)]
+struct ZcgDraw {
+    period: String,
+    result: Vec<i64>,
+    opened_at: DateTime<Utc>,
+}
+
+fn token_rejected(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_lowercase();
+    (text.contains("token") || text.contains("令牌"))
+        && (text.contains("错误")
+            || text.contains("无效")
+            || text.contains("失败")
+            || text.contains("expired")
+            || text.contains("invalid"))
+}
+
+fn parse_zcg_snapshot(game: &Game, body: &[u8]) -> Option<PredictionSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut draws = Vec::new();
+    collect_zcg_draws(&value, &mut draws);
+    draws.retain(|draw| !draw.period.is_empty() && draw.result.len() == 3);
+    draws.sort_by(|left, right| period_cmp(&right.period, &left.period));
+    let mut periods = HashSet::new();
+    draws.retain(|draw| periods.insert(draw.period.clone()));
+    let latest = draws.first()?.clone();
+    Some(PredictionSnapshot {
+        game: game.name.into(),
+        period: latest.period,
+        result: latest.result,
+        updated_at: latest.opened_at,
+        history: draws.into_iter().take(60).map(|draw| draw.result).collect(),
+        freshness: PredictionFreshness::Fresh.as_str().into(),
+    })
+}
+
+fn collect_zcg_draws(value: &serde_json::Value, output: &mut Vec<ZcgDraw>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_zcg_draws(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let period = json_text(
+                value,
+                &["issue", "expect", "preDrawIssue", "full_expect", "period"],
+            );
+            let code = json_text(
+                value,
+                &[
+                    "kjcodes",
+                    "opencode",
+                    "preDrawCode",
+                    "open_code",
+                    "kjcode",
+                    "result",
+                ],
+            );
+            let opened_at = ["time", "opentime", "preDrawTime", "open_time", "openTime"]
+                .iter()
+                .find_map(|key| values.get(*key).and_then(parse_open_time));
+            if !period.is_empty() && !code.is_empty() {
+                if let Some(opened_at) = opened_at {
+                    let result = numbers(&code);
+                    if result.len() == 3 {
+                        output.push(ZcgDraw {
+                            period,
+                            result,
+                            opened_at,
+                        });
+                    }
+                }
+            }
+            for nested in values.values() {
+                if nested.is_array() || nested.is_object() {
+                    collect_zcg_draws(nested, output);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
-fn parse_pc28(body: &[u8]) -> PredictionSnapshot {
-    parse_snapshot("PC28", body)
+fn parse_open_time(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    if let Some(value) = value.as_i64() {
+        let seconds = if value > 10_000_000_000 {
+            value / 1000
+        } else {
+            value
+        };
+        return Utc.timestamp_opt(seconds, 0).single();
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(value) = DateTime::parse_from_rfc3339(text) {
+        return Some(value.with_timezone(&Utc));
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"] {
+        if let Ok(value) = NaiveDateTime::parse_from_str(text, format) {
+            return Some(Utc.from_utc_datetime(&value));
+        }
+    }
+    text.parse::<i64>()
+        .ok()
+        .and_then(|value| parse_open_time(&serde_json::Value::from(value)))
 }
 
-fn parse_jnd28(body: &[u8]) -> PredictionSnapshot {
-    parse_snapshot("加拿大28", body)
-}
-
-fn parse_bj28(body: &[u8]) -> PredictionSnapshot {
-    parse_snapshot("北京28", body)
-}
-
-fn parse_bit(body: &[u8]) -> PredictionSnapshot {
-    parse_snapshot("比特", body)
+fn period_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<u128>(), right.parse::<u128>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
 }
 
 fn json_text(value: &serde_json::Value, keys: &[&str]) -> String {
@@ -459,6 +699,11 @@ fn confidence_text(value: f64) -> &'static str {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
     #[test]
     fn prediction_requires_explicit_mention() {
         assert!(is_prediction_request("@DH 预测 PC28"));
@@ -529,8 +774,8 @@ mod tests {
         let source = FixturePredictionSource::new([snapshot(now - chrono::Duration::minutes(30))])
             .with_now(now)
             .with_stale_after(Duration::from_secs(15 * 60));
-        let pc28 = GAMES.iter().find(|game| game.id == "pc28").unwrap();
-        let missing = GAMES.iter().find(|game| game.id == "bit").unwrap();
+        let pc28 = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        let missing = GAMES.iter().find(|game| game.id == "tx28").unwrap();
         assert_eq!(
             source.load(pc28).await.unwrap().status,
             PredictionFreshness::Stale
@@ -562,5 +807,81 @@ mod tests {
         }
         assert!(reply.contains("20260721001"));
         assert!(reply.contains("1 + 2 + 3"));
+    }
+
+    #[test]
+    fn parses_all_known_zcg_contract_shapes_with_real_times() {
+        let game = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        for body in [
+            r#"{"datas":[{"issue":"20260728002","kjcodes":"1,2,3","time":"2026-07-28 12:02:00"},{"issue":"20260728001","kjcodes":"4,5,6","time":"2026-07-28 12:01:00"}]}"#,
+            r#"{"data":[{"expect":"20260728002","opencode":"1,2,3","opentime":"2026-07-28 12:02:00"}]}"#,
+            r#"{"result":{"data":[{"preDrawIssue":"20260728002","preDrawCode":"1,2,3","preDrawTime":"2026-07-28 12:02:00"}]}}"#,
+            r#"{"data":[{"full_expect":"20260728002","open_code":"1,2,3","open_time":"2026-07-28 12:02:00"}]}"#,
+        ] {
+            let snapshot = parse_zcg_snapshot(game, body.as_bytes()).unwrap();
+            assert_eq!(snapshot.period, "20260728002");
+            assert_eq!(snapshot.result, vec![1, 2, 3]);
+            assert_eq!(
+                snapshot.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "2026-07-28 12:02:00"
+            );
+        }
+    }
+
+    #[test]
+    fn zcg_contract_rejects_missing_draw_time_and_token_errors() {
+        let game = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        assert!(parse_zcg_snapshot(
+            game,
+            br#"{"datas":[{"issue":"20260728002","kjcodes":"1,2,3"}]}"#
+        )
+        .is_none());
+        assert!(token_rejected("token验证错误".as_bytes()));
+        let source = ZcgLotterySource::new(Duration::from_secs(1))
+            .unwrap()
+            .with_token("TEST_TOKEN");
+        assert_eq!(source.token, "TEST_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn zcg_live_requests_are_single_flight_and_cached() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        let opened_at = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            server_hits.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 8 * 1024];
+            let _ = stream.read(&mut request);
+            let body = serde_json::json!({
+                "data": [{
+                    "issue": "20260728001",
+                    "kjcodes": "1,2,3",
+                    "time": opened_at
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let source = ZcgLotterySource::new(Duration::from_secs(1))
+            .unwrap()
+            .with_token("TEST_TOKEN")
+            .with_test_base(format!("http://{address}"));
+        let game = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        let (first, second) = tokio::join!(source.fetch_live(game), source.fetch_live(game));
+        assert_eq!(first.unwrap().status, PredictionFreshness::Fresh);
+        assert_eq!(second.unwrap().status, PredictionFreshness::Fresh);
+        assert_eq!(
+            source.fetch_live(game).await.unwrap().status,
+            PredictionFreshness::Fresh
+        );
+        worker.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

@@ -14,7 +14,7 @@ use crate::gateway::{
     GatewayRecord, GatewayRecordKind, GroupGateway, RuntimeGateway,
 };
 use crate::models::{
-    Group, GroupAnnouncement, Member, MemberRef, MemberRoster, RosterCompleteness,
+    Group, GroupAnnouncement, GroupMuteState, Member, MemberRef, MemberRoster, RosterCompleteness,
 };
 
 pub const FIXTURE_ACCOUNT: &str = "fixture-nim-10001";
@@ -94,6 +94,7 @@ pub struct FixtureAnnouncement {
     pub group_id: i64,
     pub notice_id: String,
     pub content: String,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +224,8 @@ impl FixtureGateway {
             enabled: false,
             ai_enabled: false,
             moderation_enabled: false,
+            machine_rules_enabled: false,
+            ai_rules_enabled: false,
             manual_takeover: false,
             welcome_message: "欢迎 @「[成员]」加入 DH Fixture 测试群。".into(),
             updated_at: now,
@@ -235,6 +238,8 @@ impl FixtureGateway {
             enabled: false,
             ai_enabled: false,
             moderation_enabled: false,
+            machine_rules_enabled: false,
+            ai_rules_enabled: false,
             manual_takeover: false,
             welcome_message: "欢迎 @「[成员]」加入 DH Fixture 第二测试群。".into(),
             updated_at: now,
@@ -1322,6 +1327,19 @@ impl GroupGateway for FixtureGateway {
         ))
     }
 
+    async fn get_group_mute_state(&self, group_id: i64) -> AppResult<GroupMuteState> {
+        let state = self.state.read().await;
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
+            return Err(AppError::new("group_not_found", "Fixture 群不存在"));
+        }
+        Ok(GroupMuteState {
+            group_id,
+            muted: state.group_mutes.contains(&group_id),
+            source: "fixture-state".into(),
+            checked_at: fixture_now(),
+        })
+    }
+
     async fn get_group_announcement(&self, group_id: i64) -> AppResult<Option<GroupAnnouncement>> {
         let state = self.state.read().await;
         Ok(state
@@ -1331,9 +1349,17 @@ impl GroupGateway for FixtureGateway {
                 group_id,
                 notice_id: value.notice_id.clone(),
                 content: value.content.clone(),
-                mode: "COMMON_NOTICE".into(),
+                mode: value.mode.clone(),
                 author_user_id: 10001,
             }))
+    }
+
+    async fn list_group_announcements(&self, group_id: i64) -> AppResult<Vec<GroupAnnouncement>> {
+        Ok(self
+            .get_group_announcement(group_id)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     async fn set_group_announcement(&self, group_id: i64, text: &str) -> AppResult<GatewayReceipt> {
@@ -1353,12 +1379,70 @@ impl GroupGateway for FixtureGateway {
                 group_id,
                 notice_id,
                 content: text.into(),
+                mode: "COMMON_NOTICE".into(),
             },
         );
         state
             .actions
             .push(Self::action("group_announcement", group_id, 0, text, 0));
         Ok(self.receipt("/v1/group/add-notice", ordinal, String::new()))
+    }
+
+    async fn update_group_announcement(
+        &self,
+        group_id: i64,
+        notice_id: &str,
+        text: &str,
+        mode: &str,
+    ) -> AppResult<GatewayReceipt> {
+        let mut state = self.state.write().await;
+        Self::fault_error(&mut state.faults)?;
+        let announcement = state
+            .announcements
+            .get_mut(&group_id)
+            .filter(|announcement| announcement.notice_id == notice_id)
+            .ok_or_else(|| AppError::new("notice_not_found", "Fixture 公告不存在"))?;
+        announcement.content = text.into();
+        announcement.mode = mode.into();
+        let ordinal = state.actions.len() + 1;
+        state.actions.push(Self::action(
+            "group_announcement_updated",
+            group_id,
+            0,
+            text,
+            0,
+        ));
+        let mut receipt = self.receipt("/v1/group/notice-opt", ordinal, String::new());
+        receipt.verification = Some("verified".into());
+        Ok(receipt)
+    }
+
+    async fn delete_group_announcement(
+        &self,
+        group_id: i64,
+        notice_id: &str,
+    ) -> AppResult<GatewayReceipt> {
+        let mut state = self.state.write().await;
+        Self::fault_error(&mut state.faults)?;
+        let exists = state
+            .announcements
+            .get(&group_id)
+            .is_some_and(|announcement| announcement.notice_id == notice_id);
+        if !exists {
+            return Err(AppError::new("notice_not_found", "Fixture 公告不存在"));
+        }
+        state.announcements.remove(&group_id);
+        let ordinal = state.actions.len() + 1;
+        state.actions.push(Self::action(
+            "group_announcement_deleted",
+            group_id,
+            0,
+            notice_id,
+            0,
+        ));
+        let mut receipt = self.receipt("/v1/group/notice-del", ordinal, String::new());
+        receipt.verification = Some("verified".into());
+        Ok(receipt)
     }
 }
 
@@ -1603,9 +1687,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(announcement.content, "Fixture 群公告");
+        <FixtureGateway as GroupGateway>::update_group_announcement(
+            &fixture,
+            FIXTURE_GROUP,
+            &announcement.notice_id,
+            "Fixture 编辑后的群公告",
+            "TOP_NOTICE",
+        )
+        .await
+        .unwrap();
+        let updated = fixture
+            .get_group_announcement(FIXTURE_GROUP)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.content, "Fixture 编辑后的群公告");
+        assert_eq!(updated.mode, "TOP_NOTICE");
+        fixture
+            .delete_group_announcement(FIXTURE_GROUP, &updated.notice_id)
+            .await
+            .unwrap();
+        assert!(fixture
+            .get_group_announcement(FIXTURE_GROUP)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
             fixture.snapshot().await.actions.last().unwrap().kind,
-            "group_announcement"
+            "group_announcement_deleted"
         );
         fixture
             .set_group_announcement(FIXTURE_SECOND_GROUP, "第二群公告")
@@ -1631,6 +1740,7 @@ mod tests {
         );
         for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
             fixture.set_group_mute(group_id, true).await.unwrap();
+            assert!(fixture.get_group_mute_state(group_id).await.unwrap().muted);
         }
         assert_eq!(
             fixture.snapshot().await.group_mutes,
@@ -1638,6 +1748,7 @@ mod tests {
         );
         for group_id in [FIXTURE_GROUP, FIXTURE_SECOND_GROUP] {
             fixture.set_group_mute(group_id, false).await.unwrap();
+            assert!(!fixture.get_group_mute_state(group_id).await.unwrap().muted);
         }
         assert!(fixture.snapshot().await.group_mutes.is_empty());
     }

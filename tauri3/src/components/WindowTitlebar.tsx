@@ -19,7 +19,10 @@ export default function WindowTitlebar() {
     let active = true
     const syncMaximized = () => {
       void appWindow.isMaximized().then(value => {
-        if (active) setMaximized(value)
+        if (active) {
+          setMaximized(value)
+          document.documentElement.classList.toggle('window-maximized', value)
+        }
       }).catch(reason => reportWindowError('isMaximized', reason))
     }
     syncMaximized()
@@ -31,6 +34,7 @@ export default function WindowTitlebar() {
     return () => {
       active = false
       unlisten?.()
+      document.documentElement.classList.remove('window-maximized')
     }
   }, [])
 
@@ -41,7 +45,7 @@ export default function WindowTitlebar() {
   const toggleMaximize = () => {
     if (!isTauriRuntime()) return
     const appWindow = getCurrentWindow()
-    void appWindow.toggleMaximize().then(() => appWindow.isMaximized()).then(setMaximized).catch(reason => reportWindowError('toggleMaximize', reason))
+    void appWindow.toggleMaximize().then(() => appWindow.isMaximized()).then(value => { setMaximized(value); document.documentElement.classList.toggle('window-maximized', value) }).catch(reason => reportWindowError('toggleMaximize', reason))
   }
 
   const close = () => {
@@ -51,15 +55,15 @@ export default function WindowTitlebar() {
   const toggleFromTitlebar = () => {
     if (!isTauriRuntime()) return
     const appWindow = getCurrentWindow()
-    void appWindow.toggleMaximize().then(() => appWindow.isMaximized()).then(setMaximized).catch(reason => reportWindowError('toggleMaximize', reason))
+    void appWindow.toggleMaximize().then(() => appWindow.isMaximized()).then(value => { setMaximized(value); document.documentElement.classList.toggle('window-maximized', value) }).catch(reason => reportWindowError('toggleMaximize', reason))
   }
 
   return <header className="window-titlebar">
     <div className="window-titlebar__drag" data-tauri-drag-region onDoubleClick={toggleFromTitlebar} />
     <div className="window-titlebar__controls">
-      <button data-window-control className="window-control" type="button" aria-label="Minimize" title="Minimize" onMouseDown={event => event.stopPropagation()} onClick={minimize}><Minus size={16} strokeWidth={1.8} /></button>
-      <button data-window-control className="window-control" type="button" aria-label={maximized ? 'Restore' : 'Maximize'} title={maximized ? 'Restore' : 'Maximize'} onMouseDown={event => event.stopPropagation()} onClick={toggleMaximize}>{maximized ? <Copy size={14} strokeWidth={1.8} /> : <Square size={14} strokeWidth={1.8} />}</button>
-      <button data-window-control className="window-control window-control--close" type="button" aria-label="Close" title="Close" onMouseDown={event => event.stopPropagation()} onClick={close}><X size={17} strokeWidth={1.8} /></button>
+      <button data-window-control className="window-control" type="button" aria-label="最小化" title="最小化" onMouseDown={event => event.stopPropagation()} onClick={minimize}><Minus size={16} strokeWidth={1.8} /></button>
+      <button data-window-control className="window-control" type="button" aria-label={maximized ? '还原窗口' : '最大化'} title={maximized ? '还原窗口' : '最大化'} onMouseDown={event => event.stopPropagation()} onClick={toggleMaximize}>{maximized ? <Copy size={14} strokeWidth={1.8} /> : <Square size={14} strokeWidth={1.8} />}</button>
+      <button data-window-control className="window-control window-control--close" type="button" aria-label="关闭" title="关闭" onMouseDown={event => event.stopPropagation()} onClick={close}><X size={17} strokeWidth={1.8} /></button>
     </div>
   </header>
 }

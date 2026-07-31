@@ -1,11 +1,13 @@
 type PreviewRecord = Record<string, unknown>
 
 export function installStylePreviewFixture() {
+  document.documentElement.classList.add('style-preview')
   const actions: Array<{ command: string; args: PreviewRecord }> = []
   let callbackId = 1
+  let windowMaximized = false
   const defaultRule = (id: number, name: string, matcher: string, pattern = '', threshold = 0, count = 0, windowSeconds = 0, priority = 100, mode = 'automatic', semanticThreshold = 0.8): PreviewRecord => ({
-    id, accountId: 'ACCOUNT', groupId: 0, name, matcher, pattern, threshold, count, windowSeconds, cooldownSeconds: 600,
-    priority, mode, enabled: false, semanticThreshold, exemptRoles: ['owner', 'admin'], exemptUserIds: [],
+    id, accountId: 'ACCOUNT', groupId: 0, ruleType: matcher === 'semantic' ? 'ai' : 'machine', scope: 'global', groupIds: [], name, matcher, pattern, threshold, count, windowSeconds, cooldownSeconds: 600,
+    priority, priorityLevel: priority >= 200 ? 'high' : priority >= 100 ? 'medium' : 'low', mode, enabled: false, semanticThreshold, exemptRoles: ['owner', 'admin'], exemptUserIds: [], whitelistUserIds: [],
     actions: [{ kind: 'recall', durationSeconds: 0, message: '' }],
   })
   let rules: PreviewRecord[] = [
@@ -54,8 +56,9 @@ export function installStylePreviewFixture() {
     { id: 7, baseId: 1, baseName: 'DH 默认群规与 FAQ', title: '预测说明', kind: 'markdown', content: '预测只展示整理后的彩种、期号、结果、更新时间、趋势和参考度。', source: 'built-in', contentHash: 'STYLE-HASH-7', enabled: true },
   ]
   const audits = [
-    { id: 2, accountId: 'ACCOUNT', groupId: 101, userId: 10002, actor: 'DH BOT', event: 'message_processed', level: 'info', details: '消息已处理并写入本地审计', createdAt: '2026-07-22T08:16:01Z' },
-    { id: 1, accountId: 'ACCOUNT', groupId: 101, userId: 10005, actor: 'rule', event: 'rule_matched', level: 'warning', details: '观察模式命中图片规则，未执行动作', createdAt: '2026-07-22T08:12:01Z' },
+    { id: 3, accountId: 'ACCOUNT', groupId: 101, userId: 10002, actor: 'DH BOT', event: 'message_received', level: 'info', details: JSON.stringify({ direction: 'incoming', messageId: 3, serverMessageId: 'MESSAGE-3', sequence: 3, kind: 'text', senderName: '广校', contentPreview: '@DH 请说明今天的群规', processingState: 'queued', result: 'persisted-and-acknowledged' }), createdAt: '2026-07-22T08:16:00Z' },
+    { id: 2, accountId: 'ACCOUNT', groupId: 101, userId: 10002, actor: 'DH BOT', event: 'message_processed', level: 'info', details: JSON.stringify({ direction: 'incoming', messageId: 3, serverMessageId: 'MESSAGE-3', sequence: 3, kind: 'text', senderName: '广校', contentPreview: '@DH 请说明今天的群规', processingState: 'processed', result: 'rules-and-ai-evaluated' }), createdAt: '2026-07-22T08:16:01Z' },
+    { id: 1, accountId: 'ACCOUNT', groupId: 101, userId: 10005, actor: 'rule', event: 'machine_rule_evaluated', level: 'warning', details: JSON.stringify({ messageId: 2, matchedRuleIds: [4], automatic: false, decision: '观察模式命中图片规则，未执行动作' }), createdAt: '2026-07-22T08:12:01Z' },
   ]
   const summaries = [{ id: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-22', content: '群内交流正常，今日有 3 条业务消息和 1 项待跟进任务。', source: 'local', createdAt: '2026-07-22T12:00:00Z' }]
 
@@ -64,11 +67,18 @@ export function installStylePreviewFixture() {
     switch (command) {
       case 'plugin:event|listen': return callbackId++
       case 'plugin:event|unlisten': return null
+      case 'plugin:window|is_maximized': return windowMaximized
+      case 'plugin:window|toggle_maximize': windowMaximized = !windowMaximized; return null
+      case 'plugin:window|minimize': return null
+      case 'plugin:window|close': return null
       case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Style Preview', pageUrl: 'http://127.0.0.1:5173', nimAccount: 'ACCOUNT', detail: '样式预览数据已加载，修改 CSS 后会自动刷新。' }
       case 'database_status': return { path: '样式预览内存数据', schemaVersion: 6, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
-      case 'get_ai_settings': return { base_url: '', webhook_url: '', model: 'deepseek-v4-pro', api_key_configured: false }
+      case 'get_ai_settings': return { base_url: '', webhook_url: '', api_backend: 'chat_completions', model: 'deepseek-v4-pro', api_key_configured: false }
+      case 'list_ai_provider_endpoints': return [{ id: 1, accountId: 'ACCOUNT', name: '主连接', baseUrl: 'https://api.example.invalid/v1', webhookUrl: '', apiBackend: 'chat_completions', model: 'deepseek-v4-pro', priority: 0, enabled: true, apiKeyConfigured: true, healthStatus: 'healthy', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: '2026-07-22T08:00:00Z', createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }, { id: 2, accountId: 'ACCOUNT', name: '备用连接', baseUrl: 'https://backup.example.invalid/v1', webhookUrl: '', apiBackend: 'responses', model: 'deepseek-v4-pro', priority: 1, enabled: true, apiKeyConfigured: true, healthStatus: 'unchecked', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: null, createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
+      case 'test_ai_provider_endpoint': return { decision: { reply: '你好，我可以协助处理群规、FAQ 和群内任务。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 1280, model: 'deepseek-v4-pro' }
       case 'get_wang_startup_settings': return { path: '', autoStart: true }
       case 'get_close_behavior': return 'ask'
+      case 'get_developer_calibration_status': return { active: false, finishing: false, startedAt: '', appFileVersion: '样式预览', mainScriptSha256: 'STYLE-PREVIEW-HASH', pageTitle: 'DH Style Preview', pageUrl: 'http://127.0.0.1:5174', capabilities: ['sendText', 'recall', 'mute', 'rename', 'announcement', 'groupMute', 'memberEvents'], operationCount: 0, callbackCount: 0, writeOperationCount: 0, baselineCount: 0, restoredBaselineCount: 0, restorationVerified: false, restorationError: '' }
       case 'list_groups': case 'list_cached_groups': return groups
       case 'list_audit': return audits
       case 'query_audit': return { items: audits, nextCursor: null }
@@ -78,10 +88,13 @@ export function installStylePreviewFixture() {
       case 'send_text_batch': return (args.groupIds || []).map((groupId: number) => ({ groupId, success: true, messageId: `SENT-${groupId}`, error: '' }))
       case 'execute_group_batch': return (args.input?.groupIds || []).map((groupId: number) => ({ groupId, success: true, status: 'succeeded', requestId: `STYLE-REQUEST-${groupId}`, messageId: args.input?.action === 'announcement' ? `STYLE-NOTICE-${groupId}` : '', error: '' }))
       case 'list_members': return { members, reportedCount: 16, resolvedCount: 16, complete: true, completeness: 'complete', completenessReason: '', httpReturnedCount: 16, httpReportedCount: 16, nimReturnedCount: 16, nimReportedCount: 16, authority: 'style-preview', sources: ['style-preview'] }
+      case 'local_members': return members
+      case 'search_rule_members': return { items: members.filter(member => !args.keyword || `${member.cardName} ${member.nickname} ${member.userId} ${member.nimId}`.includes(String(args.keyword))), nextCursor: null }
       case 'get_card_settings': return { prefix: 'DH', autoRename: false, paused: false }
       case 'get_ai_automation_settings': return { enabled: true, reply: true, tasks: true, recall: false, mute: false, remove: false, manualTakeover: false }
       case 'get_group_management_context': return { groupId: args.groupId, senderId: 10001, isManager: true, capabilities: { announcement: 'supported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }, memberCount: 16, announcementStatus: '可用' }
       case 'get_group_announcement': return { groupId: args.groupId, noticeId: 'STYLE-NOTICE-1', content: '文明交流，涉及资金、账号和验证码时请先联系管理员核实。', mode: 'COMMON_NOTICE', authorUserId: 10001 }
+      case 'list_group_announcements': return [{ groupId: args.groupId, noticeId: 'STYLE-NOTICE-1', content: '文明交流，涉及资金、账号和验证码时请先联系管理员核实。', mode: 'COMMON_NOTICE', authorUserId: 10001 }]
       case 'list_card_rename_jobs': return []
       case 'list_rules': return rules
       case 'save_rule': { const next = { ...args.rule, id: args.rule.id || rules.length + 1 }; rules = rules.filter(rule => rule.id !== next.id).concat(next); return next.id }
@@ -90,7 +103,7 @@ export function installStylePreviewFixture() {
       case 'import_rules': return 0
       case 'list_knowledge_bases': return bases
       case 'list_knowledge_documents': return documents
-      case 'list_knowledge_bindings': return []
+      case 'list_knowledge_bindings': return [{ baseId: args.baseId, accountId: 'ACCOUNT', groupId: 101, enabled: true }]
       case 'list_business_apps': return [{ accountId: 'ACCOUNT', appId: 'prediction', name: '预测', description: '读取已校准结果并生成统计参考', version: '1.0.0', enabled: true, status: 'ready', statusDetail: '1 个彩种数据可用', lastCheckedAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
       case 'list_business_app_runs': return [{ id: 1, accountId: 'ACCOUNT', appId: 'prediction', groupId: 101, messageId: 3, runKey: 'message:3', status: 'succeeded', freshness: 'fresh', aiUsed: true, reply: 'PC28 第20260722001期\n最新结果：1 + 2 + 3\n趋势摘要：近期样本稳定。', error: '', elapsedMs: 420, createdAt: '2026-07-22T08:16:02Z', completedAt: '2026-07-22T08:16:02Z' }]
       case 'get_business_app_health': return { appId: 'prediction', status: 'ready', detail: '1 个彩种数据可用', checkedAt: '2026-07-22T08:00:00Z', games: [{ id: 'pc28', name: 'PC28', status: 'ready', detail: '结果与历史数据可用' }, { id: 'jnd28', name: '加拿大28', status: 'unavailable', detail: '暂未发现可用结果' }] }

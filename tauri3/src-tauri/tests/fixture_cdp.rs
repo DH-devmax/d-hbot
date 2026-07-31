@@ -1,7 +1,9 @@
 #![cfg(feature = "fixture")]
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dh_bot_lib::fixture::FIXTURE_GROUP;
 use dh_bot_lib::gateway::{
@@ -9,11 +11,70 @@ use dh_bot_lib::gateway::{
 };
 use serde_json::json;
 
-struct FixtureProcess(Option<Child>);
+struct FixtureProcess {
+    child: Option<Child>,
+    http_port: u16,
+}
+
+fn request_fixture_shutdown(port: u16) {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let request = format!(
+        "POST /fixture/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_ok() {
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.read(&mut [0_u8; 256]);
+    }
+}
+
+fn terminate_fixture_browser_children(fixture_pid: u32) {
+    let profile_prefix = format!("dh-fixture-browser-{fixture_pid}-");
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$prefix = [regex]::Escape('{profile_prefix}'); Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -match $prefix }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let _ = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", &profile_prefix])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 
 impl Drop for FixtureProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
+            let fixture_pid = child.id();
+            request_fixture_shutdown(self.http_port);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            terminate_fixture_browser_children(fixture_pid);
+            if exited {
+                return;
+            }
             #[cfg(windows)]
             {
                 let process_id = child.id().to_string();
@@ -34,19 +95,40 @@ impl Drop for FixtureProcess {
     }
 }
 
+async fn wait_for_records(
+    gateway: &CdpGateway,
+    timeout: Duration,
+) -> dh_bot_lib::gateway::GatewayBatch {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let batch = gateway.read_batch().await.unwrap();
+        if !batch.records.is_empty() {
+            return batch;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待 Fixture 浏览器将 NIM 回调交给已安装监听器超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn cdp_fixture_exercises_real_gateway_contract() {
     let binary = env!("CARGO_BIN_EXE_dh-fixture");
     let http_base = "http://127.0.0.1:51301";
     let devtools_base = "http://127.0.0.1:9234";
-    let _process = FixtureProcess(Some(
-        Command::new(binary)
-            .env("DH_FIXTURE_HTTP_PORT", "51301")
-            .env("DH_FIXTURE_DEVTOOLS_PORT", "9234")
-            .env("DH_FIXTURE_HEADLESS", "1")
-            .spawn()
-            .unwrap(),
-    ));
+    let _process = FixtureProcess {
+        child: Some(
+            Command::new(binary)
+                .env("DH_FIXTURE_HTTP_PORT", "51301")
+                .env("DH_FIXTURE_DEVTOOLS_PORT", "9234")
+                .env("DH_FIXTURE_HEADLESS", "1")
+                .spawn()
+                .unwrap(),
+        ),
+        http_port: 51301,
+    };
     let gateway = CdpGateway::new(CdpClient::new(devtools_base).unwrap());
     gateway.calibrate_capabilities(
         "3.0.0-fixture",
@@ -73,6 +155,13 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
     );
     assert_eq!(diagnostic.page_title, contract["metadata"]["pageTitle"]);
     assert_eq!(diagnostic.page_url, format!("{http_base}/"));
+    let probed = gateway.probe_capabilities("2.7.8", &"f".repeat(64)).await;
+    assert_eq!(probed.mute, CapabilityStatus::Supported);
+    assert_eq!(probed.recall, CapabilityStatus::Supported);
+    assert_eq!(probed.rename, CapabilityStatus::Supported);
+    assert_eq!(probed.remove_member, CapabilityStatus::Supported);
+    assert_eq!(probed.group_mute, CapabilityStatus::Supported);
+    assert_eq!(probed.announcement, CapabilityStatus::ManualVerification);
     assert_eq!(
         gateway.session_identity().await.unwrap().1,
         "fixture-nim-10001"
@@ -201,7 +290,7 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .set_group_announcement(FIXTURE_GROUP, "公告广播幂等测试")
         .await
         .unwrap();
-    assert_eq!(repeated.verification.as_deref(), Some("not-applicable"));
+    assert_eq!(repeated.verification.as_deref(), Some("unknown"));
     let actions_after_retry = client
         .get(format!("{http_base}/fixture/actions"))
         .send()
@@ -215,14 +304,14 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
             .iter()
             .filter(|action| action["kind"] == "group_announcement")
             .count(),
-        announcement_writes
+        announcement_writes + 1
     );
     assert_eq!(
         actions_after_retry
             .iter()
             .filter(|action| action["kind"] == "send_text")
             .count(),
-        announcement_broadcasts
+        announcement_broadcasts + 1
     );
     client
         .post(format!("{http_base}/fixture/faults"))
@@ -254,6 +343,52 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .unwrap();
     assert!(!send_receipt.request_id.is_empty());
     assert!(!send_receipt.message_id.is_empty());
+    client
+        .post(format!("{http_base}/fixture/events/message"))
+        .json(&json!({
+            "version":1,
+            "groupId":FIXTURE_GROUP,
+            "userId":10006,
+            "sequence":91,
+            "serverMessageId":"fixture-other-member-recall",
+            "text":"请提供验证码"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let recall_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let batch = gateway.read_batch().await.unwrap();
+        if batch.records.iter().any(|record| {
+            record.payload["idServer"].as_str() == Some("fixture-other-member-recall")
+        }) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < recall_deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let recall_receipt = gateway
+        .recall(FIXTURE_GROUP, 10006, "fixture-other-member-recall")
+        .await
+        .unwrap();
+    assert_eq!(recall_receipt.route, "nim.recallMsg");
+    assert_eq!(recall_receipt.message_id, "fixture-other-member-recall");
+    assert_eq!(recall_receipt.verification.as_deref(), Some("verified"));
+    let recall_actions = client
+        .get(format!("{http_base}/fixture/actions"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .unwrap();
+    assert!(recall_actions.iter().any(|action| {
+        action["kind"] == "recall"
+            && action["userId"] == 10006
+            && action["text"] == "fixture-other-member-recall"
+    }));
     assert_eq!(gateway.capabilities().rename, CapabilityStatus::Supported);
     assert_eq!(gateway.capabilities().mute, CapabilityStatus::Supported);
 
@@ -265,7 +400,7 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let member_batch = gateway.read_batch().await.unwrap();
+    let member_batch = wait_for_records(&gateway, Duration::from_secs(5)).await;
     assert_eq!(
         gateway
             .member_events(member_batch.records.clone())
@@ -275,7 +410,10 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         1
     );
     gateway
-        .ack(&member_batch.session, member_batch.records[0].sequence)
+        .ack(
+            &member_batch.session,
+            member_batch.records.last().unwrap().sequence,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -360,11 +498,12 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
 
     let unmute = gateway.unmute(FIXTURE_GROUP, 10006).await.unwrap();
     assert_eq!(unmute.verification.as_deref(), Some("verified"));
-    let recall = gateway
+    let missing_recall = gateway
         .recall(FIXTURE_GROUP, 10006, "fixture-contract-recall")
         .await
-        .unwrap();
-    assert_eq!(recall.message_id, "fixture-contract-recall");
+        .unwrap_err();
+    assert_eq!(missing_recall.code, "nim_recall");
+    assert!(!missing_recall.retryable);
     let group_mute = gateway.set_group_mute(FIXTURE_GROUP, true).await.unwrap();
     assert_eq!(group_mute.verification.as_deref(), Some("verified"));
     let remove = gateway

@@ -14,5 +14,7 @@ describe('typed client helpers', () => {
   it('normalizes command errors without leaking object formatting', () => {
     expect(readableError({ message: '权限不足' })).toBe('权限不足')
     expect(readableError('连接断开')).toBe('连接断开')
+    expect(readableError('AI 请求失败：error sending request for url (https://example.invalid/v1/chat/completions)'))
+      .toBe('网络请求失败，请检查网络或服务地址')
   })
 })

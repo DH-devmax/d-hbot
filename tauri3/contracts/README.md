@@ -1,5 +1,7 @@
 # DH BOT contract fixtures
 
+ZCG 群管理基线由 Rust 内置路由常量、参数校验和双层 envelope 测试覆盖，运行时通过 CDP/Electron/NIM 只读探测决定单项能力。Contract v2 继续保存旺商聊专有能力与真实写后回读的脱敏证据，不再把每个脚本 SHA 当作全部能力的统一开关。
+
 The first frozen contracts are:
 
 - `GroupGateway`: group/member reads, text, recall, mute, rename, remove,
@@ -15,26 +17,31 @@ The fixture files are `group_gateway_v1.json`, `group_gateway_v2.json`,
 `group_announcement_v2.json`, `ai_provider_v1.json`, `prediction_v1.json` and
 `schedule_v1.json`.
 
-`wangshangliao_capabilities.json` is the production-only calibration registry.
-It may only receive a version/hash pair after a sanitized real trace has passed
-replay. Fixture versions, URLs and ports never belong in that file. With no
-exact match, reads remain available while every write capability is
-`Unverified`. Group announcements are enabled only for a verified app version
-and script hash.
+`wangshangliao_capabilities.json` is the production-only evidence registry for
+WangShangLiao-specific write behavior. It may only receive a version/hash pair
+after a sanitized real trace has passed replay. Fixture versions, URLs and
+ports never belong in that file. Runtime ZCG-baseline capabilities are opened
+by the live read-only route/IPC/NIM probe, so an unknown hash with the same
+protocol structure is not blocked by the hash alone. WangShangLiao-specific
+operations such as announcements still require the corresponding evidence and
+remain `ManualVerification` until the first real readback succeeds.
 
 `group_gateway_v2.json` freezes the application file version, page title/URL,
 main-script SHA-256, request, transport envelope, business envelope, normalized
-receipt, callbacks and expected normalized state. Capability calibration uses
-the exact `(appFileVersion, mainScriptSha256)` pair. A new or changed build is
-`Unverified` until its sanitized trace is replayed successfully.
+receipt, callbacks and expected normalized state. The pair remains evidence and
+diagnostic provenance; the runtime probe also compares route signatures, IPC,
+NIM methods and response envelopes before opening a baseline capability.
 
 `execute_group_batch` is an application-level composition over the same frozen
 single-group operations. It accepts only `announcement`, `mute` and `unmute`,
 validates each group independently, and preserves selection order in its result.
-It does not introduce a generic protocol route. For WangShangLiao 2.7.7,
-announcement read/add/update/broadcast is calibrated. Whole-group mute and
-unmute remain `Unverified` until a sanitized two-managed-group trace verifies
-both the `MUTE_MEMBER` and `MUTE_NO` state transitions and restoration.
+It does not introduce a generic protocol route. Announcement read/add/update/
+broadcast remains subject to dedicated readback evidence. Whole-group mute and
+unmute are opened by the live ZCG route/IPC/NIM probe when `MUTE_MEMBER` and
+`MUTE_NO` are present and state readback is valid; otherwise the UI shows the
+concrete `ManualVerification` or `Unavailable` reason instead of a generic
+version lock. A sanitized two-managed-group trace is still required before
+enabling WangShangLiao-specific automation.
 
 Raw traces created by `DH-BOT-Dev.exe` belong in
 `%APPDATA%\DH\3.0\developer\contracts\raw` and never enter Git or a release bundle.

@@ -64,6 +64,8 @@ tauri3\dist\DH-BOT-VERSION-windows-x64-portable.zip
 
 `EXE_SHA256` 取自 `dist\production\SHA256SUMS.txt`。签名状态显示 `NotSigned` 属于当前个人发行的预期状态；仍需完成 9222、任务栏、托盘、退出残留和旺商聊登录复用检查。
 
+在实机验收中额外进入“调试”连续生成两次诊断包，检查 ZIP 均可打开且路径不相同，包内 `manifest.json` 与 `SHA256SUMS.txt` 存在，且压缩包内没有 `dh.db`、`secrets.dat`、Cookie、Token、API Key、真实群名或原始消息。诊断包是用户自行发送给维护人员的排障材料，不随发行包上传。
+
 ## 5. 上传云盘
 
 最少上传：

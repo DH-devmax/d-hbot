@@ -1,8 +1,12 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::defaults;
@@ -42,6 +46,7 @@ pub struct AiKnowledgeChunk {
 pub struct AiRequest {
     pub version: &'static str,
     pub event_id: String,
+    #[serde(skip_serializing)]
     pub persona: &'static str,
     pub group_id: i64,
     pub group_name: String,
@@ -151,7 +156,12 @@ pub fn build_recent_context(messages: &[Message], limit: usize) -> Vec<AiContext
 pub struct AiConfig {
     pub base_url: String,
     pub webhook_url: String,
+    /// `chat_completions` is the OpenAI-compatible default. `responses` uses
+    /// the OpenAI Responses envelope while keeping the same DH decision schema.
+    pub api_backend: String,
     pub model: String,
+    /// Responses reasoning depth: low, medium, high, or xhigh.
+    pub reasoning_effort: String,
     pub api_key: String,
     pub timeout: Duration,
 }
@@ -168,11 +178,30 @@ pub struct AiTestResult {
 #[async_trait]
 pub trait AiProvider: Send + Sync {
     async fn decide(&self, request: &AiRequest) -> AppResult<AiDecision>;
+
+    fn last_attempt_count(&self) -> usize {
+        1
+    }
 }
 
 pub struct ConfiguredProvider {
     config: AiConfig,
     client: reqwest::Client,
+    responses_route_unavailable: AtomicBool,
+}
+
+pub const AI_PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+pub const AI_TOTAL_BUDGET: Duration = Duration::from_secs(65);
+const RESPONSES_ROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+
+fn ai_transport_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "AI 请求超时，请检查网络或服务状态"
+    } else if error.is_connect() {
+        "AI 服务连接失败，请检查网络、代理或服务地址"
+    } else {
+        "AI 网络请求失败，请检查网络或服务地址"
+    }
 }
 
 impl ConfiguredProvider {
@@ -180,8 +209,10 @@ impl ConfiguredProvider {
         if config.model.trim().is_empty() {
             config.model = "deepseek-v4-pro".into();
         }
-        if config.timeout.is_zero() {
-            config.timeout = Duration::from_secs(30);
+        config.api_backend = normalize_api_backend(&config.api_backend)?;
+        config.reasoning_effort = normalize_reasoning_effort(&config.reasoning_effort)?;
+        if config.timeout.is_zero() || config.timeout > AI_PROVIDER_TIMEOUT {
+            config.timeout = AI_PROVIDER_TIMEOUT;
         }
         validate_remote_url(if config.webhook_url.trim().is_empty() {
             &config.base_url
@@ -189,10 +220,17 @@ impl ConfiguredProvider {
             &config.webhook_url
         })?;
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
             .timeout(config.timeout)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
-            .map_err(|error| AppError::new("ai_client", error.to_string()))?;
-        Ok(Self { config, client })
+            .map_err(|_| AppError::new("ai_client", "AI 网络客户端初始化失败"))?;
+        Ok(Self {
+            config,
+            client,
+            responses_route_unavailable: AtomicBool::new(false),
+        })
     }
 
     pub async fn test(&self, request: &AiRequest) -> AppResult<AiTestResult> {
@@ -215,14 +253,16 @@ impl ConfiguredProvider {
             return Err(AppError::new("ai_not_configured", "请先填写 AI Base URL"));
         }
         let url = completion_url(&self.config.base_url)?;
-        let request_json = serde_json::to_string(request)
+        let request_json = serde_json::to_string(&bounded_request(request))
             .map_err(|error| AppError::new("ai_request", error.to_string()))?;
         let body = json!({
             "model": self.config.model,
             "temperature": 0.3,
+            "max_tokens": 512,
+            "reasoning_effort": self.config.reasoning_effort,
             "response_format": {"type":"json_object"},
             "messages": [
-                {"role":"system","content":format!("{}\n\n只返回一个 JSON 对象，字段只能是 reply、actions、tasks、confidence、reason。群聊回复不得泄露接口地址、认证信息、上游字段和原始响应结构。", PERSONA)},
+                {"role":"system","content":format!("{}\n\n只返回一个 JSON 对象，字段只能是 reply、actions、tasks、confidence、reason。群聊回复不得泄露接口地址、认证信息、上游字段和原始响应结构。", request.persona)},
                 {"role":"user","content":request_json}
             ]
         });
@@ -230,14 +270,15 @@ impl ConfiguredProvider {
         if !self.config.api_key.trim().is_empty() {
             outbound = outbound.bearer_auth(self.config.api_key.trim());
         }
-        let response = outbound.send().await.map_err(|error| {
-            AppError::new("ai_request", format!("AI 请求失败：{error}")).retryable()
-        })?;
+        let response = outbound
+            .send()
+            .await
+            .map_err(|error| AppError::new("ai_request", ai_transport_error(&error)).retryable())?;
         let status = response.status();
         let bytes = response
             .bytes()
             .await
-            .map_err(|error| AppError::new("ai_response", error.to_string()))?;
+            .map_err(|_| AppError::new("ai_response", "AI 响应读取失败，请稍后重试"))?;
         if !status.is_success() {
             return Err(AppError::new("ai_http", format!("AI 请求返回 HTTP {status}")).retryable());
         }
@@ -250,15 +291,57 @@ impl ConfiguredProvider {
         decode_decision(content)
     }
 
+    async fn decide_responses(&self, request: &AiRequest) -> AppResult<AiDecision> {
+        if self.config.base_url.trim().is_empty() {
+            return Err(AppError::new("ai_not_configured", "请先填写 AI Base URL"));
+        }
+        let url = responses_url(&self.config.base_url)?;
+        let request_json = serde_json::to_string(&bounded_request(request))
+            .map_err(|error| AppError::new("ai_request", error.to_string()))?;
+        let body = json!({
+            "model": self.config.model,
+            "max_output_tokens": 1024,
+            "reasoning": {"effort": self.config.reasoning_effort},
+            "instructions": response_instruction(request.persona),
+            "input": request_json,
+            "text": {"format": {"type": "json_object"}}
+        });
+        let mut outbound = self.client.post(url).json(&body);
+        if !self.config.api_key.trim().is_empty() {
+            outbound = outbound.bearer_auth(self.config.api_key.trim());
+        }
+        let response = outbound
+            .send()
+            .await
+            .map_err(|error| AppError::new("ai_request", ai_transport_error(&error)).retryable())?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| AppError::new("ai_response", "AI 响应读取失败，请稍后重试"))?;
+        if !status.is_success() {
+            return Err(AppError::new(
+                "ai_http",
+                format!("AI 请求返回 HTTP {status}{}", response_error_suffix(&bytes)),
+            )
+            .retryable());
+        }
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::new("ai_response", format!("AI 响应格式错误：{error}")))?;
+        let content = response_output_text(&envelope)
+            .ok_or_else(|| AppError::new("ai_response", "AI Responses 响应中没有可用结果"))?;
+        decode_decision(content)
+    }
+
     async fn decide_webhook(&self, request: &AiRequest) -> AppResult<AiDecision> {
         let response = self
             .client
             .post(self.config.webhook_url.trim())
-            .json(request)
+            .json(&bounded_request(request))
             .send()
             .await
             .map_err(|error| {
-                AppError::new("webhook_request", format!("Webhook 请求失败：{error}")).retryable()
+                AppError::new("webhook_request", ai_transport_error(&error)).retryable()
             })?;
         let status = response.status();
         if !status.is_success() {
@@ -266,11 +349,437 @@ impl ConfiguredProvider {
                 AppError::new("webhook_http", format!("Webhook 返回 HTTP {status}")).retryable(),
             );
         }
-        let wire: WireDecision = response.json().await.map_err(|error| {
-            AppError::new("webhook_response", format!("Webhook 响应格式错误：{error}"))
-        })?;
+        let wire: WireDecision = response
+            .json()
+            .await
+            .map_err(|_| AppError::new("webhook_response", "Webhook 响应格式错误"))?;
         validate_decision(wire.into())
     }
+}
+
+fn response_error_suffix(bytes: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return String::new();
+    };
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if message.is_empty() {
+        String::new()
+    } else {
+        let sanitized = message
+            .replace("Authorization", "认证信息")
+            .replace("api_key", "密钥")
+            .chars()
+            .take(240)
+            .collect::<String>();
+        format!("：{sanitized}")
+    }
+}
+
+const MAX_RECENT_MESSAGES: usize = 8;
+const MAX_RECENT_CHARS: usize = 2_400;
+const MAX_KNOWLEDGE_CHUNKS: usize = 3;
+const MAX_KNOWLEDGE_CHARS: usize = 3_600;
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn bounded_request(request: &AiRequest) -> AiRequest {
+    let mut recent_context = request
+        .recent_context
+        .iter()
+        .rev()
+        .take(MAX_RECENT_MESSAGES)
+        .cloned()
+        .collect::<Vec<_>>();
+    recent_context.reverse();
+    let mut remaining = MAX_RECENT_CHARS;
+    for item in recent_context.iter_mut().rev() {
+        item.text = truncate_chars(&item.text, remaining);
+        remaining = remaining.saturating_sub(item.text.chars().count());
+    }
+    recent_context.retain(|item| !item.text.is_empty());
+
+    let mut knowledge = request
+        .knowledge
+        .iter()
+        .take(MAX_KNOWLEDGE_CHUNKS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut remaining = MAX_KNOWLEDGE_CHARS;
+    for item in &mut knowledge {
+        item.text = truncate_chars(&item.text, remaining);
+        remaining = remaining.saturating_sub(item.text.chars().count());
+    }
+    knowledge.retain(|item| !item.text.is_empty());
+
+    AiRequest {
+        version: request.version,
+        event_id: request.event_id.clone(),
+        persona: request.persona,
+        group_id: request.group_id,
+        group_name: request.group_name.clone(),
+        member_id: request.member_id,
+        member_name: request.member_name.clone(),
+        member_role: request.member_role.clone(),
+        message_id: request.message_id.clone(),
+        message: request.message.clone(),
+        recent_context,
+        knowledge,
+    }
+}
+
+fn config_fingerprint(config: &AiConfig) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        config.base_url.trim(),
+        config.webhook_url.trim(),
+        config.api_backend.trim(),
+        config.model.trim(),
+        config.reasoning_effort.trim(),
+        config.api_key.trim(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Default)]
+pub struct AiProviderPool {
+    inner: Arc<Mutex<ProviderPoolState>>,
+}
+
+#[derive(Default)]
+struct ProviderPoolState {
+    providers: HashMap<String, Arc<ConfiguredProvider>>,
+    health: HashMap<String, ProviderHealth>,
+}
+
+#[derive(Default)]
+struct ProviderHealth {
+    failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+impl AiProviderPool {
+    pub fn provider(&self, config: AiConfig) -> AppResult<Arc<ConfiguredProvider>> {
+        let fingerprint = config_fingerprint(&config);
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| AppError::new("ai_pool", "AI 连接池状态异常"))?;
+        if let Some(provider) = state.providers.get(&fingerprint) {
+            return Ok(provider.clone());
+        }
+        let provider = Arc::new(ConfiguredProvider::new(config)?);
+        state.providers.insert(fingerprint, provider.clone());
+        Ok(provider)
+    }
+
+    pub fn chain(&self, configs: Vec<AiConfig>) -> AppResult<Arc<dyn AiProvider>> {
+        if configs.is_empty() {
+            return Err(AppError::new("ai_not_configured", "请先配置 AI 连接"));
+        }
+        let mut providers = Vec::with_capacity(configs.len());
+        let mut last_error = None;
+        for config in configs {
+            let fingerprint = config_fingerprint(&config);
+            match self.provider(config) {
+                Ok(provider) => providers.push((fingerprint, provider)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if providers.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| AppError::new("ai_not_configured", "请先配置 AI 连接")));
+        }
+        Ok(Arc::new(PooledProviderChain {
+            pool: self.clone(),
+            providers,
+            last_attempts: AtomicUsize::new(0),
+        }))
+    }
+
+    fn available(&self, fingerprint: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .health
+                    .get(fingerprint)
+                    .and_then(|health| health.cooldown_until)
+            })
+            .is_none_or(|until| until <= Instant::now())
+    }
+
+    fn succeeded(&self, fingerprint: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.health.remove(fingerprint);
+        }
+    }
+
+    fn failed(&self, fingerprint: &str, error: &AppError) {
+        if let Ok(mut state) = self.inner.lock() {
+            let health = state.health.entry(fingerprint.into()).or_default();
+            health.failures = health.failures.saturating_add(1);
+            let auth_error = error.message.contains("401") || error.message.contains("403");
+            let seconds = if auth_error {
+                30 * 60
+            } else {
+                (30_u64.saturating_mul(1_u64 << health.failures.saturating_sub(1).min(4))).min(600)
+            };
+            health.cooldown_until = Some(Instant::now() + Duration::from_secs(seconds));
+        }
+    }
+}
+
+struct PooledProviderChain {
+    pool: AiProviderPool,
+    providers: Vec<(String, Arc<ConfiguredProvider>)>,
+    last_attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl AiProvider for PooledProviderChain {
+    async fn decide(&self, request: &AiRequest) -> AppResult<AiDecision> {
+        self.last_attempts.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let mut attempted = 0;
+        let mut last_error = None;
+        for (fingerprint, provider) in &self.providers {
+            if attempted >= 2 || started.elapsed() >= AI_TOTAL_BUDGET {
+                break;
+            }
+            if !self.pool.available(fingerprint) && self.providers.len() > 1 {
+                continue;
+            }
+            attempted += 1;
+            self.last_attempts.store(attempted, Ordering::Relaxed);
+            let remaining = AI_TOTAL_BUDGET.saturating_sub(started.elapsed());
+            let budget = remaining.min(AI_PROVIDER_TIMEOUT);
+            match tokio::time::timeout(budget, provider.decide(request)).await {
+                Ok(Ok(decision)) => {
+                    self.pool.succeeded(fingerprint);
+                    return Ok(decision);
+                }
+                Ok(Err(error)) => {
+                    self.pool.failed(fingerprint, &error);
+                    last_error = Some(error);
+                }
+                Err(_) => {
+                    let error = AppError::new("ai_request", "AI 请求超时，请检查网络或服务状态")
+                        .retryable();
+                    self.pool.failed(fingerprint, &error);
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::new("ai_provider_cooldown", "AI 连接正在冷却，请稍后重试").retryable()
+        }))
+    }
+
+    fn last_attempt_count(&self) -> usize {
+        self.last_attempts.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+pub struct AiReplyCache {
+    inner: Arc<Mutex<HashMap<String, ReplyCacheState>>>,
+    capacity: usize,
+    ttl: Duration,
+}
+
+#[derive(Clone)]
+pub struct AiKnowledgeCache {
+    inner: Arc<Mutex<KnowledgeCacheEntries>>,
+    ttl: Duration,
+}
+
+type KnowledgeCacheEntries = HashMap<String, (Instant, Vec<AiKnowledgeChunk>)>;
+
+impl Default for AiKnowledgeCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            ttl: Duration::from_secs(60),
+        }
+    }
+}
+
+impl AiKnowledgeCache {
+    pub fn get(&self, key: &str) -> Option<Vec<AiKnowledgeChunk>> {
+        let mut state = self.inner.lock().ok()?;
+        let (created_at, chunks) = state.get(key)?.clone();
+        if created_at.elapsed() > self.ttl {
+            state.remove(key);
+            return None;
+        }
+        Some(chunks)
+    }
+
+    pub fn insert(&self, key: String, chunks: Vec<AiKnowledgeChunk>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.retain(|_, (created_at, _)| created_at.elapsed() <= self.ttl);
+            if state.len() >= 512 {
+                if let Some(oldest) = state
+                    .iter()
+                    .min_by_key(|(_, (created_at, _))| *created_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    state.remove(&oldest);
+                }
+            }
+            state.insert(key, (Instant::now(), chunks));
+        }
+    }
+}
+
+pub fn knowledge_cache_key(
+    account_id: &str,
+    group_id: i64,
+    question: &str,
+    knowledge_revision: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        account_id,
+        &group_id.to_string(),
+        question,
+        knowledge_revision,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Default)]
+struct ReplyCacheState {
+    entries: HashMap<String, (Instant, AiDecision)>,
+    order: VecDeque<String>,
+}
+
+impl Default for AiReplyCache {
+    fn default() -> Self {
+        Self::new(512, Duration::from_secs(10 * 60))
+    }
+}
+
+impl AiReplyCache {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            capacity: capacity.max(1),
+            ttl,
+        }
+    }
+
+    pub fn get_scoped(&self, namespace: &str, key: &str) -> Option<AiDecision> {
+        let mut namespaces = self.inner.lock().ok()?;
+        let state = namespaces.get_mut(namespace)?;
+        let (created_at, decision) = state.entries.get(key)?.clone();
+        if created_at.elapsed() > self.ttl {
+            state.entries.remove(key);
+            state.order.retain(|item| item != key);
+            return None;
+        }
+        state.order.retain(|item| item != key);
+        state.order.push_back(key.into());
+        Some(decision)
+    }
+
+    pub fn insert_scoped(&self, namespace: &str, key: String, decision: AiDecision) -> bool {
+        if decision.reply.trim().is_empty()
+            || !decision.actions.is_empty()
+            || !decision.tasks.is_empty()
+        {
+            return false;
+        }
+        if let Ok(mut namespaces) = self.inner.lock() {
+            let state = namespaces.entry(namespace.into()).or_default();
+            state.order.retain(|item| item != &key);
+            state.order.push_back(key.clone());
+            state.entries.insert(key, (Instant::now(), decision));
+            while state.entries.len() > self.capacity {
+                if let Some(oldest) = state.order.pop_front() {
+                    state.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub fn answer_cache_key(
+    account_id: &str,
+    group_id: i64,
+    question: &str,
+    knowledge_revision: &str,
+    provider_revision: &str,
+) -> String {
+    let normalized = question
+        .to_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace() && !character.is_ascii_punctuation())
+        .collect::<String>();
+    let mut hasher = Sha256::new();
+    for value in [
+        account_id,
+        &group_id.to_string(),
+        &normalized,
+        knowledge_revision,
+        provider_revision,
+        PERSONA,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn prediction_narration_cache_key(
+    account_id: &str,
+    app_version: &str,
+    normalized_data: &Value,
+    provider_revision: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        account_id,
+        app_version,
+        &normalized_data.to_string(),
+        provider_revision,
+        PERSONA,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn is_cacheable_faq(question: &str) -> bool {
+    let question = question.trim();
+    if question.is_empty() || question.chars().count() > 240 {
+        return false;
+    }
+    let context_dependent = [
+        "刚才", "上面", "前面", "今天", "昨天", "这条", "这张", "总结", "摘要", "任务", "提醒",
+        "预测", "处罚", "禁言", "撤回", "移出",
+    ];
+    !context_dependent.iter().any(|word| question.contains(word))
 }
 
 #[async_trait]
@@ -278,11 +787,62 @@ impl AiProvider for ConfiguredProvider {
     async fn decide(&self, request: &AiRequest) -> AppResult<AiDecision> {
         validate_request(request)?;
         if self.config.webhook_url.trim().is_empty() {
-            self.decide_openai(request).await
+            match self.config.api_backend.as_str() {
+                "responses" => {
+                    // Reserve the first Responses probe. Concurrent AI assistant
+                    // and semantic-classifier requests must not both spend their
+                    // budget probing the same slow route.
+                    if self
+                        .responses_route_unavailable
+                        .swap(true, Ordering::AcqRel)
+                    {
+                        return self.decide_openai(request).await;
+                    }
+                    let response = match tokio::time::timeout(
+                        RESPONSES_ROUTE_PROBE_TIMEOUT,
+                        self.decide_responses(request),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => Err(AppError::new(
+                            "ai_responses_route",
+                            "AI Responses 路由探测超时，已切换兼容调用",
+                        )
+                        .retryable()),
+                    };
+                    if response
+                        .as_ref()
+                        .err()
+                        .is_some_and(responses_route_fallback_error)
+                    {
+                        // Some OpenAI-compatible gateways advertise Responses but
+                        // route the configured model only through Chat Completions.
+                        // Keep Responses as the configured contract and fall back
+                        // only for route-level 404/502/503 errors.
+                        self.decide_openai(request).await
+                    } else {
+                        if response.is_ok() {
+                            self.responses_route_unavailable
+                                .store(false, Ordering::Release);
+                        }
+                        response
+                    }
+                }
+                _ => self.decide_openai(request).await,
+            }
         } else {
             self.decide_webhook(request).await
         }
     }
+}
+
+fn responses_route_fallback_error(error: &AppError) -> bool {
+    error.code == "ai_responses_route"
+        || (error.code == "ai_http"
+            && ["HTTP 404", "HTTP 502", "HTTP 503"]
+                .iter()
+                .any(|status| error.message.contains(status)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,16 +1000,85 @@ pub fn is_mentioned(text: &str) -> bool {
 }
 
 fn completion_url(raw: &str) -> AppResult<String> {
+    endpoint_url(raw, "/chat/completions")
+}
+
+fn responses_url(raw: &str) -> AppResult<String> {
+    endpoint_url(raw, "/responses")
+}
+
+fn endpoint_url(raw: &str, endpoint: &str) -> AppResult<String> {
     validate_remote_url(raw)?;
     let mut value = raw.trim().trim_end_matches('/').to_string();
-    if value.ends_with("/chat/completions") {
+    if value.ends_with(endpoint) {
         return Ok(value);
     }
     if !value.ends_with("/v1") {
         value.push_str("/v1");
     }
-    value.push_str("/chat/completions");
+    value.push_str(endpoint);
     Ok(value)
+}
+
+pub fn normalize_api_backend(value: &str) -> AppResult<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "chat" | "chat_completions" | "openai" | "openai_compatible" => {
+            Ok("chat_completions".into())
+        }
+        "responses" => Ok("responses".into()),
+        _ => Err(AppError::new(
+            "ai_backend",
+            "AI 接口方式仅支持 Chat Completions 或 Responses",
+        )),
+    }
+}
+
+pub fn normalize_reasoning_effort(value: &str) -> AppResult<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "low" => Ok("low".into()),
+        "medium" | "high" | "xhigh" => Ok(normalized),
+        "xhight" => Ok("xhigh".into()),
+        _ => Err(AppError::new(
+            "ai_reasoning_effort",
+            "思考深度仅支持 low、medium、high 或 xhigh",
+        )),
+    }
+}
+
+fn response_instruction(persona: &str) -> String {
+    format!(
+        "{persona}\n\n只返回一个 JSON 对象，字段只能是 reply、actions、tasks、confidence、reason。群聊回复不得泄露接口地址、认证信息、上游字段和原始响应结构。"
+    )
+}
+
+fn response_output_text(envelope: &Value) -> Option<&str> {
+    envelope
+        .get("output_text")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            envelope
+                .get("output")
+                .and_then(Value::as_array)
+                .and_then(|output| {
+                    output.iter().find_map(|item| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .and_then(|content| {
+                                content.iter().find_map(|part| {
+                                    part.get("text").and_then(Value::as_str).or_else(|| {
+                                        part.pointer("/text/value").and_then(Value::as_str)
+                                    })
+                                })
+                            })
+                    })
+                })
+        })
+        .or_else(|| {
+            envelope
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+        })
 }
 
 fn validate_remote_url(raw: &str) -> AppResult<()> {
@@ -472,6 +1101,86 @@ fn validate_remote_url(raw: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn mock_openai(status: u16, reply: &str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = reply.to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            let body = if status == 200 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": serde_json::json!({
+                                "reply": reply,
+                                "actions": [],
+                                "tasks": [],
+                                "confidence": 0.8,
+                                "reason": "mock"
+                            }).to_string()
+                        }
+                    }]
+                })
+                .to_string()
+            } else {
+                "{}".into()
+            };
+            let reason = if status == 200 {
+                "OK"
+            } else {
+                "Service Unavailable"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/v1"), worker)
+    }
+
+    fn mock_responses(reply: &str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = reply.to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /v1/responses "));
+            assert!(request.contains("\"max_output_tokens\":1024"));
+            assert!(request.contains("\"reasoning\":{\"effort\":\"xhigh\"}"));
+            let body = serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": serde_json::json!({
+                            "reply": reply,
+                            "actions": [],
+                            "tasks": [],
+                            "confidence": 0.8,
+                            "reason": "mock"
+                        }).to_string()
+                    }]
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/v1"), worker)
+    }
     #[test]
     fn mention_requires_at_sign_and_boundary() {
         assert!(is_mentioned("@DH 帮我看看"));
@@ -489,6 +1198,13 @@ mod tests {
             completion_url("https://example.com/v1").unwrap(),
             "https://example.com/v1/chat/completions"
         );
+        assert_eq!(
+            responses_url("https://example.com/v1").unwrap(),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(normalize_api_backend("responses").unwrap(), "responses");
+        assert_eq!(normalize_api_backend("openai").unwrap(), "chat_completions");
+        assert_eq!(normalize_reasoning_effort("xhight").unwrap(), "xhigh");
     }
     #[test]
     fn remote_http_is_rejected() {
@@ -577,5 +1293,227 @@ mod tests {
             vec!["second", "third"]
         );
         assert!(build_recent_context(&messages, 0).is_empty());
+    }
+
+    fn text_decision(reply: &str) -> AiDecision {
+        AiDecision {
+            reply: reply.into(),
+            actions: Vec::new(),
+            tasks: Vec::new(),
+            confidence: 0.8,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn provider_pool_reuses_client_for_the_same_configuration() {
+        let pool = AiProviderPool::default();
+        let config = AiConfig {
+            base_url: "http://127.0.0.1:18080/v1".into(),
+            webhook_url: String::new(),
+            api_backend: "chat_completions".into(),
+            model: "deepseek-v4-pro".into(),
+            reasoning_effort: "low".into(),
+            api_key: "TOKEN".into(),
+            timeout: Duration::from_secs(8),
+        };
+        let first = pool.provider(config.clone()).unwrap();
+        let second = pool.provider(config).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn responses_backend_accepts_the_dh_decision_schema() {
+        let (base_url, worker) = mock_responses("responses reply");
+        let provider = ConfiguredProvider::new(AiConfig {
+            base_url,
+            webhook_url: String::new(),
+            api_backend: "responses".into(),
+            model: "gpt-5.6-luna".into(),
+            reasoning_effort: "xhight".into(),
+            api_key: "TOKEN".into(),
+            timeout: Duration::from_secs(2),
+        })
+        .unwrap();
+        let decision = provider
+            .decide(&AiRequest::testing("@DH 你好", Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(decision.reply, "responses reply");
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_chain_cools_failed_primary_and_uses_one_backup() {
+        let (primary_url, primary_worker) = mock_openai(503, "");
+        let (backup_url, backup_worker) = mock_openai(200, "backup reply");
+        let primary = AiConfig {
+            base_url: primary_url,
+            webhook_url: String::new(),
+            api_backend: "chat_completions".into(),
+            model: "deepseek-v4-pro".into(),
+            reasoning_effort: "low".into(),
+            api_key: "PRIMARY".into(),
+            timeout: Duration::from_secs(2),
+        };
+        let backup = AiConfig {
+            base_url: backup_url,
+            webhook_url: String::new(),
+            api_backend: "chat_completions".into(),
+            model: "deepseek-v4-pro".into(),
+            reasoning_effort: "low".into(),
+            api_key: "BACKUP".into(),
+            timeout: Duration::from_secs(2),
+        };
+        let primary_fingerprint = config_fingerprint(&primary);
+        let pool = AiProviderPool::default();
+        let chain = pool.chain(vec![primary, backup]).unwrap();
+        let decision = chain
+            .decide(&AiRequest::testing("@DH 群规是什么", Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(decision.reply, "backup reply");
+        assert_eq!(chain.last_attempt_count(), 2);
+        assert!(!pool.available(&primary_fingerprint));
+        primary_worker.join().unwrap();
+        backup_worker.join().unwrap();
+    }
+
+    #[test]
+    fn reply_cache_only_accepts_plain_text_decisions() {
+        let cache = AiReplyCache::new(2, Duration::from_secs(60));
+        cache.insert_scoped("account", "one".into(), text_decision("cached"));
+        assert_eq!(cache.get_scoped("account", "one").unwrap().reply, "cached");
+
+        let mut action = text_decision("must-not-cache");
+        action.actions.push(RuleAction {
+            kind: "recall".into(),
+            duration_seconds: 0,
+            message: String::new(),
+        });
+        cache.insert_scoped("account", "action".into(), action);
+        assert!(cache.get_scoped("account", "action").is_none());
+
+        cache.insert_scoped("account", "two".into(), text_decision("two"));
+        cache.insert_scoped("account", "three".into(), text_decision("three"));
+        assert!(cache.get_scoped("account", "one").is_none());
+    }
+
+    #[test]
+    fn reply_cache_capacity_is_isolated_per_account() {
+        let cache = AiReplyCache::new(1, Duration::from_secs(60));
+        cache.insert_scoped("account-a", "one".into(), text_decision("a"));
+        cache.insert_scoped("account-b", "one".into(), text_decision("b"));
+        assert_eq!(cache.get_scoped("account-a", "one").unwrap().reply, "a");
+        assert_eq!(cache.get_scoped("account-b", "one").unwrap().reply, "b");
+    }
+
+    #[test]
+    fn request_budget_limits_context_and_knowledge() {
+        let mut request = AiRequest::testing("@DH test", Vec::new());
+        request.recent_context = (0..20)
+            .map(|index| AiContextMessage {
+                user_id: index,
+                name: format!("member-{index}"),
+                text: "x".repeat(600),
+                time: index,
+            })
+            .collect();
+        request.knowledge = (0..8)
+            .map(|index| AiKnowledgeChunk {
+                base: "base".into(),
+                title: format!("doc-{index}"),
+                source: "test".into(),
+                text: "知".repeat(1_500),
+            })
+            .collect();
+        let bounded = bounded_request(&request);
+        assert!(bounded.recent_context.len() <= 8);
+        assert!(bounded.knowledge.len() <= 3);
+        assert!(
+            bounded
+                .recent_context
+                .iter()
+                .map(|item| item.text.chars().count())
+                .sum::<usize>()
+                <= MAX_RECENT_CHARS
+        );
+        assert!(
+            bounded
+                .knowledge
+                .iter()
+                .map(|item| item.text.chars().count())
+                .sum::<usize>()
+                <= MAX_KNOWLEDGE_CHARS
+        );
+    }
+
+    #[test]
+    fn prediction_narration_cache_key_tracks_period_algorithm_and_provider() {
+        let first = prediction_narration_cache_key(
+            "account",
+            "1.0.0",
+            &serde_json::json!({"game":"PC28","period":"100"}),
+            "provider-a",
+        );
+        let same = prediction_narration_cache_key(
+            "account",
+            "1.0.0",
+            &serde_json::json!({"game":"PC28","period":"100"}),
+            "provider-a",
+        );
+        let next_period = prediction_narration_cache_key(
+            "account",
+            "1.0.0",
+            &serde_json::json!({"game":"PC28","period":"101"}),
+            "provider-a",
+        );
+        assert_eq!(first, same);
+        assert_ne!(first, next_period);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DH_AI_LIVE_URL and DH_AI_LIVE_KEY"]
+    async fn live_openai_compatible_provider_accepts_dh_schema() {
+        let base_url = std::env::var("DH_AI_LIVE_URL").expect("DH_AI_LIVE_URL is required");
+        let api_key = std::env::var("DH_AI_LIVE_KEY").expect("DH_AI_LIVE_KEY is required");
+        let message = std::env::var("DH_AI_LIVE_MESSAGE")
+            .unwrap_or_else(|_| "@DH 请用一句自然中文介绍你能做什么。".into());
+        let provider = ConfiguredProvider::new(AiConfig {
+            base_url,
+            webhook_url: String::new(),
+            api_backend: std::env::var("DH_AI_LIVE_BACKEND")
+                .unwrap_or_else(|_| "chat_completions".into()),
+            model: std::env::var("DH_AI_LIVE_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into()),
+            reasoning_effort: std::env::var("DH_AI_LIVE_REASONING")
+                .unwrap_or_else(|_| "low".into()),
+            api_key,
+            timeout: Duration::from_secs(30),
+        })
+        .expect("live provider configuration should be valid");
+        let result = provider
+            .test(&AiRequest::testing_with_knowledge(
+                message,
+                Vec::new(),
+                true,
+            ))
+            .await
+            .expect("live provider should return a valid DH decision");
+
+        assert!(!result.decision.reply.trim().is_empty());
+        assert!((0.0..=1.0).contains(&result.decision.confidence));
+        eprintln!(
+            "live AI passed: model={}, elapsed_ms={}, reply_preview={:?}, action_kinds={:?}, tasks={}",
+            result.model,
+            result.elapsed_ms,
+            result.decision.reply.chars().take(240).collect::<String>(),
+            result
+                .decision
+                .actions
+                .iter()
+                .map(|action| action.kind.as_str())
+                .collect::<Vec<_>>(),
+            result.decision.tasks.len()
+        );
     }
 }

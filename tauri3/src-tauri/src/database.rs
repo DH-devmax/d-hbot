@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
@@ -12,10 +12,10 @@ use sha2::{Digest, Sha256};
 use crate::defaults;
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
-    Account, ActionRecord, AuditEvent, BatchIngestResult, BusinessAppRecord, BusinessAppRun,
-    CardPlan, CardRenameJob, DailySummary, EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect,
-    GatewayInboxEvent, GatewayInboxItem, Group, GroupAiPermissions, GroupSchedule, KnowledgeBase,
-    KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, TaskItem,
+    Account, ActionRecord, AiProviderEndpoint, AuditEvent, BatchIngestResult, BusinessAppRecord,
+    BusinessAppRun, CardPlan, CardRenameJob, DailySummary, EffectOutboxItem, EffectOutboxRequest,
+    EnqueuedEffect, GatewayInboxEvent, GatewayInboxItem, Group, GroupAiPermissions, GroupSchedule,
+    KnowledgeBase, KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, TaskItem,
 };
 use crate::paths::AppPaths;
 
@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS groups (
   enabled INTEGER NOT NULL DEFAULT 0,
   ai_enabled INTEGER NOT NULL DEFAULT 0,
   moderation_enabled INTEGER NOT NULL DEFAULT 0,
+  machine_rules_enabled INTEGER NOT NULL DEFAULT 0,
+  ai_rules_enabled INTEGER NOT NULL DEFAULT 0,
   manual_takeover INTEGER NOT NULL DEFAULT 0,
   welcome_message TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
@@ -144,6 +146,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS effect_outbox_dedupe_idx
 CREATE TABLE IF NOT EXISTS rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
+  rule_type TEXT NOT NULL DEFAULT 'machine',
+  scope TEXT NOT NULL DEFAULT 'global',
+  priority_level TEXT NOT NULL DEFAULT 'medium',
   group_id INTEGER NOT NULL DEFAULT 0,
   name TEXT NOT NULL,
   matcher TEXT NOT NULL,
@@ -160,6 +165,38 @@ CREATE TABLE IF NOT EXISTS rules (
   exempt_user_ids_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_groups (
+  rule_id INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  PRIMARY KEY(rule_id, group_id),
+  FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE,
+  FOREIGN KEY(account_id, group_id) REFERENCES groups(account_id, group_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS rule_whitelist_members (
+  rule_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  PRIMARY KEY(rule_id, user_id),
+  FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS rule_evaluations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL DEFAULT 0,
+  message_id INTEGER NOT NULL DEFAULT 0,
+  rule_id INTEGER NOT NULL,
+  rule_type TEXT NOT NULL,
+  matched INTEGER NOT NULL DEFAULT 0,
+  confidence REAL,
+  mode TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(account_id, message_id, rule_id),
+  FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS rule_actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -394,6 +431,29 @@ CREATE TABLE IF NOT EXISTS app_settings (
   sensitive INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ai_provider_endpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL DEFAULT '',
+  webhook_url TEXT NOT NULL DEFAULT '',
+  api_backend TEXT NOT NULL DEFAULT 'chat_completions',
+  model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',
+  reasoning_effort TEXT NOT NULL DEFAULT 'low',
+  secret_ref TEXT NOT NULL DEFAULT '',
+  priority INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  health_status TEXT NOT NULL DEFAULT 'unchecked',
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  cooldown_until TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  last_checked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx
+  ON ai_provider_endpoints(account_id, enabled DESC, priority, id);
 CREATE TABLE IF NOT EXISTS business_apps (
   account_id TEXT NOT NULL,
   app_id TEXT NOT NULL,
@@ -425,6 +485,17 @@ CREATE TABLE IF NOT EXISTS business_app_runs (
   completed_at TEXT,
   UNIQUE(account_id, app_id, run_key),
   FOREIGN KEY(account_id, app_id) REFERENCES business_apps(account_id, app_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS gateway_capability_verifications (
+  fingerprint TEXT NOT NULL,
+  capability TEXT NOT NULL,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL,
+  automatic_allowed INTEGER NOT NULL DEFAULT 0,
+  evidence_hash TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  verified_at TEXT NOT NULL,
+  PRIMARY KEY(fingerprint, capability)
 );
 "#;
 
@@ -633,6 +704,18 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn ignore_gateway_inbox_event(
+        &self,
+        account_id: String,
+        event_id: String,
+        reason: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.ignore_gateway_inbox_event(&account_id, &event_id, &reason)
+        })
+        .await
+    }
+
     pub async fn mark_gateway_inbox_processed(
         &self,
         account_id: String,
@@ -739,6 +822,82 @@ impl DatabaseExecutor {
     pub async fn get_setting(&self, key: String) -> AppResult<Option<String>> {
         self.execute(move |database| database.get_setting(&key))
             .await
+    }
+
+    pub async fn ensure_ai_provider_endpoints(&self, account_id: String) -> AppResult<()> {
+        self.execute(move |database| database.ensure_ai_provider_endpoints(&account_id))
+            .await
+    }
+
+    pub async fn list_ai_provider_endpoints(
+        &self,
+        account_id: String,
+    ) -> AppResult<Vec<AiProviderEndpoint>> {
+        self.execute(move |database| database.list_ai_provider_endpoints(&account_id))
+            .await
+    }
+
+    pub async fn save_ai_provider_endpoint(&self, endpoint: AiProviderEndpoint) -> AppResult<i64> {
+        self.execute(move |database| database.save_ai_provider_endpoint(&endpoint))
+            .await
+    }
+
+    pub async fn delete_ai_provider_endpoint(
+        &self,
+        account_id: String,
+        endpoint_id: i64,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.delete_ai_provider_endpoint(&account_id, endpoint_id))
+            .await
+    }
+
+    pub async fn update_ai_provider_health(
+        &self,
+        account_id: String,
+        endpoint_id: i64,
+        success: bool,
+        error: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.update_ai_provider_health(&account_id, endpoint_id, success, &error)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_gateway_capability_verification(
+        &self,
+        fingerprint: String,
+        capability: String,
+        source: String,
+        status: String,
+        automatic_allowed: bool,
+        evidence_hash: String,
+        last_error: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.save_gateway_capability_verification(
+                &fingerprint,
+                &capability,
+                &source,
+                &status,
+                automatic_allowed,
+                &evidence_hash,
+                &last_error,
+            )
+        })
+        .await
+    }
+
+    pub async fn is_gateway_capability_verified(
+        &self,
+        fingerprint: String,
+        capability: String,
+    ) -> AppResult<bool> {
+        self.execute(move |database| {
+            database.is_gateway_capability_verified(&fingerprint, &capability)
+        })
+        .await
     }
 
     pub async fn upsert_account(&self, account: Account) -> AppResult<()> {
@@ -863,6 +1022,18 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn resolve_member_user_id(
+        &self,
+        account_id: String,
+        group_id: i64,
+        nim_id: String,
+    ) -> AppResult<Option<i64>> {
+        self.execute(move |database| {
+            database.resolve_member_user_id(&account_id, group_id, &nim_id)
+        })
+        .await
+    }
+
     pub async fn set_member_blacklisted(
         &self,
         account_id: String,
@@ -872,6 +1043,18 @@ impl DatabaseExecutor {
     ) -> AppResult<()> {
         self.execute(move |database| {
             database.set_member_blacklisted(&account_id, group_id, user_id, blacklisted)
+        })
+        .await
+    }
+
+    pub async fn increment_member_violation(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<i64> {
+        self.execute(move |database| {
+            database.increment_member_violation(&account_id, group_id, user_id)
         })
         .await
     }
@@ -943,9 +1126,10 @@ impl DatabaseExecutor {
         &self,
         job: CardRenameJob,
         success: bool,
+        retryable: bool,
         error: String,
     ) -> AppResult<()> {
-        self.execute(move |database| database.finish_card_job(&job, success, &error))
+        self.execute(move |database| database.finish_card_job(&job, success, retryable, &error))
             .await
     }
 
@@ -1319,10 +1503,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 6 {
+    if old_version > 11 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v6"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v11"),
         ));
     }
     let transaction = connection
@@ -1377,6 +1561,15 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
         ("tasks", "reminder_claimed_at", "TEXT"),
         ("tasks", "reminder_last_error", "TEXT NOT NULL DEFAULT ''"),
         ("tasks", "source_key", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "groups",
+            "machine_rules_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("groups", "ai_rules_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("rules", "rule_type", "TEXT NOT NULL DEFAULT 'machine'"),
+        ("rules", "scope", "TEXT NOT NULL DEFAULT 'global'"),
+        ("rules", "priority_level", "TEXT NOT NULL DEFAULT 'medium'"),
     ] {
         add_column_if_missing(&transaction, table, column, definition).map_err(|error| {
             AppError::new(
@@ -1385,6 +1578,27 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
             )
         })?;
     }
+    transaction
+        .execute(
+            "UPDATE groups SET machine_rules_enabled=moderation_enabled WHERE machine_rules_enabled=0 AND moderation_enabled=1",
+            [],
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute(
+            "UPDATE rules SET rule_type=CASE WHEN matcher='semantic' THEN 'ai' ELSE 'machine' END,scope=CASE WHEN group_id=0 THEN 'global' ELSE 'selected' END,priority_level=CASE WHEN priority<100 THEN 'low' WHEN priority<200 THEN 'medium' ELSE 'high' END",
+            [],
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS rule_groups (rule_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,PRIMARY KEY(rule_id,group_id),FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS rule_whitelist_members (rule_id INTEGER NOT NULL,user_id INTEGER NOT NULL,PRIMARY KEY(rule_id,user_id),FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS rule_evaluations (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,user_id INTEGER NOT NULL DEFAULT 0,message_id INTEGER NOT NULL DEFAULT 0,rule_id INTEGER NOT NULL,rule_type TEXT NOT NULL,matched INTEGER NOT NULL DEFAULT 0,confidence REAL,mode TEXT NOT NULL,decision TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',elapsed_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(account_id,message_id,rule_id),FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE);
+             INSERT OR IGNORE INTO rule_groups(rule_id,account_id,group_id) SELECT id,account_id,group_id FROM rules WHERE group_id>0;
+             INSERT OR IGNORE INTO rule_whitelist_members(rule_id,user_id) SELECT rules.id,CAST(json_each.value AS INTEGER) FROM rules,json_each(rules.exempt_user_ids_json) WHERE CAST(json_each.value AS INTEGER)>0;"
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .execute(
             "UPDATE members SET discovered_at=COALESCE(NULLIF(discovered_at,''),updated_at), last_seen_at=COALESCE(NULLIF(last_seen_at,''),updated_at)",
@@ -1419,7 +1633,40 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
         .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS tasks_source_key_idx ON tasks(account_id,source_key) WHERE source_key<>''")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
-        .execute_batch("PRAGMA user_version = 6;")
+        .execute_batch("CREATE TABLE IF NOT EXISTS gateway_capability_verifications (fingerprint TEXT NOT NULL,capability TEXT NOT NULL,source TEXT NOT NULL,status TEXT NOT NULL,automatic_allowed INTEGER NOT NULL DEFAULT 0,evidence_hash TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',verified_at TEXT NOT NULL,PRIMARY KEY(fingerprint,capability)); CREATE TABLE IF NOT EXISTS ai_provider_endpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',api_backend TEXT NOT NULL DEFAULT 'chat_completions',model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',secret_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,health_status TEXT NOT NULL DEFAULT 'unchecked',failure_count INTEGER NOT NULL DEFAULT 0,cooldown_until TEXT,last_error TEXT NOT NULL DEFAULT '',last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx ON ai_provider_endpoints(account_id,enabled DESC,priority,id);")
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    add_column_if_missing(
+        &transaction,
+        "ai_provider_endpoints",
+        "api_backend",
+        "TEXT NOT NULL DEFAULT 'chat_completions'",
+    )
+    .map_err(|error| {
+        AppError::new(
+            "database_migration",
+            format!("补齐 ai_provider_endpoints.api_backend 失败：{error}"),
+        )
+    })?;
+    add_column_if_missing(
+        &transaction,
+        "ai_provider_endpoints",
+        "reasoning_effort",
+        "TEXT NOT NULL DEFAULT 'low'",
+    )
+    .map_err(|error| {
+        AppError::new(
+            "database_migration",
+            format!("补齐 ai_provider_endpoints.reasoning_effort 失败：{error}"),
+        )
+    })?;
+    transaction
+        .execute(
+            "UPDATE ai_provider_endpoints SET api_backend='chat_completions' WHERE api_backend IS NULL OR TRIM(api_backend)=''",
+            [],
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 11;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -1536,7 +1783,7 @@ impl Database {
         let old_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| AppError::new("database_version", error.to_string()))?;
-        if database_existed && old_version < 6 {
+        if database_existed && old_version < 8 {
             snapshot_before_migration(paths, &connection, old_version)?;
         }
         connection.execute_batch(SCHEMA).map_err(|error| {
@@ -1555,6 +1802,7 @@ impl Database {
 
     fn prepare(&self) -> Result<(), InternalError> {
         Ok(self.with_connection(|connection| {
+            let now = Utc::now();
             connection.execute_batch(
                 "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
             )?;
@@ -1583,6 +1831,15 @@ impl Database {
                 "UPDATE summary_runs SET state='retry',next_retry_at=NULL,last_error='DH BOT 重启后已恢复执行',updated_at=? WHERE state='processing'",
                 params![Utc::now().to_rfc3339()],
             )?;
+            // Messages from the pre-ACK pipeline were persisted without a
+            // source acknowledgement and must never be replayed on a later
+            // launch. Keep them visible as historical records instead of
+            // presenting them as actionable pending work.
+            connection.execute(
+                "UPDATE messages SET processed_at=?,processing_state='ignored',next_attempt_at=NULL,last_error='历史未确认消息已归档，不会自动执行' WHERE acknowledged_at IS NULL AND processed_at IS NULL AND processing_state IN ('pending','queued','retry') AND received_at<?",
+                params![now.to_rfc3339(), (now - ChronoDuration::minutes(15)).to_rfc3339()],
+            )?;
+            reconcile_alias_backed_legacy_members(connection)?;
             Ok(())
         })?)
     }
@@ -1947,10 +2204,206 @@ impl Database {
         .map_err(|error| AppError::new("settings_read", error.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_gateway_capability_verification(
+        &self,
+        fingerprint: &str,
+        capability: &str,
+        source: &str,
+        status: &str,
+        automatic_allowed: bool,
+        evidence_hash: &str,
+        last_error: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| connection.execute(
+            "INSERT INTO gateway_capability_verifications(fingerprint,capability,source,status,automatic_allowed,evidence_hash,last_error,verified_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint,capability) DO UPDATE SET source=excluded.source,status=excluded.status,automatic_allowed=excluded.automatic_allowed,evidence_hash=excluded.evidence_hash,last_error=excluded.last_error,verified_at=excluded.verified_at",
+            params![fingerprint, capability, source, status, bool_i(automatic_allowed), evidence_hash, last_error, Utc::now().to_rfc3339()],
+        ))
+        .map(|_| ())
+        .map_err(|error| AppError::new("capability_verification_write", error.to_string()))
+    }
+
+    pub fn is_gateway_capability_verified(
+        &self,
+        fingerprint: &str,
+        capability: &str,
+    ) -> AppResult<bool> {
+        self.with_connection(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM gateway_capability_verifications WHERE fingerprint=? AND capability=? AND status='supported' AND automatic_allowed=1)",
+                params![fingerprint, capability],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .map(|value| value != 0)
+        .map_err(|error| AppError::new("capability_verification_read", error.to_string()))
+    }
+
     pub fn set_setting(&self, key: &str, value: &str, sensitive: bool) -> AppResult<()> {
         self.with_connection(|connection| connection.execute("INSERT INTO app_settings(key,value,sensitive,updated_at) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,sensitive=excluded.sensitive,updated_at=excluded.updated_at", params![key, value, if sensitive { 1 } else { 0 }, Utc::now().to_rfc3339()]))
             .map(|_| ())
             .map_err(|error| AppError::new("settings_write", error.to_string()))
+    }
+
+    pub fn ensure_ai_provider_endpoints(&self, account_id: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ai_provider_endpoints WHERE account_id=?)",
+                params![account_id],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                return Ok(());
+            }
+            let setting = |key: &str| -> rusqlite::Result<String> {
+                connection
+                    .query_row(
+                        "SELECT value FROM app_settings WHERE key=?",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map(|value| value.unwrap_or_default())
+            };
+            let base_url = setting("ai.base_url")?;
+            let webhook_url = setting("ai.webhook_url")?;
+            let api_backend = {
+                let value = setting("ai.api_backend")?;
+                if value.trim().is_empty() {
+                    "chat_completions".to_string()
+                } else {
+                    value
+                }
+            };
+            let model = {
+                let value = setting("ai.model")?;
+                if value.trim().is_empty() {
+                    "deepseek-v4-pro".to_string()
+                } else {
+                    value
+                }
+            };
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT INTO ai_provider_endpoints(account_id,name,base_url,webhook_url,api_backend,model,secret_ref,priority,enabled,health_status,created_at,updated_at) VALUES(?,?,?,?,? ,?,'ai.api_key',0,1,'unchecked',?,?)",
+                params![account_id, "主连接", base_url, webhook_url, api_backend, model, now, now],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("ai_endpoints_initialize", error.to_string()))
+    }
+
+    pub fn list_ai_provider_endpoints(
+        &self,
+        account_id: &str,
+    ) -> AppResult<Vec<AiProviderEndpoint>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,account_id,name,base_url,webhook_url,api_backend,model,reasoning_effort,secret_ref,priority,enabled,health_status,failure_count,cooldown_until,last_error,last_checked_at,created_at,updated_at FROM ai_provider_endpoints WHERE account_id=? ORDER BY enabled DESC,priority,id",
+            )?;
+            let rows = statement
+                .query_map(params![account_id], |row| {
+                    Ok(AiProviderEndpoint {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        name: row.get(2)?,
+                        base_url: row.get(3)?,
+                        webhook_url: row.get(4)?,
+                        api_backend: row.get(5)?,
+                        model: row.get(6)?,
+                        reasoning_effort: row.get(7)?,
+                        secret_ref: row.get(8)?,
+                        priority: row.get(9)?,
+                        enabled: row.get::<_, i64>(10)? != 0,
+                        api_key_configured: false,
+                        health_status: row.get(11)?,
+                        failure_count: row.get(12)?,
+                        cooldown_until: optional_time(row.get(13)?),
+                        last_error: row.get(14)?,
+                        last_checked_at: optional_time(row.get(15)?),
+                        created_at: parse_time(row.get(16)?),
+                        updated_at: parse_time(row.get(17)?),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .map_err(|error| AppError::new("ai_endpoints_read", error.to_string()))
+    }
+
+    pub fn save_ai_provider_endpoint(&self, endpoint: &AiProviderEndpoint) -> AppResult<i64> {
+        self.with_connection(|connection| {
+            let now = Utc::now().to_rfc3339();
+            if endpoint.id <= 0 {
+                connection.execute(
+                    "INSERT INTO ai_provider_endpoints(account_id,name,base_url,webhook_url,api_backend,model,reasoning_effort,secret_ref,priority,enabled,health_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![endpoint.account_id,endpoint.name,endpoint.base_url,endpoint.webhook_url,endpoint.api_backend,endpoint.model,endpoint.reasoning_effort,endpoint.secret_ref,endpoint.priority,bool_i(endpoint.enabled),endpoint.health_status,now,now],
+                )?;
+                Ok(connection.last_insert_rowid())
+            } else {
+                let changed = connection.execute(
+                    "UPDATE ai_provider_endpoints SET name=?,base_url=?,webhook_url=?,api_backend=?,model=?,reasoning_effort=?,secret_ref=?,priority=?,enabled=?,health_status=?,updated_at=? WHERE account_id=? AND id=?",
+                    params![endpoint.name,endpoint.base_url,endpoint.webhook_url,endpoint.api_backend,endpoint.model,endpoint.reasoning_effort,endpoint.secret_ref,endpoint.priority,bool_i(endpoint.enabled),endpoint.health_status,now,endpoint.account_id,endpoint.id],
+                )?;
+                if changed == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                Ok(endpoint.id)
+            }
+        })
+        .map_err(|error| AppError::new("ai_endpoint_write", error.to_string()))
+    }
+
+    pub fn delete_ai_provider_endpoint(&self, account_id: &str, endpoint_id: i64) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM ai_provider_endpoints WHERE account_id=? AND id=?",
+                params![account_id, endpoint_id],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("ai_endpoint_delete", error.to_string()))
+    }
+
+    pub fn update_ai_provider_health(
+        &self,
+        account_id: &str,
+        endpoint_id: i64,
+        success: bool,
+        error: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            let now = Utc::now();
+            let previous_failures = connection
+                .query_row(
+                    "SELECT failure_count FROM ai_provider_endpoints WHERE account_id=? AND id=?",
+                    params![account_id, endpoint_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let failure_count = if success {
+                0
+            } else {
+                previous_failures.saturating_add(1)
+            };
+            let cooldown_until = if success {
+                None
+            } else {
+                let seconds = if error.contains("401") || error.contains("403") {
+                    30 * 60
+                } else {
+                    30_i64.saturating_mul(1_i64 << (failure_count.saturating_sub(1).min(4)))
+                };
+                Some(now + chrono::Duration::seconds(seconds))
+            };
+            connection.execute(
+                "UPDATE ai_provider_endpoints SET health_status=?,failure_count=?,cooldown_until=?,last_error=?,last_checked_at=?,updated_at=? WHERE account_id=? AND id=?",
+                params![if success { "healthy" } else { "unavailable" },failure_count,cooldown_until.map(|value| value.to_rfc3339()),if success { "" } else { error },now.to_rfc3339(),now.to_rfc3339(),account_id,endpoint_id],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("ai_endpoint_health", error.to_string()))
     }
 
     pub fn upsert_account(&self, account: &Account) -> AppResult<()> {
@@ -1960,14 +2413,14 @@ impl Database {
     }
 
     pub fn upsert_group(&self, group: &Group) -> AppResult<()> {
-        self.with_connection(|connection| connection.execute("INSERT INTO groups(account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,manual_takeover,welcome_message,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,group_id) DO UPDATE SET name=excluded.name,owner_user_id=excluded.owner_user_id,updated_at=excluded.updated_at", params![group.account_id, group.group_id, group.name, group.owner_user_id, bool_i(group.enabled), bool_i(group.ai_enabled), bool_i(group.moderation_enabled), bool_i(group.manual_takeover), group.welcome_message, group.updated_at.to_rfc3339()]))
+        self.with_connection(|connection| connection.execute("INSERT INTO groups(account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,machine_rules_enabled,ai_rules_enabled,manual_takeover,welcome_message,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,group_id) DO UPDATE SET name=excluded.name,owner_user_id=excluded.owner_user_id,updated_at=excluded.updated_at", params![group.account_id, group.group_id, group.name, group.owner_user_id, bool_i(group.enabled), bool_i(group.ai_enabled), bool_i(group.moderation_enabled), bool_i(group.machine_rules_enabled), bool_i(group.ai_rules_enabled), bool_i(group.manual_takeover), group.welcome_message, group.updated_at.to_rfc3339()]))
             .map(|_| ())
             .map_err(|error| AppError::new("group_write", error.to_string()))
     }
 
     pub fn list_groups(&self, account_id: Option<&str>) -> AppResult<Vec<Group>> {
         self.with_connection(|connection| {
-            let mut statement = connection.prepare("SELECT account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,manual_takeover,welcome_message,updated_at FROM groups WHERE (?1 IS NULL OR account_id=?1) ORDER BY name,group_id")?;
+            let mut statement = connection.prepare("SELECT account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,machine_rules_enabled,ai_rules_enabled,manual_takeover,welcome_message,updated_at FROM groups WHERE (?1 IS NULL OR account_id=?1) ORDER BY name,group_id")?;
             let rows = statement.query_map(params![account_id], group_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("groups_read", error.to_string()))
@@ -2115,11 +2568,17 @@ impl Database {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if existing.as_deref() == Some("succeeded") {
+            if existing.as_deref() == Some("succeeded")
+                && plan.member.card_name == plan.suggested_name
+            {
                 transaction.commit()?;
                 return Ok(false);
             }
-            if existing.is_some() {
+            if existing.is_some() && existing.as_deref() != Some("succeeded") {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            if existing.as_deref() == Some("succeeded") {
                 transaction.execute(
                     "UPDATE card_rename_jobs SET nim_id=?,original_name=?,suffix=?,state='queued',attempts=0,next_attempt_at=NULL,last_error='',welcome_pending=CASE WHEN welcome_pending=1 OR ? THEN 1 ELSE 0 END,updated_at=? WHERE account_id=? AND group_id=? AND user_id=? AND desired_name=?",
                     params![plan.member.nim_id,plan.original_name,plan.suffix,welcome_pending,now,account_id,group_id,plan.member.user_id,plan.suggested_name],
@@ -2184,6 +2643,7 @@ impl Database {
         &self,
         job: &CardRenameJob,
         success: bool,
+        retryable: bool,
         error: &str,
     ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
@@ -2194,12 +2654,16 @@ impl Database {
                     "UPDATE card_rename_jobs SET state='succeeded',next_attempt_at=NULL,last_error='',updated_at=? WHERE id=?",
                     params![now, job.id],
                 )?;
+                // `card_name` is a wire value owned by 旺商聊. Never manufacture a
+                // successful readback locally: it is refreshed only by the next
+                // HTTP/NIM roster synchronization. This keeps a UI-visible rename
+                // failure detectable instead of masking it with the desired value.
                 transaction.execute(
-                    "UPDATE members SET card_name=?,managed_card_name=?,locked_card_name=?,card_suffix=?,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?",
-                    params![job.desired_name,job.desired_name,job.desired_name,job.suffix,now,job.account_id,job.group_id,job.user_id],
+                    "UPDATE members SET managed_card_name=?,locked_card_name=?,card_suffix=?,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?",
+                    params![job.desired_name,job.desired_name,job.suffix,now,job.account_id,job.group_id,job.user_id],
                 )?;
             } else {
-                let (state, next_retry) = if job.attempts >= 5 {
+                let (state, next_retry) = if !retryable || job.attempts >= 5 {
                     ("failed", None)
                 } else {
                     let delay = match job.attempts {
@@ -2309,7 +2773,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let ids = {
                 let mut statement = transaction.prepare(
-                    "SELECT current.id FROM gateway_inbox AS current WHERE (?1 IS NULL OR current.account_id=?1) AND current.state IN ('pending','retry') AND (current.next_attempt_at IS NULL OR current.next_attempt_at<=?2) AND NOT EXISTS (SELECT 1 FROM gateway_inbox AS prior WHERE prior.account_id=current.account_id AND prior.bridge_session=current.bridge_session AND prior.bridge_sequence>0 AND prior.bridge_sequence<current.bridge_sequence AND prior.state<>'processed') ORDER BY current.received_at,current.id LIMIT ?3",
+                    "SELECT current.id FROM gateway_inbox AS current WHERE (?1 IS NULL OR current.account_id=?1) AND current.state IN ('pending','retry') AND (current.next_attempt_at IS NULL OR current.next_attempt_at<=?2) AND NOT EXISTS (SELECT 1 FROM gateway_inbox AS prior WHERE prior.account_id=current.account_id AND prior.bridge_session=current.bridge_session AND prior.bridge_sequence>0 AND prior.bridge_sequence<current.bridge_sequence AND prior.state NOT IN ('processed','ignored')) ORDER BY current.received_at,current.id LIMIT ?3",
                 )?;
                 let result = statement
                     .query_map(
@@ -2369,6 +2833,23 @@ impl Database {
         .map_err(|error| AppError::new("gateway_inbox_finish", error.to_string()))
     }
 
+    pub fn ignore_gateway_inbox_event(
+        &self,
+        account_id: &str,
+        event_id: &str,
+        reason: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE gateway_inbox SET state='ignored',processed_at=COALESCE(processed_at,?),claimed_at=NULL,next_attempt_at=NULL,last_error=? WHERE account_id=? AND event_id=? AND state<>'processed'",
+                params![now, reason, account_id, event_id],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("gateway_inbox_ignore", error.to_string()))
+    }
+
     pub fn mark_gateway_inbox_processed(
         &self,
         account_id: &str,
@@ -2380,7 +2861,7 @@ impl Database {
             let mut changed = 0;
             for event_id in event_ids {
                 changed += transaction.execute(
-                    "UPDATE gateway_inbox SET state='processed',processed_at=?,claimed_at=NULL,next_attempt_at=NULL,last_error='' WHERE account_id=? AND event_id=? AND state<>'processed'",
+                    "UPDATE gateway_inbox SET state=CASE WHEN state='ignored' THEN 'ignored' ELSE 'processed' END,processed_at=COALESCE(processed_at,?),claimed_at=NULL,next_attempt_at=NULL,last_error=CASE WHEN state='ignored' THEN last_error ELSE '' END WHERE account_id=? AND event_id=? AND state<>'processed'",
                     params![now, account_id, event_id],
                 )?;
             }
@@ -2406,7 +2887,7 @@ impl Database {
                 let state = statement
                     .query_row(params![account_id, event_id], |row| row.get::<_, String>(0))
                     .optional()?;
-                if state.as_deref() == Some("processed") {
+                if matches!(state.as_deref(), Some("processed" | "ignored")) {
                     processed.push(event_id.clone());
                 }
             }
@@ -2432,7 +2913,7 @@ impl Database {
             }
             for event_id in event_ids {
                 transaction.execute(
-                    "UPDATE gateway_inbox SET state='processed',processed_at=COALESCE(processed_at,?),claimed_at=NULL,next_attempt_at=NULL,last_error='' WHERE account_id=? AND event_id=?",
+                    "UPDATE gateway_inbox SET state=CASE WHEN state='ignored' THEN 'ignored' ELSE 'processed' END,processed_at=COALESCE(processed_at,?),claimed_at=NULL,next_attempt_at=NULL,last_error=CASE WHEN state='ignored' THEN last_error ELSE '' END WHERE account_id=? AND event_id=?",
                     params![now, account_id, event_id],
                 )?;
             }
@@ -2703,6 +3184,21 @@ fn resolve_member_identity(
 
     let mut effective_user_id = member.user_id;
     let mut provisional_user_id = None;
+    if member.user_id > 0 {
+        if let Some(legacy_user_id) = legacy_nim_user_candidate(
+            transaction,
+            member,
+            existing_alias.as_ref().map(|(user_id, _)| *user_id),
+        )? {
+            merge_member_identity(
+                transaction,
+                &member.account_id,
+                member.group_id,
+                legacy_user_id,
+                member.user_id,
+            )?;
+        }
+    }
     if member.user_id < 0 {
         if let Some((canonical_user_id, _)) = existing_alias {
             if canonical_user_id > 0 {
@@ -2732,7 +3228,7 @@ fn resolve_member_identity(
             });
         if let Some(provisional_user_id) = provisional_user_id {
             if provisional_user_id != member.user_id {
-                merge_provisional_member(
+                merge_member_identity(
                     transaction,
                     &member.account_id,
                     member.group_id,
@@ -2751,17 +3247,52 @@ fn resolve_member_identity(
     Ok(effective_user_id)
 }
 
-fn merge_provisional_member(
+fn legacy_nim_user_candidate(
+    transaction: &rusqlite::Transaction<'_>,
+    member: &Member,
+    aliased_user_id: Option<i64>,
+) -> rusqlite::Result<Option<i64>> {
+    let Ok(legacy_user_id) = member.nim_id.parse::<i64>() else {
+        return Ok(None);
+    };
+    if legacy_user_id <= 0 || legacy_user_id == member.user_id {
+        return Ok(None);
+    }
+    let legacy: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT nickname,card_name FROM members WHERE account_id=? AND group_id=? AND user_id=? AND nim_id=''",
+            params![member.account_id, member.group_id, legacy_user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((nickname, card_name)) = legacy else {
+        return Ok(None);
+    };
+    let alias_confirms_identity = aliased_user_id == Some(member.user_id);
+    let legacy_looks_internal = [nickname.as_str(), card_name.as_str()]
+        .iter()
+        .all(|value| value.trim().is_empty() || is_internal_member_hash(value));
+    Ok((alias_confirms_identity || legacy_looks_internal).then_some(legacy_user_id))
+}
+
+fn is_internal_member_hash(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn merge_member_identity(
     transaction: &rusqlite::Transaction<'_>,
     account_id: &str,
     group_id: i64,
-    provisional_user_id: i64,
+    old_user_id: i64,
     real_user_id: i64,
 ) -> rusqlite::Result<()> {
+    if old_user_id == real_user_id {
+        return Ok(());
+    }
     let provisional: Option<Member> = transaction
         .query_row(
             "SELECT account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND user_id=?",
-            params![account_id, group_id, provisional_user_id],
+            params![account_id, group_id, old_user_id],
             member_from_row,
         )
         .optional()?;
@@ -2776,7 +3307,7 @@ fn merge_provisional_member(
     if !real_exists {
         transaction.execute(
             "INSERT INTO members(account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at) SELECT account_id,group_id,?,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND user_id=?",
-            params![real_user_id, account_id, group_id, provisional_user_id],
+            params![real_user_id, account_id, group_id, old_user_id],
         )?;
     } else {
         transaction.execute(
@@ -2787,37 +3318,123 @@ fn merge_provisional_member(
 
     transaction.execute(
         "UPDATE messages SET user_id=? WHERE account_id=? AND group_id=? AND user_id=?",
-        params![real_user_id, account_id, group_id, provisional_user_id],
+        params![real_user_id, account_id, group_id, old_user_id],
     )?;
     transaction.execute(
         "UPDATE actions SET user_id=? WHERE account_id=? AND group_id=? AND user_id=?",
-        params![real_user_id, account_id, group_id, provisional_user_id],
+        params![real_user_id, account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "UPDATE audit_events SET user_id=? WHERE account_id=? AND group_id=? AND user_id=?",
+        params![real_user_id, account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "UPDATE rule_evaluations SET user_id=? WHERE account_id=? AND group_id=? AND user_id=?",
+        params![real_user_id, account_id, group_id, old_user_id],
     )?;
     transaction.execute(
         "UPDATE tasks SET assignee_id=? WHERE account_id=? AND group_id=? AND assignee_id=?",
-        params![real_user_id, account_id, group_id, provisional_user_id],
+        params![real_user_id, account_id, group_id, old_user_id],
     )?;
     transaction.execute(
         "UPDATE tasks SET created_by=? WHERE account_id=? AND group_id=? AND created_by=?",
-        params![real_user_id, account_id, group_id, provisional_user_id],
+        params![real_user_id, account_id, group_id, old_user_id],
     )?;
     transaction.execute(
-        "INSERT OR IGNORE INTO card_rename_jobs(account_id,group_id,user_id,nim_id,original_name,desired_name,suffix,state,attempts,next_attempt_at,last_error,welcome_pending,created_at,updated_at) SELECT account_id,group_id,?,nim_id,original_name,desired_name,suffix,state,attempts,next_attempt_at,last_error,welcome_pending,created_at,updated_at FROM card_rename_jobs WHERE account_id=? AND group_id=? AND user_id=?",
-        params![real_user_id, account_id, group_id, provisional_user_id],
+        "INSERT INTO rule_runtime_state(rule_id,account_id,group_id,user_id,window_started_at,window_count,last_executed_at,updated_at) SELECT rule_id,account_id,group_id,?,window_started_at,window_count,last_executed_at,updated_at FROM rule_runtime_state WHERE account_id=? AND group_id=? AND user_id=? AND true ON CONFLICT(rule_id,account_id,group_id,user_id) DO UPDATE SET window_started_at=CASE WHEN excluded.window_started_at IS NULL THEN rule_runtime_state.window_started_at WHEN rule_runtime_state.window_started_at IS NULL OR excluded.window_started_at<rule_runtime_state.window_started_at THEN excluded.window_started_at ELSE rule_runtime_state.window_started_at END,window_count=MAX(rule_runtime_state.window_count,excluded.window_count),last_executed_at=CASE WHEN excluded.last_executed_at IS NULL THEN rule_runtime_state.last_executed_at WHEN rule_runtime_state.last_executed_at IS NULL OR excluded.last_executed_at>rule_runtime_state.last_executed_at THEN excluded.last_executed_at ELSE rule_runtime_state.last_executed_at END,updated_at=MAX(rule_runtime_state.updated_at,excluded.updated_at)",
+        params![real_user_id, account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM rule_runtime_state WHERE account_id=? AND group_id=? AND user_id=?",
+        params![account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO rule_whitelist_members(rule_id,user_id) SELECT id,? FROM rules WHERE account_id=? AND EXISTS(SELECT 1 FROM rule_whitelist_members whitelist WHERE whitelist.rule_id=rules.id AND whitelist.user_id=?)",
+        params![real_user_id, account_id, old_user_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM rule_whitelist_members WHERE user_id=? AND rule_id IN (SELECT id FROM rules WHERE account_id=?)",
+        params![old_user_id, account_id],
+    )?;
+    transaction.execute(
+        "UPDATE effect_outbox SET payload_json=json_set(payload_json,'$.userId',?) WHERE account_id=? AND group_id=? AND state IN ('queued','retry') AND json_valid(payload_json)=1 AND CAST(json_extract(payload_json,'$.userId') AS INTEGER)=?",
+        params![real_user_id, account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "UPDATE OR IGNORE card_rename_jobs SET user_id=? WHERE account_id=? AND group_id=? AND user_id=?",
+        params![real_user_id, account_id, group_id, old_user_id],
+    )?;
+    transaction.execute(
+        "UPDATE card_rename_jobs AS target SET nim_id=CASE WHEN target.nim_id='' THEN source.nim_id ELSE target.nim_id END,original_name=CASE WHEN target.original_name='' THEN source.original_name ELSE target.original_name END,suffix=CASE WHEN target.suffix='' THEN source.suffix ELSE target.suffix END,state=CASE WHEN target.state='processing' OR source.state='processing' THEN 'processing' WHEN target.state='queued' OR source.state='queued' THEN 'queued' WHEN target.state='retry' OR source.state='retry' THEN 'retry' WHEN target.state='failed' OR source.state='failed' THEN 'failed' ELSE 'succeeded' END,attempts=MAX(target.attempts,source.attempts),next_attempt_at=CASE WHEN target.next_attempt_at IS NULL THEN source.next_attempt_at WHEN source.next_attempt_at IS NULL THEN target.next_attempt_at ELSE MIN(target.next_attempt_at,source.next_attempt_at) END,last_error=CASE WHEN target.last_error='' THEN source.last_error ELSE target.last_error END,welcome_pending=MAX(target.welcome_pending,source.welcome_pending),created_at=MIN(target.created_at,source.created_at),updated_at=MAX(target.updated_at,source.updated_at) FROM card_rename_jobs AS source WHERE target.account_id=? AND target.group_id=? AND target.user_id=? AND source.account_id=target.account_id AND source.group_id=target.group_id AND source.user_id=? AND source.desired_name=target.desired_name",
+        params![account_id, group_id, real_user_id, old_user_id],
     )?;
     transaction.execute(
         "DELETE FROM card_rename_jobs WHERE account_id=? AND group_id=? AND user_id=?",
-        params![account_id, group_id, provisional_user_id],
+        params![account_id, group_id, old_user_id],
     )?;
     transaction.execute(
-        "UPDATE member_identity_aliases SET user_id=?,provisional_user_id=COALESCE(provisional_user_id,?),updated_at=? WHERE account_id=? AND group_id=? AND user_id=?",
-        params![real_user_id,provisional_user_id,Utc::now().to_rfc3339(),account_id,group_id,provisional_user_id],
+        "UPDATE member_identity_aliases SET user_id=?,provisional_user_id=CASE WHEN ?<0 THEN COALESCE(provisional_user_id,?) ELSE provisional_user_id END,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?",
+        params![real_user_id,old_user_id,old_user_id,Utc::now().to_rfc3339(),account_id,group_id,old_user_id],
     )?;
     transaction.execute(
         "DELETE FROM members WHERE account_id=? AND group_id=? AND user_id=?",
-        params![account_id, group_id, provisional_user_id],
+        params![account_id, group_id, old_user_id],
     )?;
     Ok(())
+}
+
+/// Repairs pre-v3 records that stored a numeric NIM account as `user_id`
+/// before the authoritative HTTP roster exposed the real 旺商号.  The alias
+/// table is the proof of identity; an empty NIM binding plus internal hashes
+/// prevent a real member whose numeric ID happens to match an account from
+/// being merged by inference alone.
+fn reconcile_alias_backed_legacy_members(connection: &mut Connection) -> rusqlite::Result<usize> {
+    let transaction = connection.transaction()?;
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT alias.account_id,alias.group_id,legacy.user_id,alias.user_id,legacy.nickname,legacy.card_name
+             FROM member_identity_aliases alias
+             JOIN members legacy
+               ON legacy.account_id=alias.account_id
+              AND legacy.group_id=alias.group_id
+              AND legacy.user_id=CAST(alias.nim_id AS INTEGER)
+             WHERE alias.user_id>0
+               AND CAST(alias.nim_id AS INTEGER)>0
+               AND alias.user_id<>legacy.user_id
+               AND legacy.nim_id=''",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut repaired = 0;
+    for (account_id, group_id, legacy_user_id, canonical_user_id, nickname, card_name) in candidates
+    {
+        let legacy_looks_internal = [nickname.as_str(), card_name.as_str()]
+            .iter()
+            .all(|value| value.trim().is_empty() || is_internal_member_hash(value));
+        if !legacy_looks_internal {
+            continue;
+        }
+        merge_member_identity(
+            &transaction,
+            &account_id,
+            group_id,
+            legacy_user_id,
+            canonical_user_id,
+        )?;
+        repaired += 1;
+    }
+    transaction.commit()?;
+    Ok(repaired)
 }
 
 fn bool_i(value: bool) -> i64 {
@@ -2829,15 +3446,22 @@ fn bool_i(value: bool) -> i64 {
 }
 
 fn parse_time(value: String) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|time| time.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    parse_stored_time(&value).unwrap_or_else(Utc::now)
 }
 
 fn optional_time(value: Option<String>) -> Option<DateTime<Utc>> {
-    value
-        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-        .map(|value| value.with_timezone(&Utc))
+    value.and_then(|value| parse_stored_time(&value))
+}
+
+fn parse_stored_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|time| time.and_utc())
+        })
 }
 
 fn group_from_row(row: &Row<'_>) -> rusqlite::Result<Group> {
@@ -2849,9 +3473,11 @@ fn group_from_row(row: &Row<'_>) -> rusqlite::Result<Group> {
         enabled: row.get::<_, i64>(4)? != 0,
         ai_enabled: row.get::<_, i64>(5)? != 0,
         moderation_enabled: row.get::<_, i64>(6)? != 0,
-        manual_takeover: row.get::<_, i64>(7)? != 0,
-        welcome_message: row.get(8)?,
-        updated_at: parse_time(row.get(9)?),
+        machine_rules_enabled: row.get::<_, i64>(7)? != 0,
+        ai_rules_enabled: row.get::<_, i64>(8)? != 0,
+        manual_takeover: row.get::<_, i64>(9)? != 0,
+        welcome_message: row.get(10)?,
+        updated_at: parse_time(row.get(11)?),
     })
 }
 
@@ -3004,6 +3630,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: true,
                 moderation_enabled: true,
+                machine_rules_enabled: true,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -3026,12 +3654,94 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 6);
+        assert_eq!(status.schema_version, 11);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn migrates_legacy_ai_settings_to_one_account_scoped_endpoint() {
+        let database = populated_database();
+        database
+            .set_setting("ai.base_url", "https://ai.example/v1", false)
+            .unwrap();
+        database
+            .set_setting("ai.model", "deepseek-v4-pro", false)
+            .unwrap();
+        database
+            .set_setting("ai.api_backend", "responses", false)
+            .unwrap();
+        database.ensure_ai_provider_endpoints("a").unwrap();
+        database.ensure_ai_provider_endpoints("a").unwrap();
+        let endpoints = database.list_ai_provider_endpoints("a").unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "主连接");
+        assert_eq!(endpoints[0].base_url, "https://ai.example/v1");
+        assert_eq!(endpoints[0].api_backend, "responses");
+        assert_eq!(endpoints[0].secret_ref, "ai.api_key");
+    }
+
+    #[test]
+    fn ai_endpoint_health_records_cooldown_and_recovers() {
+        let database = populated_database();
+        database.ensure_ai_provider_endpoints("a").unwrap();
+        let endpoint_id = database.list_ai_provider_endpoints("a").unwrap()[0].id;
+        database
+            .update_ai_provider_health("a", endpoint_id, false, "AI 请求返回 HTTP 401")
+            .unwrap();
+        let failed = database.list_ai_provider_endpoints("a").unwrap().remove(0);
+        assert_eq!(failed.health_status, "unavailable");
+        assert_eq!(failed.failure_count, 1);
+        assert!(failed.cooldown_until.is_some());
+        database
+            .update_ai_provider_health("a", endpoint_id, true, "")
+            .unwrap();
+        let recovered = database.list_ai_provider_endpoints("a").unwrap().remove(0);
+        assert_eq!(recovered.health_status, "healthy");
+        assert_eq!(recovered.failure_count, 0);
+        assert!(recovered.cooldown_until.is_none());
+    }
+
+    #[test]
+    fn ai_endpoint_transient_failures_back_off_exponentially() {
+        let database = populated_database();
+        database.ensure_ai_provider_endpoints("a").unwrap();
+        let endpoint_id = database.list_ai_provider_endpoints("a").unwrap()[0].id;
+        database
+            .update_ai_provider_health("a", endpoint_id, false, "AI 请求返回 HTTP 503")
+            .unwrap();
+        let first = database.list_ai_provider_endpoints("a").unwrap().remove(0);
+        database
+            .update_ai_provider_health("a", endpoint_id, false, "AI 请求返回 HTTP 503")
+            .unwrap();
+        let second = database.list_ai_provider_endpoints("a").unwrap().remove(0);
+        assert_eq!(second.failure_count, 2);
+        assert!(second.cooldown_until.unwrap() > first.cooldown_until.unwrap());
+    }
+
+    #[test]
+    fn capability_verification_is_scoped_to_protocol_fingerprint() {
+        let database = populated_database();
+        database
+            .save_gateway_capability_verification(
+                "fingerprint-a",
+                "announcement",
+                "manualReceipt",
+                "supported",
+                true,
+                "evidence-a",
+                "",
+            )
+            .unwrap();
+        assert!(database
+            .is_gateway_capability_verified("fingerprint-a", "announcement")
+            .unwrap());
+        assert!(!database
+            .is_gateway_capability_verified("fingerprint-b", "announcement")
+            .unwrap());
     }
 
     #[test]
@@ -3284,7 +3994,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 6);
+        assert_eq!(database.status().unwrap().schema_version, 11);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -3312,7 +4022,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 6);
+        assert_eq!(reopened.status().unwrap().schema_version, 11);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -3344,7 +4054,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 6);
+        assert_eq!(database.status().unwrap().schema_version, 11);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -3358,7 +4068,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_and_v3_to_v6_idempotently() {
+    fn migrates_v2_and_v3_to_v11_idempotently() {
         for version in [2_i64, 3_i64] {
             let directory = tempdir().unwrap();
             let paths = AppPaths {
@@ -3383,7 +4093,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 6);
+            assert_eq!(database.status().unwrap().schema_version, 11);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -3397,7 +4107,7 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 6);
+            assert_eq!(reopened.status().unwrap().schema_version, 11);
             assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1
@@ -3437,6 +4147,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: true,
                 moderation_enabled: true,
+                machine_rules_enabled: true,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -3612,6 +4324,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: true,
                 moderation_enabled: true,
+                machine_rules_enabled: true,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -3720,6 +4434,53 @@ mod tests {
             .claim_gateway_inbox(Some("a"), 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn ignored_gateway_inbox_event_keeps_its_diagnostic_without_blocking_following_sequence() {
+        let database = populated_database();
+        let now = Utc::now();
+        let events = [1_i64, 2_i64]
+            .into_iter()
+            .map(|sequence| GatewayInboxEvent {
+                account_id: "a".into(),
+                bridge_session: "ignored-session".into(),
+                bridge_sequence: sequence,
+                event_id: format!("ignored-{sequence}"),
+                event_type: "message".into(),
+                payload_json: format!("{{\"sequence\":{sequence}}}"),
+                received_at: now,
+            })
+            .collect::<Vec<_>>();
+        database.ingest_gateway_inbox_batch(&events).unwrap();
+        database
+            .ignore_gateway_inbox_event("a", "ignored-1", "解码失败且群身份未映射")
+            .unwrap();
+
+        let claimed = database.claim_gateway_inbox(Some("a"), 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].bridge_sequence, 2);
+        database
+            .commit_gateway_ack("a", &["ignored-1".into()], &[])
+            .unwrap();
+
+        let (state, last_error): (String, String) = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT state,last_error FROM gateway_inbox WHERE account_id='a' AND event_id='ignored-1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(state, "ignored");
+        assert_eq!(last_error, "解码失败且群身份未映射");
+        assert_eq!(
+            database
+                .processed_gateway_event_ids("a", &["ignored-1".into()])
+                .unwrap(),
+            vec!["ignored-1".to_string()]
+        );
     }
 
     #[test]
@@ -4167,6 +4928,190 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_roster_merges_legacy_positive_nim_identity_and_references() {
+        let database = populated_database();
+        let now = Utc::now();
+        let canonical = Member {
+            account_id: "a".into(),
+            group_id: 1,
+            user_id: 22,
+            nim_id: String::new(),
+            nickname: "真实成员".into(),
+            card_name: "真实名片".into(),
+            original_card_name: String::new(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: String::new(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: now,
+            joined_at: None,
+            last_seen_at: now,
+            updated_at: now,
+        };
+        database.upsert_member(&canonical).unwrap();
+        let stamp = now.to_rfc3339();
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(&format!(
+                    "INSERT INTO members(account_id,group_id,user_id,nim_id,nickname,card_name,role,present,join_source,discovered_at,last_seen_at,updated_at) VALUES('a',1,9002,'','270dbd1d10bfb72ffa0ce988028c8133','270dbd1d10bfb72ffa0ce988028c8133','member',1,'message-discovered','{stamp}','{stamp}','{stamp}');
+                     INSERT INTO messages(account_id,group_id,server_message_id,user_id,sent_at,received_at) VALUES('a',1,'legacy-message',9002,'{stamp}','{stamp}');
+                     INSERT INTO actions(account_id,group_id,user_id,kind,created_at) VALUES('a',1,9002,'recall','{stamp}');
+                     INSERT INTO audit_events(account_id,group_id,user_id,actor,event,created_at) VALUES('a',1,9002,'system','legacy','{stamp}');
+                     INSERT INTO rules(account_id,name,matcher,created_at,updated_at) VALUES('a','legacy-rule','contains','{stamp}','{stamp}');
+                     INSERT INTO rule_evaluations(account_id,group_id,user_id,message_id,rule_id,rule_type,mode,decision,created_at) VALUES('a',1,9002,1,last_insert_rowid(),'machine','automatic','matched','{stamp}');
+                     INSERT INTO rule_runtime_state(rule_id,account_id,group_id,user_id,window_count,updated_at) SELECT id,'a',1,9002,4,'{stamp}' FROM rules WHERE name='legacy-rule';
+                     INSERT INTO rule_whitelist_members(rule_id,user_id) SELECT id,9002 FROM rules WHERE name='legacy-rule';
+                     INSERT INTO effect_outbox(account_id,group_id,effect_type,payload_json,dedupe_key,state,created_at) VALUES('a',1,'recall','{{\"userId\":9002}}','legacy-queued','queued','{stamp}');
+                     INSERT INTO effect_outbox(account_id,group_id,effect_type,payload_json,dedupe_key,state,created_at) VALUES('a',1,'recall','{{\"userId\":9002}}','legacy-succeeded','succeeded','{stamp}');
+                     INSERT INTO card_rename_jobs(account_id,group_id,user_id,desired_name,state,attempts,welcome_pending,created_at,updated_at) VALUES('a',1,22,'DH群员0001','succeeded',1,0,'{stamp}','{stamp}');
+                     INSERT INTO card_rename_jobs(account_id,group_id,user_id,desired_name,state,attempts,welcome_pending,created_at,updated_at) VALUES('a',1,9002,'DH群员0001','retry',4,1,'{stamp}','{stamp}');"
+                ))
+            })
+            .unwrap();
+
+        let mut wire = canonical.clone();
+        wire.nim_id = "9002".into();
+        database.upsert_member_from_wire(&wire).unwrap();
+        database.upsert_member_from_wire(&wire).unwrap();
+
+        let members = database.list_members("a", 1).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].user_id, 22);
+        assert_eq!(members[0].nim_id, "9002");
+        let result: (i64, i64, i64, i64, i64, i64, i64, String, String, i64, i64) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row("SELECT COUNT(*) FROM messages WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM actions WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM audit_events WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM rule_evaluations WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM rule_runtime_state WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM rule_whitelist_members WHERE user_id=22", [], |row| row.get(0))?,
+                    connection.query_row("SELECT COUNT(*) FROM members WHERE user_id=9002", [], |row| row.get(0))?,
+                    connection.query_row("SELECT payload_json FROM effect_outbox WHERE dedupe_key='legacy-queued'", [], |row| row.get(0))?,
+                    connection.query_row("SELECT payload_json FROM effect_outbox WHERE dedupe_key='legacy-succeeded'", [], |row| row.get(0))?,
+                    connection.query_row("SELECT attempts FROM card_rename_jobs WHERE user_id=22 AND desired_name='DH群员0001'", [], |row| row.get(0))?,
+                    connection.query_row("SELECT welcome_pending FROM card_rename_jobs WHERE user_id=22 AND desired_name='DH群员0001'", [], |row| row.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            [result.0, result.1, result.2, result.3, result.4, result.5],
+            [1; 6]
+        );
+        assert_eq!(result.6, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.7).unwrap()["userId"],
+            22
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.8).unwrap()["userId"],
+            9002
+        );
+        assert_eq!(result.9, 4);
+        assert_eq!(result.10, 1);
+    }
+
+    #[test]
+    fn startup_reconciles_alias_backed_legacy_positive_nim_identity() {
+        let database = populated_database();
+        let now = Utc::now();
+        let stamp = now.to_rfc3339();
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(&format!(
+                    "INSERT INTO members(account_id,group_id,user_id,nim_id,nickname,card_name,role,present,join_source,discovered_at,last_seen_at,updated_at) VALUES
+                       ('a',1,22,'9002','真实成员','真实名片','member',1,'baseline','{stamp}','{stamp}','{stamp}'),
+                       ('a',1,9002,'','270dbd1d10bfb72ffa0ce988028c8133','270dbd1d10bfb72ffa0ce988028c8133','member',1,'message-discovered','{stamp}','{stamp}','{stamp}');
+                     INSERT INTO member_identity_aliases(account_id,group_id,nim_id,user_id,created_at,updated_at) VALUES('a',1,'9002',22,'{stamp}','{stamp}');
+                     INSERT INTO messages(account_id,group_id,server_message_id,user_id,sent_at,received_at) VALUES('a',1,'startup-legacy-message',9002,'{stamp}','{stamp}');
+                     INSERT INTO effect_outbox(account_id,group_id,effect_type,payload_json,dedupe_key,state,created_at) VALUES('a',1,'recall','{{\"userId\":9002}}','startup-legacy-effect','queued','{stamp}');"
+                ))?;
+                assert_eq!(reconcile_alias_backed_legacy_members(connection)?, 1);
+                assert_eq!(reconcile_alias_backed_legacy_members(connection)?, 0);
+                Ok(())
+            })
+            .unwrap();
+
+        let result: (i64, i64, i64) = database
+            .with_connection(|connection| {
+                Ok((
+                    connection.query_row(
+                        "SELECT COUNT(*) FROM members WHERE account_id='a' AND group_id=1 AND user_id=9002",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT user_id FROM messages WHERE server_message_id='startup-legacy-message'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT CAST(json_extract(payload_json,'$.userId') AS INTEGER) FROM effect_outbox WHERE dedupe_key='startup-legacy-effect'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(result, (0, 22, 22));
+    }
+
+    #[test]
+    fn startup_archives_only_stale_unacknowledged_messages() {
+        let database = populated_database();
+        let now = Utc::now();
+        let stale = now - ChronoDuration::minutes(16);
+        database
+            .with_connection(|connection| {
+                for (server_message_id, received_at, acknowledged_at) in [
+                    ("stale-unacknowledged", stale, None),
+                    ("recent-unacknowledged", now, None),
+                    ("stale-acknowledged", stale, Some(stale)),
+                ] {
+                    connection.execute(
+                        "INSERT INTO messages(account_id,group_id,server_message_id,user_id,sent_at,received_at,acknowledged_at,processing_state) VALUES('a',1,?,2,?,?,?,'pending')",
+                        params![server_message_id,received_at.to_rfc3339(),received_at.to_rfc3339(),acknowledged_at.map(|value| value.to_rfc3339())],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        database.prepare().unwrap();
+        let states = database
+            .with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT server_message_id,processing_state,processed_at IS NOT NULL FROM messages WHERE server_message_id LIKE '%unacknowledged' OR server_message_id='stale-acknowledged' ORDER BY server_message_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("recent-unacknowledged".into(), "pending".into(), 0),
+                ("stale-acknowledged".into(), "pending".into(), 0),
+                ("stale-unacknowledged".into(), "ignored".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn message_ack_and_processing_are_separate_and_recoverable() {
         let directory = tempdir().unwrap();
         let paths = AppPaths {
@@ -4198,6 +5143,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: false,
                 moderation_enabled: false,
+                machine_rules_enabled: false,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -4281,6 +5228,8 @@ mod tests {
                 enabled: true,
                 ai_enabled: false,
                 moderation_enabled: false,
+                machine_rules_enabled: false,
+                ai_rules_enabled: false,
                 manual_takeover: false,
                 welcome_message: String::new(),
                 updated_at: now,
@@ -4327,9 +5276,13 @@ mod tests {
         let job = database.claim_next_card_job("a").unwrap().unwrap();
         assert_eq!(job.state, "processing");
         assert_eq!(job.attempts, 2);
-        database.finish_card_job(&job, true, "").unwrap();
+        database.finish_card_job(&job, true, false, "").unwrap();
         let saved = database.list_members("a", 1).unwrap().pop().unwrap();
-        assert_eq!(saved.card_name, "DH群员0001");
+        // A completed job stores the managed target, while the actual wire
+        // card remains owned by the next 旺商聊 roster readback.
+        assert_eq!(saved.card_name, "原名");
+        assert_eq!(saved.managed_card_name, "DH群员0001");
+        assert_eq!(saved.locked_card_name, "DH群员0001");
         assert_eq!(
             database
                 .list_card_jobs("a", 1, 20)
@@ -4339,5 +5292,73 @@ mod tests {
                 .state,
             "succeeded"
         );
+        assert!(database.enqueue_card_job("a", 1, &plan, false).unwrap());
+        assert_eq!(
+            database
+                .list_card_jobs("a", 1, 20)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn card_job_stops_immediately_for_a_non_retryable_member_error() {
+        let database = populated_database();
+        let now = Utc::now();
+        let member = Member {
+            account_id: "a".into(),
+            group_id: 1,
+            user_id: 3,
+            nim_id: "nim-3".into(),
+            nickname: "已封禁用户".into(),
+            card_name: "1".into(),
+            original_card_name: "1".into(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: "ACCOUNT_STATE_BAN".into(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: now,
+            joined_at: None,
+            last_seen_at: now,
+            updated_at: now,
+        };
+        database.upsert_member(&member).unwrap();
+        let plan = CardPlan {
+            member,
+            original_name: "已封禁用户".into(),
+            suggested_name: "DH群员0001".into(),
+            suffix: "0001".into(),
+            status: "planned".into(),
+            reason: String::new(),
+        };
+        database.enqueue_card_job("a", 1, &plan, false).unwrap();
+        let job = database.claim_next_card_job("a").unwrap().unwrap();
+        database
+            .finish_card_job(&job, false, false, "该成员已封禁，跳过自动改名")
+            .unwrap();
+        let job = database.list_card_jobs("a", 1, 1).unwrap().pop().unwrap();
+        assert_eq!(job.state, "failed");
+        assert!(job.next_attempt_at.is_none());
+        assert_eq!(job.last_error, "该成员已封禁，跳过自动改名");
+    }
+
+    #[test]
+    fn stored_time_accepts_rfc3339_and_legacy_sqlite_timestamps() {
+        let rfc3339 = parse_stored_time("2026-07-31T11:17:42+00:00").unwrap();
+        let legacy = parse_stored_time("2026-07-31 11:17:42").unwrap();
+        let legacy_fraction = parse_stored_time("2026-07-31 11:17:42.125").unwrap();
+
+        assert_eq!(rfc3339, legacy);
+        assert_eq!(legacy_fraction.timestamp_subsec_millis(), 125);
+        assert!(parse_stored_time("invalid").is_none());
     }
 }

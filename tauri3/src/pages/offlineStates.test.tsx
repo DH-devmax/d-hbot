@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Group } from '../types'
@@ -60,6 +60,16 @@ describe('production pages retain scoped cached data', () => {
     expect(mocks.saveKnowledgeDocument).toHaveBeenCalledWith(expect.objectContaining({ id: 11, enabled: false }))
   })
 
+  it('shows an explicit checked state for bound knowledge groups', async () => {
+    mocks.listKnowledgeBindings.mockResolvedValueOnce([{ baseId: 7, accountId: 'ACCOUNT', groupId: 101, enabled: true }])
+    render(<KnowledgePage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
+
+    const group = await screen.findByRole('checkbox', { name: '测试群' })
+    expect(group).toBeChecked()
+    expect(group.closest('.check-chip')).toHaveClass('selected')
+    expect(group.closest('.check-chip')?.querySelector('.check-chip-indicator')).toBeInTheDocument()
+  })
+
   it('keeps audit rows visible when a refresh goes offline', async () => {
     render(<AuditPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
     await screen.findAllByText('生成每日摘要')
@@ -73,24 +83,28 @@ describe('production pages retain scoped cached data', () => {
     render(<AuditPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
     await screen.findAllByText('生成每日摘要')
     await userEvent.type(screen.getByLabelText('成员旺商号'), '10001')
-    await userEvent.selectOptions(screen.getByLabelText('事件'), 'daily_summary')
+    await userEvent.click(screen.getByRole('combobox', { name: '事件' }))
+    await userEvent.click(screen.getByRole('option', { name: '生成每日摘要' }))
     await userEvent.click(screen.getByRole('button', { name: '刷新' }))
     await waitFor(() => expect(mocks.queryAudit).toHaveBeenLastCalledWith('ACCOUNT', expect.objectContaining({ userId: 10001, event: 'daily_summary' })))
   })
 
   it('defaults audit filtering to today and reloads a selected date', async () => {
     render(<AuditPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
-    const yearInput = await screen.findByLabelText('年份')
-    const monthInput = screen.getByLabelText('月份')
-    const dayInput = screen.getByLabelText('日期')
+    const yearInput = await screen.findByRole('combobox', { name: '年份' })
+    const monthInput = screen.getByRole('combobox', { name: '月份' })
+    const dayInput = screen.getByRole('combobox', { name: '日期' })
     const now = new Date()
-    expect(yearInput).toHaveValue(String(now.getFullYear()))
-    expect(monthInput).toHaveValue(String(now.getMonth() + 1))
-    expect(dayInput).toHaveValue(String(now.getDate()))
+    expect(yearInput).toHaveTextContent(`${now.getFullYear()} 年`)
+    expect(monthInput).toHaveTextContent(`${now.getMonth() + 1} 月`)
+    expect(dayInput).toHaveTextContent(`${now.getDate()} 日`)
 
-    fireEvent.change(yearInput, { target: { value: '2026' } })
-    fireEvent.change(monthInput, { target: { value: '7' } })
-    fireEvent.change(dayInput, { target: { value: '20' } })
+    await userEvent.click(yearInput)
+    await userEvent.click(screen.getByRole('option', { name: '2026 年' }))
+    await userEvent.click(screen.getByRole('combobox', { name: '月份' }))
+    await userEvent.click(screen.getByRole('option', { name: '7 月' }))
+    await userEvent.click(screen.getByRole('combobox', { name: '日期' }))
+    await userEvent.click(screen.getByRole('option', { name: '20 日' }))
     await waitFor(() => expect(mocks.queryAudit).toHaveBeenLastCalledWith('ACCOUNT', expect.objectContaining({
       from: new Date('2026-07-20T00:00:00').toISOString(),
       to: new Date('2026-07-20T23:59:59.999').toISOString(),
@@ -104,5 +118,15 @@ describe('production pages retain scoped cached data', () => {
     await userEvent.click(screen.getByRole('button', { name: '刷新' }))
     await waitFor(() => expect(screen.getByText(/当前展示本地缓存/)).toBeInTheDocument())
     expect(screen.getAllByText('联系群员').length).toBeGreaterThan(0)
+  })
+
+  it('uses consistent application menus for task group and status', async () => {
+    render(<PlansPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
+    await screen.findAllByText('联系群员')
+
+    expect(screen.getByRole('combobox', { name: '所属群' })).toHaveTextContent('测试群')
+    await userEvent.click(screen.getByRole('combobox', { name: '状态' }))
+    await userEvent.click(screen.getByRole('option', { name: '已完成' }))
+    expect(screen.getByRole('combobox', { name: '状态' })).toHaveTextContent('已完成')
   })
 })

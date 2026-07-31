@@ -10,6 +10,8 @@ export type Group = {
   enabled: boolean
   aiEnabled: boolean
   moderationEnabled: boolean
+  machineRulesEnabled?: boolean
+  aiRulesEnabled?: boolean
   manualTakeover: boolean
   welcomeMessage?: string
   updatedAt?: string
@@ -22,6 +24,13 @@ export type DatabaseStatus = {
   accounts: number
   groups: number
   messages: number
+}
+
+export type SupportBundleResult = {
+  path: string
+  sha256: string
+  includedFiles: number
+  generatedAt: string
 }
 
 export type Message = {
@@ -48,21 +57,32 @@ export type RuleAction = { kind: string; durationSeconds: number; message: strin
 export type Rule = {
   id: number
   accountId: string
-  groupId: number
+  ruleType: 'machine' | 'ai'
+  scope: 'global' | 'selected'
+  groupIds: number[]
+  priorityLevel: 'low' | 'medium' | 'high'
+  whitelistUserIds: number[]
   name: string
   matcher: string
   pattern: string
   threshold: number
   count: number
   windowSeconds: number
-  cooldownSeconds: number
-  priority: number
   mode: 'observe' | 'automatic' | string
   enabled: boolean
   semanticThreshold: number
-  exemptRoles: string[]
-  exemptUserIds: number[]
   actions: RuleAction[]
+}
+
+export type RuleMember = {
+  accountId: string
+  groupId: number
+  userId: number
+  nimId: string
+  nickname: string
+  cardName: string
+  originalCardName: string
+  managedCardName: string
 }
 
 export type KnowledgeBase = {
@@ -169,7 +189,28 @@ export type AuditFilters = {
   cursor?: string
 }
 
-export type AiSettings = { base_url: string; webhook_url: string; model: string; api_key_configured: boolean }
+export type AiSettings = { base_url: string; webhook_url: string; api_backend: 'chat_completions' | 'responses'; model: string; api_key_configured: boolean }
+
+export type AiProviderEndpoint = {
+  id: number
+  accountId: string
+  name: string
+  baseUrl: string
+  webhookUrl: string
+  apiBackend: 'chat_completions' | 'responses'
+  model: string
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh'
+  priority: number
+  enabled: boolean
+  apiKeyConfigured: boolean
+  healthStatus: string
+  failureCount: number
+  cooldownUntil?: string | null
+  lastError: string
+  lastCheckedAt?: string | null
+  createdAt: string
+  updatedAt: string
+}
 
 export type BusinessAppRecord = {
   accountId: string

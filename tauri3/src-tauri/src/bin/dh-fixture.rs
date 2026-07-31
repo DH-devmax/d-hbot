@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,10 +17,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, Notify, RwLock};
 
+const BROWSER_EVENT_LIMIT: usize = 10_000;
+
 #[derive(Clone)]
 struct HostState {
     gateway: Arc<RwLock<FixtureGateway>>,
     browser_events: Arc<RwLock<VecDeque<BrowserEvent>>>,
+    next_browser_event: Arc<AtomicU64>,
     browser: Arc<Mutex<Option<BrowserProcess>>>,
     http_port: u16,
     devtools_port: u16,
@@ -29,6 +33,7 @@ struct HostState {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserEvent {
+    id: u64,
     callback: String,
     args: Vec<Value>,
 }
@@ -92,6 +97,8 @@ struct NimTeamInput {
     account: Option<String>,
     nick_in_team: Option<String>,
     content: Option<String>,
+    message_id: Option<String>,
+    user_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +228,7 @@ async fn emit_burst(
                 )
             })?;
         browser_events.push(BrowserEvent {
+            id: state.next_browser_event.fetch_add(1, Ordering::Relaxed),
             callback: "onmsg".into(),
             args: vec![json!({
                 "idServer": message_id,
@@ -235,7 +243,11 @@ async fn emit_burst(
             })],
         });
     }
-    state.browser_events.write().await.extend(browser_events);
+    let mut events = state.browser_events.write().await;
+    events.extend(browser_events);
+    while events.len() > BROWSER_EVENT_LIMIT {
+        events.pop_front();
+    }
     Ok(Json(json!({"ok":true,"count":input.count})))
 }
 
@@ -356,10 +368,15 @@ async fn member_updated(
 }
 
 async fn push_browser_event(state: &HostState, callback: &str, args: Vec<Value>) {
-    state.browser_events.write().await.push_back(BrowserEvent {
+    let mut events = state.browser_events.write().await;
+    events.push_back(BrowserEvent {
+        id: state.next_browser_event.fetch_add(1, Ordering::Relaxed),
         callback: callback.into(),
         args,
     });
+    while events.len() > BROWSER_EVENT_LIMIT {
+        events.pop_front();
+    }
 }
 
 fn validate_version(
@@ -400,8 +417,11 @@ async fn index() -> axum::response::Html<&'static str> {
 }
 
 async fn browser_events(State(state): State<HostState>) -> Json<Vec<BrowserEvent>> {
-    let mut queue = state.browser_events.write().await;
-    Json(queue.drain(..).collect())
+    // A reload may overlap the previous renderer's polling loop. Keep a bounded
+    // replay log so the new renderer can install its listener without losing a
+    // callback fetched by the renderer that is about to unload.
+    let queue = state.browser_events.read().await;
+    Json(queue.iter().cloned().collect())
 }
 
 async fn fixture_ipc(State(state): State<HostState>, Json(input): Json<IpcInput>) -> Json<Value> {
@@ -517,7 +537,36 @@ async fn nim_rename(
     }
 }
 
+async fn nim_recall(
+    State(state): State<HostState>,
+    Json(input): Json<NimTeamInput>,
+) -> Json<Value> {
+    let gateway = state.gateway.read().await.clone();
+    let group_id = fixture_group_from_team_id(input.team_id.as_deref());
+    let message_id = input.message_id.unwrap_or_default();
+    let user_id = input.user_id.unwrap_or_else(|| {
+        input
+            .account
+            .as_deref()
+            .and_then(|value| value.rsplit('-').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10006)
+    });
+    match gateway.recall(group_id, user_id, &message_id).await {
+        Ok(receipt) => Json(json!({
+            "ok":true,
+            "idServer":message_id,
+            "idClient":receipt.request_id,
+            "requestId":receipt.request_id,
+        })),
+        Err(error) => Json(json!({"ok":false,"errorMessage":error.message})),
+    }
+}
+
 async fn shutdown_fixture(State(state): State<HostState>) -> Json<Value> {
+    // Retain one permit as well as waking active waiters. A test harness can
+    // request shutdown while the Fixture is completing browser startup.
+    state.shutdown.notify_one();
     state.shutdown.notify_waiters();
     Json(json!({"ok":true}))
 }
@@ -527,11 +576,47 @@ struct BrowserProcess {
     profile: PathBuf,
 }
 
-impl Drop for BrowserProcess {
-    fn drop(&mut self) {
+impl BrowserProcess {
+    fn terminate(&mut self) {
+        let process_id = self.child.id().to_string();
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &process_id, "/T", "/F"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            // Chromium can fork a browser child and leave the launcher PID.
+            // spawn_browser creates a dedicated process group, so terminating
+            // that group reliably releases the Fixture DevTools port.
+            let group = format!("-{process_id}");
+            let _ = Command::new("kill")
+                .args(["-TERM", &group])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = Command::new("kill")
+                .args(["-KILL", &group])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.profile);
+    }
+}
+
+impl Drop for BrowserProcess {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -625,6 +710,11 @@ fn spawn_browser(http_port: u16, devtools_port: u16) -> Result<BrowserProcess, S
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let child = command
         .spawn()
         .map_err(|error| format!("启动 Fixture 浏览器 {} 失败：{error}", executable.display()))?;
@@ -667,9 +757,11 @@ async fn main() {
         .unwrap_or(9233);
     let shutdown = Arc::new(Notify::new());
     let browser = Arc::new(Mutex::new(None));
+    let next_browser_event = Arc::new(AtomicU64::new(1));
     let state = HostState {
         gateway: Arc::new(RwLock::new(FixtureGateway::new_default())),
         browser_events: Arc::new(RwLock::new(VecDeque::new())),
+        next_browser_event,
         browser: browser.clone(),
         http_port,
         devtools_port,
@@ -691,6 +783,7 @@ async fn main() {
         .route("/fixture/nim/members", get(nim_members))
         .route("/fixture/nim/send", post(nim_send))
         .route("/fixture/nim/rename", post(nim_rename))
+        .route("/fixture/nim/recall", post(nim_recall))
         .route("/fixture/faults", post(faults))
         .route("/fixture/shutdown", post(shutdown_fixture))
         .with_state(state);
@@ -713,6 +806,10 @@ async fn main() {
     );
     shutdown.notified().await;
     let _ = server.await;
+    // Drop the browser before the async runtime exits. This is deliberate: on
+    // macOS Chromium can otherwise outlive its short-lived launcher process.
+    let stopped_browser = browser.lock().await.take();
+    drop(stopped_browser);
 }
 
 const INDEX: &str = r#"<!doctype html>
@@ -724,9 +821,12 @@ const INDEX: &str = r#"<!doctype html>
 <div class="row"><button onclick="reset()">重置完整场景</button><button onclick="load()">刷新状态</button></div><h2>当前状态与动作日志</h2><pre id="state">读取中...</pre></main>
 <script>
 const jsonHeaders={'content-type':'application/json'};
+globalThis.__dhProtocolRoutes=["/v1/group/get-group-list","/v1/group/get-group-members","/v1/group/get-group-member-info","/v1/group/set-member-mute","/v1/group/member-mute-cancel","/v1/group/set-member-nickname","/v1/group/remove-group-member","/v1/group/message-rollback","/v1/group/set-group-mute","/v1/plugins/encode-msg"];
 async function json(url,options){const response=await fetch(url,options);return response.json()}
 async function post(url,body){return json(url,{method:'POST',headers:jsonHeaders,body:JSON.stringify(body||{})})}
 const fixtureState={nimReady:true};
+const fixtureHistory=[];
+const seenBrowserEvents=new Set();
 const ipcListeners=new Map();
 window.__dhIpc={
   once(channel,callback){ipcListeners.set(channel,callback)},
@@ -749,6 +849,14 @@ const nimCore={
       input.done(error,{members,nextCursor:value.nextCursor||''});
     }catch(error){input.done(error,[])}
   },
+  async getTeam(input){
+    try{
+      const value=await json('/fixture/state');
+      const teamId=String(input.teamId||'');
+      const muted=(value.groupMutes||[]).some(groupId=>`fixture-cloud-${groupId}`===teamId);
+      input.done(null,{mute:muted,muteType:muted?'MUTE_MEMBER':'none'});
+    }catch(error){input.done(error,null)}
+  },
   async updateNickInTeam(input){
     try{
       const value=await post('/fixture/nim/rename',{teamId:input.teamId,account:input.account,nickInTeam:input.nickInTeam});
@@ -761,6 +869,20 @@ const nimCore={
       const error=value.ok?null:Object.assign(new Error(value.errorMessage||'NIM send error'),{code:value.errorCode||0,status:value.errorCode||0,timedOut:Boolean(value.timedOut)});
       input.done(error,value);
     }catch(error){input.done(error,null)}
+  },
+  async getHistoryMsgs(input){
+    const messages=fixtureHistory.filter(message=>message.scene==='team'&&String(message.to||'')===String(input.to||'')).slice(-Number(input.limit||100));
+    input.done(null,{msgs:messages});
+  },
+  async recallMsg(input){
+    try{
+      const message=input.msg||{};
+      const account=String(message.from||'');
+      const userId=Number(account.split('-').pop()||0);
+      const value=await post('/fixture/nim/recall',{teamId:message.to,account,messageId:message.idServer,userId});
+      if(value.ok){const index=fixtureHistory.findIndex(item=>String(item.idServer||'')===String(message.idServer||''));if(index>=0)fixtureHistory.splice(index,1);for(const name of ['onrecallmsg','onRecallMsg','onrecallmsgs','onRecallMsgs']){const callback=nimCore.options[name];if(typeof callback==='function'){callback(message);break}}}
+      input.done(value.ok?null:Object.assign(new Error(value.errorMessage||'NIM recall error'),{code:value.errorCode||0}),message);
+    }catch(error){input.done(error,input.msg||null)}
   }
 };
 Object.defineProperty(window,'nim',{configurable:true,get(){return fixtureState.nimReady?nimCore:null}});
@@ -771,8 +893,15 @@ async function pumpFixture(){
     if(fixtureState.nimReady){
       const events=await json('/fixture/browser-events');
       for(const event of events){
+        if(event.id&&seenBrowserEvents.has(event.id))continue;
         const callback=nimCore.options[event.callback];
-        if(typeof callback==='function')callback(...event.args);
+        // Do not consume an event before DH has installed the corresponding
+        // listener. This mirrors NIM callback delivery more closely after a
+        // renderer reload.
+        if(typeof callback!=='function')continue;
+        if(event.id)seenBrowserEvents.add(event.id);
+        if(event.callback==='onmsg'&&event.args&&event.args[0])fixtureHistory.push(event.args[0]);
+        callback(...event.args);
       }
     }
   }catch{}

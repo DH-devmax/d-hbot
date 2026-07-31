@@ -129,7 +129,9 @@ test('developer fixture covers navigation, data and management workflows', async
   await page.getByRole('button', { name: '新建规则' }).click()
   await page.getByLabel('匹配内容').fill('测试关键词')
   await page.getByRole('button', { name: '保存规则' }).click()
-  await expect(page.getByText('新规则').first()).toBeVisible()
+  await expect(page.getByText('新机器规则').first()).toBeVisible()
+  await page.getByRole('button', { name: /AI 控制规则/ }).first().click()
+  await expect(page.getByText('暂无 AI 控制规则')).toBeVisible()
 
   await page.getByRole('button', { name: '知识与 AI' }).click()
   await expect(page.getByRole('heading', { name: 'DH 群规' })).toBeVisible()
@@ -150,7 +152,7 @@ test('developer fixture covers navigation, data and management workflows', async
 
   await page.getByRole('button', { name: '审计' }).click()
   await page.getByText('测试环境收到消息').click()
-  await expect(page.getByRole('heading', { name: '收到消息' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '收到群消息' })).toBeVisible()
 
   await page.getByRole('button', { name: '设置' }).click()
   await expect(page.getByText('DH Fixture · 9233')).toBeVisible()

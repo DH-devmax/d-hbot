@@ -15,7 +15,10 @@ pub fn normalize(value: &str) -> Vec<char> {
 
 pub fn missing(value: &str) -> bool {
     let trimmed = value.trim();
-    if matches!(trimmed, "" | "1" | ".") {
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "" | "1" | "." | "null" | "undefined" | "unknown" | "none" | "nil" | "n/a"
+    ) {
         return true;
     }
     let normalized = normalize(trimmed);
@@ -23,6 +26,35 @@ pub fn missing(value: &str) -> bool {
         || normalized
             .iter()
             .all(|character| character.is_ascii_digit())
+}
+
+/// Returns whether the current group card should be repaired by the automatic
+/// card workflow. A locked DH card is always authoritative; otherwise only
+/// clearly unusable placeholders are corrected automatically.
+pub fn needs_automatic_correction(member: &Member) -> bool {
+    if !member.managed_card_name.trim().is_empty() {
+        return member.card_name.trim() != member.managed_card_name.trim();
+    }
+    missing(&member.card_name)
+}
+
+/// Accounts which the upstream has marked as banned, cancelled, or logged out
+/// cannot accept a group-card update. Keep them visible in previews, but never
+/// add them to an automatic rename queue.
+pub fn inactive_account(member: &Member) -> bool {
+    let state = member.account_state.trim().to_ascii_uppercase();
+    let visible_name = format!("{} {}", member.card_name, member.nickname);
+    state.contains("_BAN")
+        || state.contains("BLOCK")
+        || state.contains("CANCEL")
+        || state.contains("LOGOUT")
+        || visible_name.contains("已封禁用户")
+        || visible_name.contains("已注销")
+        || visible_name.contains("该用户已注销")
+}
+
+pub fn automatic_correction_eligible(member: &Member) -> bool {
+    !inactive_account(member) && needs_automatic_correction(member)
 }
 
 pub fn candidates(value: &str) -> Vec<String> {
@@ -151,6 +183,7 @@ pub fn preview(
     let mut next_index = 1;
     for member in members {
         let original = resolved_name(&member);
+        let automatic_correction = automatic_correction_eligible(&member);
         if excluded(&member, self_id) {
             result.excluded += 1;
             result.items.push(CardPlan {
@@ -160,6 +193,18 @@ pub fn preview(
                 suffix: String::new(),
                 status: "excluded".into(),
                 reason: "群主、管理员、当前账号或系统账号".into(),
+            });
+            continue;
+        }
+        if inactive_account(&member) {
+            result.excluded += 1;
+            result.items.push(CardPlan {
+                member,
+                original_name: original,
+                suggested_name: String::new(),
+                suffix: String::new(),
+                status: "excluded".into(),
+                reason: "该成员已封禁、注销或离线，跳过自动改名".into(),
             });
             continue;
         }
@@ -175,10 +220,23 @@ pub fn preview(
             });
             continue;
         }
-        if !member.managed_card_name.is_empty() && member.card_name == member.managed_card_name {
-            result.already_managed += 1;
+        if !member.managed_card_name.is_empty() {
             let suggested = member.managed_card_name.clone();
             let fixed = member.card_suffix.clone();
+            if member.card_name != member.managed_card_name {
+                used_names.insert(suggested.clone());
+                result.will_rename += 1;
+                result.items.push(CardPlan {
+                    member,
+                    original_name: original,
+                    suggested_name: suggested,
+                    suffix: fixed,
+                    status: "planned".into(),
+                    reason: "旺商聊当前群名片与已管理名称不一致".into(),
+                });
+                continue;
+            }
+            result.already_managed += 1;
             result.items.push(CardPlan {
                 member,
                 original_name: original,
@@ -223,7 +281,11 @@ pub fn preview(
                 suggested_name: suggested,
                 suffix: fixed,
                 status: "planned".into(),
-                reason: String::new(),
+                reason: if automatic_correction {
+                    "当前群名片异常，自动纠正".into()
+                } else {
+                    String::new()
+                },
             });
         }
     }
@@ -240,7 +302,16 @@ fn resolved_name(member: &Member) -> String {
         member.nickname.as_str(),
     ]
     .into_iter()
-    .find(|value| !value.trim().is_empty())
+    .find(|value| !missing(value))
+    .or_else(|| {
+        [
+            member.original_card_name.as_str(),
+            member.card_name.as_str(),
+            member.nickname.as_str(),
+        ]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+    })
     .unwrap_or("")
     .trim()
     .into()
@@ -268,5 +339,131 @@ mod tests {
         ] {
             assert_eq!(suffix(index).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn managed_name_drift_reuses_the_existing_target_and_suffix() {
+        let member = Member {
+            account_id: "ACCOUNT".into(),
+            group_id: 1,
+            user_id: 10,
+            nim_id: "NIM".into(),
+            nickname: "原名称".into(),
+            card_name: "旺商聊旧名".into(),
+            original_card_name: "原名称".into(),
+            managed_card_name: "DH群员0001".into(),
+            card_suffix: "0001".into(),
+            role: "member".into(),
+            account_state: String::new(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: "DH群员0001".into(),
+            violation_count: 0,
+            discovered_at: chrono::Utc::now(),
+            joined_at: None,
+            last_seen_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let preview = preview(1, "DH", vec![member], 999).unwrap();
+        assert_eq!(preview.will_rename, 1);
+        assert_eq!(preview.items[0].suggested_name, "DH群员0001");
+        assert_eq!(preview.items[0].suffix, "0001");
+        assert_eq!(preview.items[0].status, "planned");
+    }
+
+    #[test]
+    fn automatic_correction_detects_placeholder_card_and_uses_a_valid_backup_name() {
+        let member = Member {
+            account_id: "ACCOUNT".into(),
+            group_id: 1,
+            user_id: 10,
+            nim_id: "NIM".into(),
+            nickname: "广州校长".into(),
+            card_name: "1".into(),
+            original_card_name: "1".into(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: String::new(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: chrono::Utc::now(),
+            joined_at: None,
+            last_seen_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(needs_automatic_correction(&member));
+        let preview = preview(1, "DH", vec![member], 999).unwrap();
+        assert_eq!(preview.items[0].suggested_name, "广校");
+        assert_eq!(preview.items[0].reason, "当前群名片异常，自动纠正");
+    }
+
+    #[test]
+    fn automatic_correction_leaves_a_normal_unmanaged_card_alone() {
+        let member = Member {
+            account_id: "ACCOUNT".into(),
+            group_id: 1,
+            user_id: 10,
+            nim_id: "NIM".into(),
+            nickname: "广州校长".into(),
+            card_name: "广州校长".into(),
+            original_card_name: "广州校长".into(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: String::new(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: chrono::Utc::now(),
+            joined_at: None,
+            last_seen_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(!needs_automatic_correction(&member));
+    }
+
+    #[test]
+    fn inactive_accounts_are_excluded_from_automatic_correction() {
+        let member = Member {
+            account_id: "ACCOUNT".into(),
+            group_id: 1,
+            user_id: 10,
+            nim_id: "NIM".into(),
+            nickname: "已封禁用户".into(),
+            card_name: "1".into(),
+            original_card_name: "1".into(),
+            managed_card_name: String::new(),
+            card_suffix: String::new(),
+            role: "member".into(),
+            account_state: "ACCOUNT_STATE_BAN".into(),
+            blacklisted: false,
+            present: true,
+            join_source: "baseline".into(),
+            prompt_read: true,
+            locked_card_name: String::new(),
+            violation_count: 0,
+            discovered_at: chrono::Utc::now(),
+            joined_at: None,
+            last_seen_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(needs_automatic_correction(&member));
+        assert!(!automatic_correction_eligible(&member));
+        let preview = preview(1, "DH", vec![member], 999).unwrap();
+        assert_eq!(preview.items[0].status, "excluded");
+        assert_eq!(
+            preview.items[0].reason,
+            "该成员已封禁、注销或离线，跳过自动改名"
+        );
     }
 }
