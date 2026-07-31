@@ -26,6 +26,7 @@
     "clean:production": "node scripts/prepare-production.mjs",
     "verify:production:boundary": "node scripts/verify-build-boundary.mjs",
     "test:production-isolation": "node scripts/test-production-isolation.mjs",
+    "verify:docs": "python3 ../tools/verify_docs.py && python3 ../tools/verify_repository_redaction.py",
     "tauri:build:production": "pnpm verify:production:boundary && pnpm clean:production && tauri build --features custom-protocol -- --no-default-features",
     "tauri:build:developer": "pnpm build:fixture-resource && pnpm clean:bundle && tauri build --features fixture,custom-protocol --config src-tauri/tauri.fixture.conf.json",
     "package:windows:production": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel production",

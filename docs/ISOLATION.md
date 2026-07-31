@@ -31,12 +31,14 @@
 
 ## 账号与 Actions 隔离
 
-- 当前源码 `origin` 应指向 `git@github.com:DH-devmax/d-hbot.git`。
+- 当前源码 `origin` 的所有者必须是 `DH-devmax/d-hbot`；HTTPS 与 SSH 传输均可，实际 URL 以 `git remote get-url --push origin` 为准。
 - 当前生产文件分发目标为管理员控制的云盘；GitHub 发行仓库只作可选索引。
 - 旧账号仓库不接受新线路的提交或发布投递。
 - `.githooks/pre-commit` 与 `.githooks/pre-push` 会核对远端所有者、活动 `gh` 账号和 Git 作者；账号不一致时停止。
 
 两个当前仓库均停用 Actions。云盘文件、校验清单和实机报告不得包含私有源码、Token、证书、原始协议或真实群数据。
+
+提交前必须同时通过 `pnpm verify:docs`、Contract sanitizer 和生产隔离检查。仓库脱敏扫描会读取 Git 跟踪文件及归档 ZIP；真实测试群、长消息 ID、用户主目录、Bearer/JWT、私钥和常见 API/GitHub 密钥格式均视为失败。
 
 ## 日志边界
 

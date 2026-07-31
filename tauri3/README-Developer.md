@@ -5,7 +5,7 @@
 ## 启动
 
 ```text
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev:fixture
 ```
 
@@ -26,6 +26,7 @@ Windows 校准使用内部开发包 `DH-BOT-Dev.exe`，在设置中选择：
 
 ```text
 pnpm test:fixture
+pnpm verify:docs
 pnpm tauri:build:developer
 pnpm package:windows:developer
 ```

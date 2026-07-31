@@ -49,3 +49,5 @@ python3 tools/verify_support_bundle.py /path/to/DH-BOT-support-YYYYMMDD-HHMMSS.z
 错误和崩溃记录会调用磁盘刷新；支持包以临时文件写入并原子替换，防止得到半个 ZIP。生成完成后，界面显示 ZIP 自身 SHA-256；包内 `SHA256SUMS.txt` 校验所有诊断载荷文件，`manifest.json` 列出文件名、大小和对应哈希。
 
 如果诊断包生成失败，请只发送生成失败的时间、调试页截图和 `%APPDATA%\DH\3.0\logs` 中最新文件的前后截图，不要发送数据库或 `secrets.dat`。维护人员也可以在收到截图后要求用户重新生成完整诊断包；不要让用户手动压缩整个 `%APPDATA%\DH` 目录。
+
+维护代码或文档提交前还必须执行 `pnpm verify:docs`。该命令同时核对文档版本/schema/链接和仓库脱敏边界；支持包校验通过不等于源码仓库脱敏通过，两项检查不能互相替代。

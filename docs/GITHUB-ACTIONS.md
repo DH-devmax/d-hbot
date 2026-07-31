@@ -24,7 +24,9 @@ pnpm test:production
 pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
-cargo clippy --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+python3 ../tools/verify_repository_redaction.py
 ```
 
 Windows 开发机随后运行：
@@ -49,3 +51,5 @@ gh api repos/DH-devmax/d-hbot-releases/actions/permissions
 ```
 
 两个权限接口都应返回 `enabled: false`，workflow 列表应为空。后续若采用公共信任代码签名或恢复 GitHub Release，需要先更新本规范和长期记忆，再建立新的独立发布方案。
+
+最近只读核对：2026-08-01，两个权限接口均返回 `enabled: false`，两个 workflow 列表均为空。

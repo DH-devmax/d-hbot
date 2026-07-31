@@ -27,7 +27,9 @@ pnpm test:production
 pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
-cargo clippy --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+python3 ../tools/verify_repository_redaction.py
 ```
 
 Fixture 只用于开发测试，不进入下一步生产构建。
@@ -51,7 +53,7 @@ tauri3\dist\production\SHA256SUMS.txt
 tauri3\dist\DH-BOT-VERSION-windows-x64-portable.zip
 ```
 
-打包脚本不会读取 PFX 或执行代码签名。`SHA256SUMS.txt` 同时记录主程序、安装包、文档、规则模板和 portable ZIP。
+打包脚本不会读取 PFX 或执行代码签名。`SHA256SUMS.txt` 同时记录主程序、安装包、文档、规则模板和 portable ZIP。当前个人发行不要求 Authenticode；未签名 portable ZIP 是预期发布形态。任何自签名测试证书、PFX、密码和密钥都不得进入包或云盘。
 
 ## 4. 实机验收
 

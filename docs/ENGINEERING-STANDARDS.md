@@ -44,20 +44,26 @@
 pnpm install --frozen-lockfile
 pnpm test:contract-sanitizer
 pnpm test:production-isolation
-cargo test --no-default-features
-cargo test --features fixture
+pnpm test:production
+pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
-cargo clippy --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+pnpm build:production
+pnpm build:rust:production
+python3 ../tools/verify_repository_redaction.py
 ```
 
-所有测试和开发构建在开发机执行，私有源码仓库不运行 GitHub Actions。ZCG 基线协议更新需完成路由、参数和 envelope 测试；旺商聊专有写能力仍需采集、脱敏、回放 Contract v2，并通过首次手工回读。
+所有测试和开发构建在开发机执行，两个当前 GitHub 仓库 Actions 均停用。ZCG 基线协议更新需完成路由、参数和 envelope 测试；旺商聊专有写能力仍需采集、脱敏、回放 Contract v2，并通过首次手工回读。
 
 生产发布只在受控 Windows 开发机执行：固定经过本地验收的源码 commit SHA，完成 MSVC/NSIS/portable 构建、生产包深度扫描和真实桌面验收。生产包使用 `--no-default-features`，Fixture 不参与构建或发行。
 
 Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针只存在于私有源码仓库，不复制到 NSIS、portable 或公开发行仓库。
 
 上传云盘前还必须确认：源码工作树干净、记录完整 commit SHA、应用版本与文件名一致、生产隔离扫描通过、Windows 实机报告通过、`SHA256SUMS.txt` 与待上传文件一致。已有文件使用新版本号，不覆盖旧包。
+
+仓库的 `.githooks/pre-commit` 与 `.githooks/pre-push` 在 GitHub 身份检查之后自动运行文档一致性和脱敏扫描。它们检查当前已跟踪及未忽略的新文件，也检查只读架构 ZIP 内部内容；不得以 `--no-verify` 绕过。
 
 ## 代码评审清单
 

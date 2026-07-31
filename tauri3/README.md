@@ -23,7 +23,7 @@ after Beta.2 device checks; GitHub Actions are not part of this release path.
 Development:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm test
 pnpm tauri:dev
 pnpm tauri:build
@@ -41,11 +41,12 @@ The production build clears staged developer resources, compiles `dh-bot` with
 no default Cargo features, and scans the frontend and Windows artifacts for
 Fixture commands, ports and data paths before release.
 
-For user-reported failures, the desktop app provides **Debug -> Generate support bundle**. The ZIP stays local until the user shares it and contains redacted runtime health, capability information, anonymized audit records, recent redacted logs and checksums. It never includes SQLite data, secrets, WangShangLiao login data, raw messages or Fixture data. Repeated exports use unique names and local retention is bounded to 20 bundles, 30 days and 128 MiB. See [`../docs/DIAGNOSTICS-AND-SUPPORT.md`](../docs/DIAGNOSTICS-AND-SUPPORT.md).
+For user-reported failures, the desktop app provides **Debug -> Generate support bundle**. The ZIP stays local until the user shares it and contains redacted runtime health, capability information, anonymized audit records, recent redacted logs and checksums. It never includes SQLite data, secrets, WangShangLiao login data, raw messages, real group names or Fixture data. Repeated exports use unique names and local retention is bounded to 20 bundles, 30 days and 128 MiB. Run `python3 ../tools/verify_repository_redaction.py` before committing source or docs. See [`../docs/DIAGNOSTICS-AND-SUPPORT.md`](../docs/DIAGNOSTICS-AND-SUPPORT.md).
 
 Architecture and implementation references:
 
 - [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md): data-flow overview.
 - [`../docs/TECHNICAL-DESIGN.md`](../docs/TECHNICAL-DESIGN.md): module map, executor, workers and failure semantics.
+- [`../docs/API-REFERENCE.md`](../docs/API-REFERENCE.md): production Tauri commands, events and developer-only boundaries.
 - [`../docs/DATABASE-SCHEMA.md`](../docs/DATABASE-SCHEMA.md): schema v11 and persistence boundaries.
 - [`../docs/PROTOCOL-CONTRACT.md`](../docs/PROTOCOL-CONTRACT.md): ZCG baseline, WangShangLiao protocol and receipts.

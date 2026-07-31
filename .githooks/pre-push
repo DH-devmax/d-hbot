@@ -5,4 +5,8 @@ set -eu
 remote_name="${1:-origin}"
 remote_url="${2:-}"
 hook_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$hook_dir/verify-github-identity.sh" "推送前检查" "$remote_name" "$remote_url"
+repo_root="$(CDPATH= cd -- "$hook_dir/.." && pwd)"
+
+"$hook_dir/verify-github-identity.sh" "推送前检查" "$remote_name" "$remote_url"
+python3 "$repo_root/tools/verify_docs.py"
+python3 "$repo_root/tools/verify_repository_redaction.py"

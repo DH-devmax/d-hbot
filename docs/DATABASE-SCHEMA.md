@@ -3,6 +3,10 @@
 当前数据库版本为 **schema v11**。数据库只保存 DH BOT 的运行状态；旺商聊的 Cookie、
 Token、Local Storage 和登录分区由旺商聊自己管理，不进入 `dh.db`。
 
+首次启动默认创建空运行状态：规则模板全部停用，内置知识库启用但不绑定群，预测应用和
+计划停用，AI Provider 地址与密钥留空，模型默认 `deepseek-v4-pro`。账号级默认内容由
+`defaults.content.version.2.<accountId>` 幂等标记控制，不覆盖管理员已有配置。
+
 ## 路径和启动
 
 | 渠道 | 数据库 | 密钥 | 说明 |
@@ -48,7 +52,7 @@ Token、Local Storage 和登录分区由旺商聊自己管理，不进入 `dh.db
 | 表 | 作用 |
 |---|---|
 | `group_ai_permissions` | 回复、任务、撤回、禁言、移出分别授权 |
-| `ai_provider_endpoints` | Provider 优先级、模型、Responses 思考深度、健康状态和密钥引用；不保存明文密钥 |
+| `ai_provider_endpoints` | Provider 优先级、模型、Responses 思考深度、健康状态和密钥引用；不保存明文密钥。`xhight` 输入会规范为 `xhigh`，默认思考深度为 `low` |
 | `ai_runs` | 同一消息/决策的幂等和重试状态 |
 | `tasks` | 负责人、创建人、截止时间、提醒 claim 和结果 |
 | `daily_summaries` / `summary_runs` | 按账号、群、本地日期生成的私密摘要 |

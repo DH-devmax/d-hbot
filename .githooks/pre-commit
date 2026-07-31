@@ -3,4 +3,8 @@
 set -eu
 
 hook_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$hook_dir/verify-github-identity.sh" "提交前检查"
+repo_root="$(CDPATH= cd -- "$hook_dir/.." && pwd)"
+
+"$hook_dir/verify-github-identity.sh" "提交前检查"
+python3 "$repo_root/tools/verify_docs.py"
+python3 "$repo_root/tools/verify_repository_redaction.py"

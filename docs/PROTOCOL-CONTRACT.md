@@ -87,6 +87,14 @@ Unsupported        当前产品明确不开放
 
 ## 6. Contract v2 采集和审查
 
+### 两层证据边界
+
+`tauri3/contracts/wangshangliao_capabilities.json` 是按旺商聊版本和脚本指纹归档的人工校准表，
+用于记录历史写操作证据；其中某项写能力为 `unverified` 不代表 ZCG 基线不可用，也不会单独
+锁住所有群管功能。当前运行时先执行 `ZcgLegacyProfileV1` 的只读路由、Electron IPC、双层
+envelope 和 NIM 方法探测，再按能力逐项决定 `Supported`、`ManualVerification` 或
+`Unavailable`。公告、公告编辑和其他旺商聊专有写能力仍必须有真实写入后的回读证据。
+
 真实采集只在开发版和本机忽略目录进行，仓库只提交确定性脱敏结果：
 
 ```text
@@ -98,7 +106,7 @@ tauri3/contracts/*.json      脱敏 Contract v2，可回放
 规范化回执和预期最终状态。脱敏器会替换账号、群、用户、NIM、消息、公告 ID、URL、会话、
 Token、Cookie、Authorization、Base64 协议体和路径；不允许原始密钥进入 Git。
 
-新增或更新旺商聊专有能力必须满足：两组管理群完整操作、可恢复操作的前后基线、回读一致、
+新增或更新旺商聊专有能力必须满足：两组脱敏测试群完整操作、可恢复操作的前后基线、回读一致、
 错误场景和人工复核。未满足时只显示 `ManualVerification`，不以 Fixture 结果冒充真实能力。
 
 校验命令和字段要求见 [`tauri3/contracts/README.md`](../tauri3/contracts/README.md)。

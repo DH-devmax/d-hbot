@@ -13,11 +13,11 @@
 | 消息台 | 多群筛选、发送、撤回 | `query_messages`、`send_text_batch` | 手工操作 | 对应能力 |
 | 规则 | 机器/AI TAB、多群绑定、三级优先级、成员白名单、v1/v2 导入导出 | `save_rule`、`search_rule_members`、`import_rules` | 全部停用 | 对应群规则开关 |
 | 知识与 AI / 知识库 | 多库、多文档、多群绑定 | 知识库与文档命令 | 默认库不绑定群 | 当前账号 |
-| 知识与 AI / AI 助手 | 多 Provider 主备、排序、健康测试、内置人格与离群 AI 测试 | `list/save/test_ai_provider_endpoint`、`test_ai` | 地址与密钥留空 | AI 配置 |
+| 知识与 AI / AI 助手 | 多 Provider 主备、排序、健康测试、内置人格与离群 AI 测试 | `list_ai_provider_endpoints`、`save_ai_provider_endpoint`、`delete_ai_provider_endpoint`、`test_ai_provider_endpoint`、`test_ai` | 地址与密钥留空 | AI 配置 |
 | 知识与 AI / 业务应用 | 预测启停、数据健康、运行记录与本地测试 | `list_business_apps`、`set_business_app_enabled`、`get_business_app_health`、`test_business_app` | 预测默认停用 | 已启用管理 + AI 回复权限 + 明确 `@DH 预测` |
 | 任务与计划 | 任务、每日摘要、每日开关群 | 任务/摘要/计划命令 | 新安装关闭 | 管理员 + 对应能力 |
 | 审计 | 筛选、详情、CSV/JSON 导出 | `query_audit`、`export_audit` | 开启 | 本地数据库 |
-| 设置 | 旺商聊路径、AI、托盘、保留周期 | 设置命令 | 保守默认 | 当前 Windows 用户 |
+| 设置 | 旺商聊路径、启动/登录分区、数据库/协议状态、托盘与关闭偏好 | `get_wang_startup_settings`、`save_wang_startup_settings`、`get_close_behavior`、`resolve_close_action` | 保守默认 | 当前 Windows 用户 |
 | 调试 | DevTools、NIM、PID、队列、能力 | 诊断命令 | 只读 | 本机回环连接 |
 | 调试 | 可分享诊断包 | `export_support_bundle` | 手工生成 | 仅本机；不读取或导出密钥、登录数据、数据库或原始消息 |
 
@@ -32,6 +32,7 @@
 - 日志写入本机 `%APPDATA%\DH\3.0\logs`，使用 JSONL、每日分段、单段 8 MiB、30 天 / 64 MiB 上限。
 - “调试 → 生成诊断包”生成本地 ZIP，包含脱敏健康状态、协议能力、匿名化审计摘要、近期脱敏日志和包内 `SHA256SUMS.txt`；同一秒重复操作自动编号，最多保留 20 个、30 天和 128 MiB。
 - 诊断包排除 `dh.db`、`secrets.dat`、旺商聊 Electron 分区、Cookie、Token、API Key、原始协议和原始群消息；不会自动上传。
+- 提交前运行 `python3 tools/verify_repository_redaction.py`；该检查会扫描 Git 跟踪文件中的常见密钥格式、凭据 URL、Bearer/JWT、私钥、真实用户路径、真实测试群名和未脱敏长消息 ID。
 
 ## 当前能力状态
 

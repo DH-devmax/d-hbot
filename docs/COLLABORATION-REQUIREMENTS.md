@@ -37,7 +37,9 @@ pnpm test:production
 pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
-cargo clippy --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+pnpm verify:docs
 ```
 
 涉及 Windows 发布时，还必须在受控 Windows 机器执行 MSVC 生产构建、生产包扫描和 `scripts/test-windows-real-machine.ps1`。未通过真实旺商聊连接、登录复用、任务栏/托盘、退出残留和 DPI 检查前，不得标记为 RC 或正式版。

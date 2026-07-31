@@ -73,6 +73,7 @@ SECRET_PATTERNS = (
     ),
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 )
+REAL_GROUP_NAME = re.compile(r"[\u4e00-\u9fffA-Za-z0-9②]{2,24}兼职群")
 
 
 class ArchiveError(RuntimeError):
@@ -122,6 +123,13 @@ def validate_content(path: str, content: bytes) -> None:
             raise ArchiveError(f"credential-like value found in {path}")
 
 
+def redact_archived_content(path: str, content: bytes) -> bytes:
+    if PurePosixPath(path).suffix.lower() not in {".md", ".txt"}:
+        return content
+    text = content.decode("utf-8", errors="strict")
+    return REAL_GROUP_NAME.sub("测试群 A", text).encode("utf-8")
+
+
 def source_files(repo: Path) -> tuple[str, list[SourceFile]]:
     tag_object = run_git(repo, "rev-parse", TAG).decode().strip()
     commit = run_git(repo, "rev-parse", f"{TAG}^{{commit}}").decode().strip()
@@ -141,7 +149,9 @@ def source_files(repo: Path) -> tuple[str, list[SourceFile]]:
             continue
         archive_path = RENAMED_FILES.get(path, path)
         validate_path(archive_path)
-        content = run_git(repo, "cat-file", "blob", object_id)
+        content = redact_archived_content(
+            archive_path, run_git(repo, "cat-file", "blob", object_id)
+        )
         validate_content(archive_path, content)
         permission = 0o755 if mode_text.endswith("755") else 0o644
         selected.append(

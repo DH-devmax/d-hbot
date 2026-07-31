@@ -30,8 +30,10 @@ python3 -m unittest tools/test_archive_go_27.py
 ```
 
 The generator uses a fixed file allowlist, deterministic ZIP metadata and
-per-file Git blob comparison. Verification also rejects generated binaries,
-runtime data and credential-like values.
+per-file Git provenance. Before packaging, archived Markdown and text files replace
+real test-group names with `测试群 A`; verification repeats the same deterministic
+transformation. It also rejects generated binaries, runtime data and credential-like
+values.
 
 Archive source: annotated tag `go-2.7-final` (tag object
 `0da624fdd017c71cefc98f3cb28ee8a34714c114`), commit

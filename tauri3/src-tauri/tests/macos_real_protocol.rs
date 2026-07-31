@@ -357,7 +357,10 @@ async fn recalls_one_explicitly_configured_other_members_test_message() {
         .expect("DH_REAL_RECALL_SENDER_USER_ID must be an integer");
     let marker = std::env::var("DH_REAL_RECALL_TEXT_MARKER")
         .expect("DH_REAL_RECALL_TEXT_MARKER is required");
-    assert_eq!(expected_name, "大海兼职群");
+    assert!(
+        !expected_name.trim().is_empty(),
+        "DH_REAL_RECALL_GROUP_NAME must not be empty"
+    );
     assert!(marker.chars().count() >= 4, "test marker is too short");
 
     let gateway = CdpGateway::new(CdpClient::new("http://127.0.0.1:9222").unwrap());
@@ -454,7 +457,10 @@ async fn injects_one_explicit_message_into_the_real_listener_queue() {
     let message_id =
         std::env::var("DH_REAL_INJECT_MESSAGE_ID").expect("DH_REAL_INJECT_MESSAGE_ID is required");
     let text = std::env::var("DH_REAL_INJECT_TEXT").expect("DH_REAL_INJECT_TEXT is required");
-    assert_eq!(expected_name, "大海兼职群");
+    assert!(
+        !expected_name.trim().is_empty(),
+        "DH_REAL_INJECT_GROUP_NAME must not be empty"
+    );
     assert!(!message_id.trim().is_empty());
     assert!(!text.trim().is_empty());
 

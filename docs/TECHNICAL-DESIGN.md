@@ -2,7 +2,8 @@
 
 本文是面向开发者和维护人员的实现说明。产品入口和操作方法见
 [`DH使用手册.md`](DH使用手册.md)，功能清单见
-[`FEATURE-CATALOG.md`](FEATURE-CATALOG.md)，本文件重点说明模块边界、并发模型、失败处理和测试方式。
+[`FEATURE-CATALOG.md`](FEATURE-CATALOG.md)，生产命令清单见
+[`API-REFERENCE.md`](API-REFERENCE.md)，本文件重点说明模块边界、并发模型、失败处理和测试方式。
 
 ## 1. 运行时边界
 
@@ -158,6 +159,8 @@ pnpm test:fixture
 pnpm test:ui
 pnpm test:e2e:fixture
 cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+pnpm verify:docs
 ```
 
 生产构建必须使用 `--no-default-features`，扫描中不能出现 Fixture、`9233/51300`、

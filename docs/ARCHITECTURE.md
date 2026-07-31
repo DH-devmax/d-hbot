@@ -3,7 +3,8 @@
 本文先回答“数据如何流动”。开发时的模块边界、并发和失败语义见
 [`TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md)；数据库表和唯一约束见
 [`DATABASE-SCHEMA.md`](DATABASE-SCHEMA.md)；协议、回执和能力状态见
-[`PROTOCOL-CONTRACT.md`](PROTOCOL-CONTRACT.md)。
+[`PROTOCOL-CONTRACT.md`](PROTOCOL-CONTRACT.md)；完整生产 command 与事件清单见
+[`API-REFERENCE.md`](API-REFERENCE.md)。
 
 ## 分层
 

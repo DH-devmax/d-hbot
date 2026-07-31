@@ -1,9 +1,13 @@
 # DH BOT 3.0 beta.1 状态
 
+技术快照（2026-08-01）：应用版本 `3.0.0-beta.1`，SQLite schema v11，生产构建
+`--no-default-features`，生产端点 `127.0.0.1:9222`。本文件中的测试数量是该源码快照的
+本地结果；Windows 新产物必须重新生成 SHA-256，不能复用历史包哈希。
+
 ## 2026-07-31 真实群 AI 与规则验收
 
 - `gpt-5.6-luna`、Responses、`xhigh` 已完成模型目录、离群调用和真实群回复验证。
-- 大海兼职群的机器规则、AI 控制规则、知识绑定/解绑、缓存和 NIM 撤回已通过。
+- 脱敏测试群 A 的机器规则、AI 控制规则、知识绑定/解绑、缓存和 NIM 撤回已通过。
 - 真实撤回以 `nim.recallMsg` 的 `verified` 回执及 NIM 历史回读为空为验收依据。
 - 预测逻辑通过离群回归；生产因缺少可持续开奖源凭据保持停用。
 - 完整证据见 `docs/REAL-GROUP-TEST-20260731.md`。
@@ -54,13 +58,13 @@
 - `pnpm test`：58 项 RTL/Vitest 通过，包含业务应用、多 Provider 离群测试、批量群控、机器/AI 规则、知识、审计汉化、调试诊断包和消息游标分页回归测试。
 - `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用。
 - macOS 本机登录旺商聊的只读探测通过：读到 8 个群、一个完整 3097 人名单，消息编码和 NIM 成员事件为 `Supported`，公告为 `ManualVerification`。没有执行任何群写操作。
-- macOS 真实双群计时验证通过：2026-07-28 15:00 对“大海兼职群”“豪门大海兼职群②”执行关群，15:01 执行开群；每次写入均通过 `nim.getTeam` 回读，两个群最终均确认为允许发言。
+- macOS 真实双群计时验证通过：2026-07-28 15:00 对脱敏测试群 A/B 执行关群，15:01 执行开群；每次写入均通过 `nim.getTeam` 回读，两个群最终均确认为允许发言。
 - Contract v2 采集、组装、合并、严格验证与脱敏工具链 34 项测试及自检通过，可在多 DevTools 页面中唯一选择旺商聊；生产/开发构建边界、10 场景生产隔离扫描、前端生产扫描和无 Fixture 的 Rust release 构建通过。
 - `DH-Manual-ZH.pdf`：12 页，首页与“诊断与支持包”页已重新渲染为 PNG 并通过视觉检查。
 - 本机 macOS 未安装 `x86_64-pc-windows-msvc` 所需的 MSVC/C 头文件，也未安装 MinGW；最终生产包需由受控 Windows MSVC 开发机生成并完成实机烟测。
 - macOS Tauri 桌面包已连接真实旺商聊 2.6.3 的 `127.0.0.1:9222`；能识别登录路由和 `nim-not-ready`，本地 Rust 诊断桥正常返回。关闭窗口的“取消 / 挂到托盘 / 退出”确认框与后台进程存活已通过 Computer Use 实测。
 - 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
-- 已用当前代码生成本地未签名 `DH-BOT-3.0.0-beta.1-windows-x64-portable-unsigned-rust-final.zip`，解压后生产隔离扫描和包内 SHA-256 校验通过；PE 为 `97d2ca4075ff08573cfcba823ad660925406375b0b026fe830f38ff472b28880`，ZIP 为 `5610866f9fa594a110b1a7ed0011fe501e428f59f3e8a33b176696bd5afb4d4c`，PDF 为 `46522c116eab3be6bdd73b36742b1530c411f810e5d9ab5129885a1972f1007a`。当前个人发行正式采用未签名 portable ZIP；新包仍需在 Windows 重新构建并完成实机验收。
+- 旧 beta.1 Windows 包曾通过本地隔离和 SHA-256 校验，但其文件哈希已过期，不作为当前发布证据。当前个人发行正式采用未签名 portable ZIP；每次 Windows 构建必须生成新的 `SHA256SUMS.txt` 并完成实机验收。
 - Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
 - 构建归属已调整为“两个 GitHub 仓库均停用 Actions，Windows 开发机本地生产构建，云盘个人分发”。发行仓库仅保留下载说明或历史索引。
 - 本地日志改为 JSONL，带会话 ID 与递增序号，按日期/8 MiB 分段并执行 30 天/64 MiB 保留策略；统一脱敏 API Key、Token、Cookie、Authorization、密码和本机用户路径。
@@ -71,7 +75,7 @@
 - Windows 开发机的 MSVC 生产编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
 - Windows 10 22H2 与 Windows 11 23H2/24H2 的标准用户/管理员、安装/升级/卸载/portable、UAC、托盘、休眠恢复和 100%/125%/150% DPI。
 - 已内置 `ZcgLegacyProfileV1` 路由基线并接入运行时只读探测。未知脚本 SHA 在路由签名、Electron IPC、双层响应和 NIM 方法保持一致时会开放对应能力；公告继续执行首次手工写入与回读验证。
-- 16 人“大海兼职群”先做只读同步，再做测试消息撤回、短时禁言/立即解禁、临时改名/自动恢复；移出成员仍只在 Fixture 验证。
+- 16 人脱敏测试群 A 先做只读同步，再做测试消息撤回、短时禁言/立即解禁、临时改名/自动恢复；移出成员仍只在 Fixture 验证。
 - 云盘上传后下载文件的 SHA-256 回读校验与版本记录。
 
 生产新安装不创建测试群、成员、规则、知识库、计划或自动化开关；Fixture 仅存在于内部开发包。
