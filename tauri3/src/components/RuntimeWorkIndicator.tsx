@@ -19,7 +19,7 @@ const stateLabels: Record<string, string> = {
 
 function destination(kind: string): PageName {
   if (kind === 'aiReply' || kind === 'aiRule' || kind === 'prediction') return '知识与 AI'
-  if (kind === 'schedule' || kind === 'reminder' || kind === 'summary') return '任务与计划'
+  if (kind === 'schedule' || kind === 'reminder' || kind === 'activity' || kind === 'summary') return '活动与计划'
   if (kind === 'cardRename' || kind === 'sync') return '群组与成员'
   if (kind === 'write') return '审计'
   return '消息台'

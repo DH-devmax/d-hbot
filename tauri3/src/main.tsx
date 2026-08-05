@@ -41,7 +41,7 @@ class AppErrorBoundary extends React.Component<{ children: ReactNode }, { messag
 
 const nav: [PageName, typeof Activity][] = [
   ['总览', LayoutDashboard], ['群组与成员', Users], ['消息台', MessagesSquare], ['规则', ShieldCheck],
-  ['知识与 AI', BookOpen], ['任务与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
+  ['知识与 AI', BookOpen], ['活动与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
 ]
 
 function isTauriRuntime() { return typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) }
@@ -345,7 +345,7 @@ function App() {
       {page === '消息台' && <MessagesPage key={`messages-${accountId}`} groups={groups} accountId={accountId} onError={setError} />}
       {page === '规则' && <RulesPage key={`rules-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}`} accountId={accountId} groups={groups} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
-      {page === '任务与计划' && <PlansPage key={`plans-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '活动与计划' && <PlansPage key={`plans-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '审计' && <AuditPage key={`audit-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}

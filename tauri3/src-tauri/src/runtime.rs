@@ -24,8 +24,9 @@ use crate::gateway::{
     GatewayReceipt, GatewayRecord, GatewayRecordKind, RuntimeGateway,
 };
 use crate::models::{
-    Account, ActionRecord, AuditEvent, DailySummary, EffectOutboxItem, EffectOutboxRequest,
-    GatewayInboxEvent, Group, Member, MemberRef, Message, ModerationRule, RuleAction, TaskItem,
+    Account, ActionRecord, Activity, AuditEvent, DailySummary, EffectOutboxItem,
+    EffectOutboxRequest, GatewayInboxEvent, Group, Member, MemberRef, Message, ModerationRule,
+    RuleAction,
 };
 use crate::runtime_work::RuntimeCoordination;
 use crate::secrets::SecretStore;
@@ -343,10 +344,10 @@ impl BackendRuntime {
         workers.push(tauri::async_runtime::spawn(async move {
             roster_sync.roster_sync_loop().await;
         }));
-        let reminders = self.clone();
-        let reminders_app = app.clone();
+        let activities = self.clone();
+        let activities_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
-            reminders.reminder_loop(reminders_app).await;
+            activities.activity_loop(activities_app).await;
         }));
         let summaries = self.clone();
         let summaries_app = app.clone();
@@ -500,6 +501,55 @@ impl BackendRuntime {
         }
         self.enqueue_effect(account_id, group_id, "send_text", payload, dedupe_key)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue_activity_text_effect(
+        &self,
+        run_id: i64,
+        account_id: &str,
+        group_id: i64,
+        text: &str,
+        source: &str,
+        dedupe_key: String,
+        metadata: Value,
+    ) -> AppResult<()> {
+        if self.gateway.calibration_active() {
+            return Err(AppError::new(
+                "calibration_active",
+                "真实校准期间已暂停自动副作用，避免后台任务修改测试群状态",
+            ));
+        }
+        let mut payload = serde_json::json!({"text":text,"purpose":"activity"});
+        if let (Some(target), Some(extra)) = (payload.as_object_mut(), metadata.as_object()) {
+            target.extend(extra.clone());
+        }
+        let enqueued = self
+            .database
+            .enqueue_activity_effect(
+                run_id,
+                text.into(),
+                source.into(),
+                EffectOutboxRequest {
+                    account_id: account_id.into(),
+                    group_id,
+                    effect_type: "send_text".into(),
+                    payload_json: payload.to_string(),
+                    dedupe_key,
+                },
+            )
+            .await?;
+        if enqueued.inserted && matches!(enqueued.state.as_str(), "queued" | "retry") {
+            let work_id = runtime_lane_id("send_text", account_id, group_id);
+            self.coordination.tracker.enqueue(
+                &work_id,
+                "write",
+                effect_label("send_text"),
+                "群操作",
+            );
+            self.coordination.notify();
+        }
+        Ok(())
     }
 
     async fn effect_loop(&self, app: AppHandle) {
@@ -722,6 +772,7 @@ impl BackendRuntime {
         let success = status.succeeded();
         let error_text = redact(&error_text);
         let receipt = redact_gateway_receipt(receipt);
+        let receipt_message_id = receipt.message_id.clone();
         let receipt_json = serde_json::to_string(&receipt).unwrap_or_default();
         let should_record_action = payload
             .get("recordAction")
@@ -865,6 +916,112 @@ impl BackendRuntime {
                 let _ = app.emit(
                     "schedule-updated",
                     serde_json::json!({"runKey":run_key,"success":success,"error":error_text}),
+                );
+            }
+        }
+        if let Some(run_id) = payload.get("activityRunId").and_then(Value::as_i64) {
+            let final_state = if status == EffectDispatchStatus::Unknown {
+                Some("unknown")
+            } else if success {
+                Some("succeeded")
+            } else if status == EffectDispatchStatus::TerminalFailed || item.attempts >= 5 {
+                Some("failed")
+            } else {
+                None
+            };
+            if let Some(final_state) = final_state {
+                let _ = self
+                    .database
+                    .finish_activity_run(run_id, final_state.into(), error_text.clone())
+                    .await;
+                let _ = self
+                    .database
+                    .record_audit(AuditEvent {
+                        id: 0,
+                        account_id: item.account_id.clone(),
+                        group_id: item.group_id,
+                        user_id: 0,
+                        actor: "DH BOT".into(),
+                        event: if success {
+                            "activity_published"
+                        } else {
+                            "activity_publish_failed"
+                        }
+                        .into(),
+                        level: if success {
+                            "info"
+                        } else if final_state == "unknown" {
+                            "warning"
+                        } else {
+                            "error"
+                        }
+                        .into(),
+                        details: serde_json::json!({
+                            "activityId": payload.get("activityId").and_then(Value::as_i64),
+                            "runId": run_id,
+                            "state": final_state,
+                            "contentSource": payload.get("contentSource").and_then(Value::as_str).unwrap_or("fixed"),
+                            "messageId": receipt_message_id.clone(),
+                            "error": error_text,
+                        })
+                        .to_string(),
+                        created_at: Utc::now(),
+                    })
+                    .await;
+            }
+            if success {
+                let now = self.clock.now_utc();
+                let sender_id = self
+                    .gateway
+                    .session_identity()
+                    .await
+                    .map(|value| value.0)
+                    .unwrap_or(0);
+                let server_message_id = if receipt_message_id.trim().is_empty() {
+                    format!("activity-run-{run_id}")
+                } else {
+                    receipt_message_id.clone()
+                };
+                if let Err(error) = self
+                    .database
+                    .insert_message(Message {
+                        id: 0,
+                        account_id: item.account_id.clone(),
+                        group_id: item.group_id,
+                        server_message_id,
+                        sequence: 0,
+                        user_id: sender_id,
+                        sender_name: "DH BOT".into(),
+                        kind: "text".into(),
+                        text: payload
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        sent_at: now,
+                        received_at: now,
+                        processed_at: Some(now),
+                        acknowledged_at: Some(now),
+                        processing_state: "processed".into(),
+                        attempts: 1,
+                        next_attempt_at: None,
+                        last_error: String::new(),
+                        mentions_json: "[]".into(),
+                        source_kind: Some("activity".into()),
+                        flow: Some("outgoing".into()),
+                    })
+                    .await
+                {
+                    self.logger.write(
+                        "ERROR",
+                        &format!("活动消息写入 AI 会话失败：{}", error.message),
+                    );
+                }
+            }
+            if let Some(app) = app {
+                let _ = app.emit(
+                    "activity-updated",
+                    serde_json::json!({"runId":run_id,"success":success,"state":final_state,"error":error_text}),
                 );
             }
         }
@@ -1268,85 +1425,199 @@ impl BackendRuntime {
         Ok(DailySummary { id, ..summary })
     }
 
-    async fn reminder_loop(&self, app: AppHandle) {
+    async fn activity_loop(&self, app: AppHandle) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
-                if let Ok(_permit) = self.gateway.automatic_write_permit().await {
-                    let tasks = self
+                if let Ok((_, account_id)) = self.gateway.session_identity().await {
+                    let _ = self
                         .database
-                        .claim_due_task_reminders(self.clock.now_utc(), 1)
+                        .generate_due_activity_runs(
+                            account_id.clone(),
+                            self.clock.now_utc(),
+                            crate::activities::MISSED_RUN_GRACE_MINUTES,
+                            20,
+                        )
+                        .await;
+                    let runs = self
+                        .database
+                        .claim_activity_preparations(account_id.clone(), self.clock.now_utc(), 8)
                         .await
                         .unwrap_or_default();
-                    for task in tasks {
-                        let work_id = runtime_lane_id("reminder", &task.account_id, task.group_id);
-                        self.coordination.tracker.start_named(
-                            &work_id,
-                            "reminder",
-                            "准备任务提醒",
-                            "计划任务",
-                            None,
+                    let results = futures_util::future::join_all(
+                        runs.into_iter().map(|due| self.process_activity_run(due)),
+                    )
+                    .await;
+                    for (activity_id, run_id, success, details) in results {
+                        let _ = app.emit(
+                            "activity-updated",
+                            serde_json::json!({"activityId":activity_id,"runId":run_id,"success":success,"detail":details}),
                         );
-                        let text = format!(
-                            "任务提醒：{}{}",
-                            task.title,
-                            if task.description.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!("\n{}", task.description)
-                            }
-                        );
-                        let result = self
-                            .enqueue_text_effect(
-                                &task.account_id,
-                                task.group_id,
-                                &text,
-                                "task-reminder",
-                                format!("task-reminder:{}", task.id),
-                                serde_json::json!({"taskId":task.id,"userId":task.assignee_id}),
-                            )
-                            .await;
-                        let (level, details, success) = match result {
-                            Ok(()) => (
-                                "info",
-                                format!("任务“{}”提醒已进入发送队列", task.title),
-                                true,
-                            ),
-                            Err(error) => {
-                                let _ = self
-                                    .database
-                                    .finish_task_reminder(task.id, false, error.message.clone())
-                                    .await;
-                                (
-                                    "error",
-                                    format!("任务“{}”提醒入队失败：{}", task.title, error.message),
-                                    false,
-                                )
-                            }
-                        };
-                        self.coordination.tracker.finish(
-                            &work_id,
-                            if success { "succeeded" } else { "failed" },
-                            if success { "" } else { &details },
-                        );
-                        let _ = self
-                            .database
-                            .record_audit(AuditEvent {
-                                id: 0,
-                                account_id: task.account_id.clone(),
-                                group_id: task.group_id,
-                                user_id: task.assignee_id,
-                                actor: "DH BOT".into(),
-                                event: "task_reminder_queued".into(),
-                                level: level.into(),
-                                details: details.clone(),
-                                created_at: Utc::now(),
-                            })
-                            .await;
-                        let _ = app.emit("task-progress", serde_json::json!({"kind":"reminder","taskId":task.id,"success":success,"detail":details}));
                     }
                 }
             }
-            tokio::select! { _ = self.coordination.wake.notified() => {}, _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
+            tokio::select! { _ = self.coordination.wake.notified() => {}, _ = sleep(Duration::from_secs(15)) => {}, _ = self.shutdown.cancelled() => break }
+        }
+    }
+
+    async fn process_activity_run(
+        &self,
+        due: crate::models::DueActivityRun,
+    ) -> (i64, i64, bool, String) {
+        let work_id = runtime_lane_id("activity", &due.run.account_id, due.run.group_id);
+        self.coordination.tracker.start_named(
+            &work_id,
+            "activity",
+            "准备活动文案",
+            "活动发布",
+            Some(3),
+        );
+        self.coordination.tracker.progress(&work_id, 1, 3);
+        let (text, source, generation_error) = self.prepare_activity_text(&due).await;
+        self.coordination.tracker.progress(&work_id, 2, 3);
+        let result = self
+            .enqueue_activity_text_effect(
+                due.run.id,
+                &due.run.account_id,
+                due.run.group_id,
+                &text,
+                &source,
+                due.run.run_key.clone(),
+                serde_json::json!({
+                    "activityRunId": due.run.id,
+                    "activityId": due.activity.id,
+                    "activityName": due.activity.name,
+                    "contentSource": source,
+                }),
+            )
+            .await;
+        let (level, details, success) = match result {
+            Ok(()) => {
+                self.coordination.tracker.progress(&work_id, 3, 3);
+                (
+                    if generation_error.is_empty() {
+                        "info"
+                    } else {
+                        "warning"
+                    },
+                    serde_json::json!({
+                        "activityId": due.activity.id,
+                        "runId": due.run.id,
+                        "source": source,
+                        "generationFallback": !generation_error.is_empty(),
+                        "generationError": generation_error,
+                    })
+                    .to_string(),
+                    true,
+                )
+            }
+            Err(error) => {
+                let _ = self
+                    .database
+                    .finish_activity_run(due.run.id, "failed".into(), error.message.clone())
+                    .await;
+                ("error", error.message, false)
+            }
+        };
+        self.coordination.tracker.finish(
+            &work_id,
+            if success { "succeeded" } else { "failed" },
+            if success { "" } else { &details },
+        );
+        let _ = self
+            .database
+            .record_audit(AuditEvent {
+                id: 0,
+                account_id: due.run.account_id,
+                group_id: due.run.group_id,
+                user_id: 0,
+                actor: "DH BOT".into(),
+                event: "activity_queued".into(),
+                level: level.into(),
+                details: details.clone(),
+                created_at: Utc::now(),
+            })
+            .await;
+        (due.activity.id, due.run.id, success, details)
+    }
+
+    async fn prepare_activity_text(
+        &self,
+        due: &crate::models::DueActivityRun,
+    ) -> (String, String, String) {
+        if !due.activity.ai_optimize {
+            return (due.activity.content.clone(), "fixed".into(), String::new());
+        }
+        let context = self
+            .database
+            .activity_context(due.run.account_id.clone(), due.run.group_id, 5)
+            .await
+            .unwrap_or_default();
+        let recent_texts = context
+            .1
+            .into_iter()
+            .map(|run| run.text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let group_name = self
+            .database
+            .list_groups(Some(due.run.account_id.clone()))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|group| group.group_id == due.run.group_id)
+            .map(|group| group.name)
+            .unwrap_or_else(|| "当前群".into());
+        let result = async {
+            let _permit = self
+                .ai_rule_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| AppError::new("activity_ai_gate", "AI 任务队列已关闭"))?;
+            let (provider, _) = self
+                .ai_provider(&due.run.account_id, ai::AI_PROVIDER_TIMEOUT)
+                .await?;
+            let mut request = AiRequest {
+                version: "1",
+                event_id: uuid::Uuid::new_v4().to_string(),
+                persona: ai::PERSONA,
+                group_id: due.run.group_id,
+                group_name: group_name.clone(),
+                member_id: 0,
+                member_name: "活动调度器".into(),
+                member_role: "system".into(),
+                message_id: due.run.run_key.clone(),
+                message: crate::activities::ai_prompt(&due.activity, &group_name, &recent_texts),
+                recent_context: Vec::new(),
+                knowledge: Vec::new(),
+            };
+            for attempt in 0..2 {
+                if attempt > 0 {
+                    request
+                        .message
+                        .push_str("\n本次必须换一种不同的表达，不能复用近期文案。");
+                }
+                let decision = provider.decide(&request).await?;
+                match crate::activities::validate_generated_text(
+                    &due.activity.content,
+                    &decision.reply,
+                    &recent_texts,
+                ) {
+                    Ok(text) => return Ok(text),
+                    Err(error) if error.code == "activity_ai_duplicate" && attempt == 0 => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(AppError::new("activity_ai_duplicate", "AI 活动文案重复"))
+        }
+        .await;
+        match result {
+            Ok(text) => (text, "ai".into(), String::new()),
+            Err(error) => (
+                due.activity.content.clone(),
+                "ai-fallback".into(),
+                redact(&error.message),
+            ),
         }
     }
 
@@ -4392,10 +4663,20 @@ impl BackendRuntime {
                 .database
                 .list_knowledge_for_group(account_id.to_string(), group.group_id)
                 .await?;
+            let (active_activities, _) = self
+                .database
+                .activity_context(account_id.to_string(), group.group_id, 10)
+                .await
+                .unwrap_or_default();
             let mut knowledge_revision = Sha256::new();
             for document in &documents {
                 knowledge_revision.update(document.id.to_le_bytes());
                 knowledge_revision.update(document.content_hash.as_bytes());
+                knowledge_revision.update([0]);
+            }
+            for activity in &active_activities {
+                knowledge_revision.update(activity.id.to_le_bytes());
+                knowledge_revision.update(activity.updated_at.to_rfc3339().as_bytes());
                 knowledge_revision.update([0]);
             }
             let knowledge_revision = format!("{:x}", knowledge_revision.finalize());
@@ -4406,7 +4687,7 @@ impl BackendRuntime {
                 if let Some(chunks) = self.ai_knowledge_cache.get(&knowledge_cache_key) {
                     (chunks, true)
                 } else {
-                    let chunks = knowledge::search(&question, &documents, 3)
+                    let mut chunks = knowledge::search(&question, &documents, 3)
                         .into_iter()
                         .map(|hit| ai::AiKnowledgeChunk {
                             base: hit.document.base_name,
@@ -4415,6 +4696,20 @@ impl BackendRuntime {
                             text: hit.excerpt,
                         })
                         .collect::<Vec<_>>();
+                    chunks.extend(active_activities.iter().map(|activity| {
+                        ai::AiKnowledgeChunk {
+                            base: "当前群活动".into(),
+                            title: activity.name.clone(),
+                            source: "activity".into(),
+                            text: format!(
+                                "活动日期：{} 至 {}；发送时刻：{}；活动内容：{}",
+                                activity.start_date,
+                                activity.end_date,
+                                activity.send_times.join("、"),
+                                activity.content
+                            ),
+                        }
+                    }));
                     self.ai_knowledge_cache
                         .insert(knowledge_cache_key, chunks.clone());
                     (chunks, false)
@@ -4528,26 +4823,37 @@ impl BackendRuntime {
                 .await
             {
                 for (index, task) in decision.tasks.into_iter().enumerate() {
+                    let scheduled = task
+                        .due_at
+                        .unwrap_or_else(|| Utc::now() + chrono::Duration::days(1))
+                        .with_timezone(&Local);
+                    let title = task.title.trim().to_string();
+                    let content = if task.description.trim().is_empty() {
+                        title.clone()
+                    } else {
+                        task.description.trim().to_string()
+                    };
                     let _ = self
                         .database
-                        .save_task_once(
-                            TaskItem {
+                        .save_activity_once(
+                            Activity {
                                 id: 0,
                                 account_id: account_id.into(),
-                                group_id: group.group_id,
-                                title: task.title,
-                                description: task.description,
-                                status: "pending".into(),
-                                assignee_id: 0,
-                                created_by: self
-                                    .gateway
-                                    .session_identity()
-                                    .await
-                                    .map(|value| value.0)
-                                    .unwrap_or(0),
-                                due_at: task.due_at,
-                                reminder_at: None,
-                                reminder_sent_at: None,
+                                name: title,
+                                content,
+                                enabled: false,
+                                ai_optimize: false,
+                                ai_instructions: String::new(),
+                                timezone: iana_time_zone::get_timezone()
+                                    .unwrap_or_else(|_| "UTC".into()),
+                                start_date: scheduled.format("%Y-%m-%d").to_string(),
+                                end_date: scheduled.format("%Y-%m-%d").to_string(),
+                                weekdays: vec![1, 2, 3, 4, 5, 6, 7],
+                                send_times: vec![scheduled.format("%H:%M").to_string()],
+                                group_ids: vec![group.group_id],
+                                next_run_at: None,
+                                source_key: String::new(),
+                                deleted_at: None,
                                 created_at: Utc::now(),
                                 updated_at: Utc::now(),
                             },

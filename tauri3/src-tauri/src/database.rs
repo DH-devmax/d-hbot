@@ -305,6 +305,61 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(account_id, group_id) REFERENCES groups(account_id, group_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS activities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  ai_optimize INTEGER NOT NULL DEFAULT 0,
+  ai_instructions TEXT NOT NULL DEFAULT '',
+  timezone TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',
+  next_run_at TEXT,
+  source_key TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS activities_source_key_idx ON activities(account_id,source_key) WHERE source_key<>'';
+CREATE INDEX IF NOT EXISTS activities_due_idx ON activities(account_id,enabled,next_run_at) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS activity_groups (
+  activity_id INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  PRIMARY KEY(activity_id,account_id,group_id),
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+  FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS activity_times (
+  activity_id INTEGER NOT NULL,
+  local_time TEXT NOT NULL,
+  PRIMARY KEY(activity_id,local_time),
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS activity_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  activity_id INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  scheduled_for TEXT NOT NULL,
+  run_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL DEFAULT 'pending',
+  text TEXT NOT NULL DEFAULT '',
+  content_source TEXT NOT NULL DEFAULT 'fixed',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  FOREIGN KEY(activity_id) REFERENCES activities(id),
+  FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);
 CREATE TABLE IF NOT EXISTS group_ai_permissions (
   account_id TEXT NOT NULL,
   group_id INTEGER NOT NULL,
@@ -778,6 +833,19 @@ impl DatabaseExecutor {
     pub async fn enqueue_effect(&self, request: EffectOutboxRequest) -> AppResult<EnqueuedEffect> {
         self.execute(move |database| database.enqueue_effect(&request))
             .await
+    }
+
+    pub async fn enqueue_activity_effect(
+        &self,
+        run_id: i64,
+        text: String,
+        source: String,
+        request: EffectOutboxRequest,
+    ) -> AppResult<EnqueuedEffect> {
+        self.execute(move |database| {
+            database.enqueue_activity_effect(run_id, &text, &source, &request)
+        })
+        .await
     }
 
     pub async fn claim_effect_outbox(
@@ -1602,10 +1670,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 12 {
+    if old_version > 13 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v12"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v13"),
         ));
     }
     let transaction = connection
@@ -1731,6 +1799,30 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
     transaction
         .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS tasks_source_key_idx ON tasks(account_id,source_key) WHERE source_key<>''")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    let migration_timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',enabled INTEGER NOT NULL DEFAULT 0,ai_optimize INTEGER NOT NULL DEFAULT 0,ai_instructions TEXT NOT NULL DEFAULT '',timezone TEXT NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',next_run_at TEXT,source_key TEXT NOT NULL DEFAULT '',deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE);
+             CREATE UNIQUE INDEX IF NOT EXISTS activities_source_key_idx ON activities(account_id,source_key) WHERE source_key<>'';
+             CREATE INDEX IF NOT EXISTS activities_due_idx ON activities(account_id,enabled,next_run_at) WHERE deleted_at IS NULL;
+             CREATE TABLE IF NOT EXISTS activity_groups (activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,PRIMARY KEY(activity_id,account_id,group_id),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS activity_times (activity_id INTEGER NOT NULL,local_time TEXT NOT NULL,PRIMARY KEY(activity_id,local_time),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS activity_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,scheduled_for TEXT NOT NULL,run_key TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'pending',text TEXT NOT NULL DEFAULT '',content_source TEXT NOT NULL DEFAULT 'fixed',attempts INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,last_error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,FOREIGN KEY(activity_id) REFERENCES activities(id),FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO activities(account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,created_at,updated_at) SELECT account_id,title,CASE WHEN TRIM(description)='' THEN title ELSE description END,0,0,'',?,substr(COALESCE(reminder_at,due_at,created_at),1,10),substr(COALESCE(reminder_at,due_at,created_at),1,10),'[1,2,3,4,5,6,7]',NULL,'legacy-task:'||id,created_at,updated_at FROM tasks",
+            params![migration_timezone],
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch(
+            "INSERT OR IGNORE INTO activity_groups(activity_id,account_id,group_id) SELECT activities.id,tasks.account_id,tasks.group_id FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;
+             INSERT OR IGNORE INTO activity_times(activity_id,local_time) SELECT activities.id,CASE WHEN tasks.reminder_at IS NOT NULL THEN substr(tasks.reminder_at,12,5) ELSE '09:00' END FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .execute_batch("CREATE TABLE IF NOT EXISTS gateway_capability_verifications (fingerprint TEXT NOT NULL,capability TEXT NOT NULL,source TEXT NOT NULL,status TEXT NOT NULL,automatic_allowed INTEGER NOT NULL DEFAULT 0,evidence_hash TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',verified_at TEXT NOT NULL,PRIMARY KEY(fingerprint,capability)); CREATE TABLE IF NOT EXISTS ai_provider_endpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',api_backend TEXT NOT NULL DEFAULT 'chat_completions',model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',secret_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,health_status TEXT NOT NULL DEFAULT 'unchecked',failure_count INTEGER NOT NULL DEFAULT 0,cooldown_until TEXT,last_error TEXT NOT NULL DEFAULT '',last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx ON ai_provider_endpoints(account_id,enabled DESC,priority,id);")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
@@ -1768,7 +1860,7 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
-        .execute_batch("PRAGMA user_version = 12;")
+        .execute_batch("PRAGMA user_version = 13;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -1980,6 +2072,10 @@ impl Database {
             connection.execute(
                 "UPDATE tasks SET reminder_state='retry',reminder_next_attempt_at=NULL,reminder_claimed_at=NULL,reminder_last_error='DH BOT 重启后已恢复提醒' WHERE reminder_state='processing' AND reminder_sent_at IS NULL",
                 [],
+            )?;
+            connection.execute(
+                "UPDATE activity_runs SET state='retry',next_retry_at=NULL,last_error='DH BOT 重启后已恢复活动处理',updated_at=? WHERE state='preparing'",
+                params![Utc::now().to_rfc3339()],
             )?;
             connection.execute(
                 "UPDATE ai_runs SET state='retry',next_retry_at=NULL,last_error='DH BOT 重启后已恢复执行',updated_at=? WHERE state='processing'",
@@ -3187,6 +3283,52 @@ impl Database {
         .map_err(|error| AppError::new("effect_outbox_enqueue", error.to_string()))
     }
 
+    pub fn enqueue_activity_effect(
+        &self,
+        run_id: i64,
+        text: &str,
+        source: &str,
+        request: &EffectOutboxRequest,
+    ) -> AppResult<EnqueuedEffect> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "INSERT OR IGNORE INTO effect_outbox(account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,created_at,claimed_at,completed_at) VALUES(?,?,?,?,?,'queued',0,NULL,'',?,NULL,NULL)",
+                params![request.account_id,request.group_id,request.effect_type,request.payload_json,request.dedupe_key,now],
+            )?;
+            let (id, state) = if changed == 1 || request.dedupe_key.is_empty() {
+                transaction.query_row(
+                    "SELECT id,state FROM effect_outbox WHERE id=last_insert_rowid()",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            } else {
+                transaction.query_row(
+                    "SELECT id,state FROM effect_outbox WHERE account_id=? AND dedupe_key=?",
+                    params![request.account_id, request.dedupe_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            };
+            let run_changed = transaction.execute(
+                "UPDATE activity_runs SET state='queued',text=?,content_source=?,updated_at=? WHERE id=? AND state='preparing'",
+                params![text,source,now,run_id],
+            )?;
+            if run_changed != 1 {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "activity run is not preparing".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(EnqueuedEffect {
+                id,
+                inserted: changed == 1,
+                state,
+            })
+        })
+        .map_err(|error| AppError::new("activity_effect_enqueue", error.to_string()))
+    }
+
     pub fn claim_effect_outbox(
         &self,
         account_id: Option<&str>,
@@ -3890,7 +4032,7 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 12);
+        assert_eq!(status.schema_version, 13);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
@@ -4247,7 +4389,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 12);
+        assert_eq!(database.status().unwrap().schema_version, 13);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -4275,7 +4417,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 12);
+        assert_eq!(reopened.status().unwrap().schema_version, 13);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -4307,7 +4449,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 12);
+        assert_eq!(database.status().unwrap().schema_version, 13);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -4321,7 +4463,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_and_v3_to_v12_idempotently() {
+    fn migrates_v2_and_v3_to_v13_idempotently() {
         for version in [2_i64, 3_i64] {
             let directory = tempdir().unwrap();
             let paths = AppPaths {
@@ -4346,7 +4488,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 12);
+            assert_eq!(database.status().unwrap().schema_version, 13);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -4360,7 +4502,7 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 12);
+            assert_eq!(reopened.status().unwrap().schema_version, 13);
             assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1

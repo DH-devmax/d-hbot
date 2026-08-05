@@ -26,6 +26,13 @@ export function installStylePreviewFixture() {
     status: 'pending', assigneeId: 10002, createdBy: 10001, dueAt: '2026-07-24T10:00:00Z', reminderAt: null,
     reminderSentAt: null, createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z',
   }]
+  let activities: PreviewRecord[] = [{
+    id: 1, accountId: 'ACCOUNT', name: '晚间互动', content: '今晚 19:30 开始互动，欢迎大家参加。',
+    enabled: true, aiOptimize: true, aiInstructions: '轻松自然', timezone: 'Asia/Shanghai',
+    startDate: '2026-08-01', endDate: '2026-08-31', weekdays: [1, 2, 3, 4, 5], sendTimes: ['19:30'],
+    groupIds: [101], nextRunAt: '2026-08-06T11:30:00Z', sourceKey: '', deletedAt: null,
+    createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-06T00:00:00Z',
+  }]
   let schedules: PreviewRecord[] = [{ id: 1, accountId: 'ACCOUNT', name: '日常开放时间', enabled: false, openTime: '08:00', closeTime: '22:00', timezone: 'Asia/Shanghai', groupIds: [101] }]
   const groups = [
     { accountId: 'ACCOUNT', groupId: 101, name: '16 人样式预览群', ownerUserId: 10001, enabled: true, aiEnabled: true, moderationEnabled: true, manualTakeover: false, welcomeMessage: '欢迎 @「[成员]」加入群聊，请先查看群规。' },
@@ -72,7 +79,7 @@ export function installStylePreviewFixture() {
       case 'plugin:window|minimize': return null
       case 'plugin:window|close': return null
       case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Style Preview', pageUrl: 'http://127.0.0.1:5173', nimAccount: 'ACCOUNT', detail: '样式预览数据已加载，修改 CSS 后会自动刷新。' }
-      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 6, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
+      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 13, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
       case 'get_ai_settings': return { base_url: '', webhook_url: '', api_backend: 'chat_completions', model: 'deepseek-v4-pro', api_key_configured: false }
       case 'list_ai_provider_endpoints': return [{ id: 1, accountId: 'ACCOUNT', name: '主连接', baseUrl: 'https://api.example.invalid/v1', webhookUrl: '', apiBackend: 'chat_completions', model: 'deepseek-v4-pro', priority: 0, enabled: true, apiKeyConfigured: true, healthStatus: 'healthy', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: '2026-07-22T08:00:00Z', createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }, { id: 2, accountId: 'ACCOUNT', name: '备用连接', baseUrl: 'https://backup.example.invalid/v1', webhookUrl: '', apiBackend: 'responses', model: 'deepseek-v4-pro', priority: 1, enabled: true, apiKeyConfigured: true, healthStatus: 'unchecked', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: null, createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
       case 'test_ai_provider_endpoint': return { decision: { reply: '你好，我可以协助处理群规、FAQ 和群内任务。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 1280, model: 'deepseek-v4-pro' }
@@ -111,6 +118,12 @@ export function installStylePreviewFixture() {
       case 'update_knowledge_base': case 'bind_knowledge_base': case 'save_knowledge_document': return 1
       case 'list_tasks': return tasks
       case 'save_task': { const next = { ...args.task, id: args.task.id || tasks.length + 1 }; tasks = tasks.filter(task => task.id !== next.id).concat(next); return next.id }
+      case 'list_activities': return activities
+      case 'save_activity': { const next = { ...args.activity, id: args.activity.id || activities.length + 1 }; activities = activities.filter(activity => activity.id !== next.id).concat(next); return next.id }
+      case 'delete_activity': activities = activities.filter(activity => activity.id !== args.activityId); return null
+      case 'list_activity_runs': return [{ id: 1, activityId: 1, accountId: 'ACCOUNT', groupId: 101, scheduledFor: '2026-08-05T11:30:00Z', runKey: 'STYLE-ACTIVITY-1', state: 'succeeded', text: '今晚互动开始啦！', contentSource: 'ai', attempts: 1, nextRetryAt: null, lastError: '', createdAt: '2026-08-05T11:30:00Z', updatedAt: '2026-08-05T11:30:02Z', completedAt: '2026-08-05T11:30:02Z' }]
+      case 'preview_activity_text': return { text: args.activity.aiOptimize ? '今晚 19:30 互动准时开始，欢迎大家来参加！' : args.activity.content, source: args.activity.aiOptimize ? 'ai' : 'fixed' }
+      case 'publish_activity_now': return (activities.find(activity => activity.id === args.activityId)?.groupIds as number[] | undefined)?.length || 0
       case 'list_schedules': return schedules
       case 'save_schedule': { const next = { ...args.schedule, id: args.schedule.id || schedules.length + 1 }; schedules = schedules.filter(schedule => schedule.id !== next.id).concat(next); return next.id }
       case 'list_schedule_runs': return [{ id: 1, scheduleId: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-22', action: 'open', success: true, error: '', attempts: 1, createdAt: '2026-07-22T00:00:00Z' }]

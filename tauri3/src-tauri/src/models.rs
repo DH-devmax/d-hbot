@@ -453,6 +453,63 @@ pub struct TaskItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct Activity {
+    pub id: i64,
+    pub account_id: String,
+    pub name: String,
+    pub content: String,
+    pub enabled: bool,
+    pub ai_optimize: bool,
+    pub ai_instructions: String,
+    pub timezone: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub weekdays: Vec<u8>,
+    pub send_times: Vec<String>,
+    pub group_ids: Vec<i64>,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub source_key: String,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityRun {
+    pub id: i64,
+    pub activity_id: i64,
+    pub account_id: String,
+    pub group_id: i64,
+    pub scheduled_for: DateTime<Utc>,
+    pub run_key: String,
+    pub state: String,
+    pub text: String,
+    pub content_source: String,
+    pub attempts: i64,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub last_error: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DueActivityRun {
+    pub run: ActivityRun,
+    pub activity: Activity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPreview {
+    pub text: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DailySummary {
     pub id: i64,
     pub account_id: String,
