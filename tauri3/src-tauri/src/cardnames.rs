@@ -4,6 +4,19 @@ use crate::error::{AppError, AppResult};
 use crate::models::{CardPlan, CardPreview, Member};
 
 pub const CAPACITY: usize = 261_081;
+pub const MAX_CARD_CHARS: usize = 20;
+
+pub fn validate_card_name(value: &str) -> AppResult<String> {
+    let value = value.trim();
+    let length = value.chars().count();
+    if length == 0 || length > MAX_CARD_CHARS {
+        return Err(AppError::new(
+            "invalid_card_name",
+            format!("群名片必须为 1 到 {MAX_CARD_CHARS} 个字符"),
+        ));
+    }
+    Ok(value.to_string())
+}
 
 pub fn normalize(value: &str) -> Vec<char> {
     value
@@ -135,18 +148,16 @@ pub fn suffix(index: usize) -> AppResult<String> {
 
 pub fn numbered_name(prefix: &str, index: usize) -> AppResult<(String, String)> {
     let suffix = suffix(index)?;
-    Ok((
-        format!(
-            "{}群员{}",
-            if prefix.trim().is_empty() {
-                "DH"
-            } else {
-                prefix.trim()
-            },
-            suffix
-        ),
-        suffix,
-    ))
+    let name = format!(
+        "{}群员{}",
+        if prefix.trim().is_empty() {
+            "DH"
+        } else {
+            prefix.trim()
+        },
+        suffix
+    );
+    Ok((validate_card_name(&name)?, suffix))
 }
 
 pub fn preview(
@@ -465,5 +476,13 @@ mod tests {
             preview.items[0].reason,
             "该成员已封禁、注销或离线，跳过自动改名"
         );
+    }
+
+    #[test]
+    fn manual_card_name_validation_matches_wang_limit() {
+        assert_eq!(validate_card_name("  测试名片  ").unwrap(), "测试名片");
+        assert!(validate_card_name("").is_err());
+        assert!(validate_card_name(&"名".repeat(MAX_CARD_CHARS + 1)).is_err());
+        assert!(numbered_name(&"前".repeat(MAX_CARD_CHARS), 1).is_err());
     }
 }

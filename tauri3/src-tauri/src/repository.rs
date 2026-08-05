@@ -694,6 +694,23 @@ impl Database {
         .map_err(|error| AppError::new("ai_run_finish", error.to_string()))
     }
 
+    pub fn fail_ai_run_terminal(
+        &self,
+        account_id: &str,
+        run_key: &str,
+        error: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE ai_runs SET state='failed',completed_at=?,next_retry_at=NULL,last_error=?,updated_at=? WHERE account_id=? AND run_key=? AND state='processing'",
+                params![now, error, now, account_id, run_key],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("ai_run_finish", error.to_string()))
+    }
+
     pub fn ai_run(&self, account_id: &str, run_key: &str) -> AppResult<Option<UniqueRun>> {
         self.with_connection(|connection| {
             connection
@@ -1945,6 +1962,15 @@ mod tests {
             "succeeded"
         );
         assert!(!database.claim_ai_run("a", 1, "message:1").unwrap());
+
+        assert!(database.claim_ai_run("a", 1, "message:failed").unwrap());
+        database
+            .fail_ai_run_terminal("a", "message:failed", "provider timeout")
+            .unwrap();
+        let failed = database.ai_run("a", "message:failed").unwrap().unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.last_error, "provider timeout");
+        assert!(!database.claim_ai_run("a", 1, "message:failed").unwrap());
 
         assert!(database.claim_summary_run("a", 1, "2026-07-21").unwrap());
         assert!(!database.claim_summary_run("a", 1, "2026-07-21").unwrap());

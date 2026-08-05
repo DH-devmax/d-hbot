@@ -420,8 +420,9 @@ impl AppState {
         let devtools_url = paths.default_devtools_url().to_string();
         let gateway: Arc<dyn RuntimeGateway> =
             Arc::new(CdpGateway::new(CdpClient::new(devtools_url)?));
-        let prediction_source: Arc<dyn PredictionSource> =
-            Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?);
+        let prediction_source: Arc<dyn PredictionSource> = Arc::new(
+            prediction::PublicLotterySource::new(Duration::from_secs(8))?,
+        );
         Ok(Self {
             secrets: SecretStore::new(paths.secrets.clone()),
             paths,
@@ -3313,6 +3314,7 @@ async fn rename_member(
     member: MemberRef,
     nickname: String,
 ) -> AppResult<()> {
+    let nickname = cardnames::validate_card_name(&nickname)?;
     let roster = require_member_manager(&state, group_id).await?;
     let target = canonical_member_ref(&roster, &member)?;
     let target_ref = MemberRef {
@@ -3320,7 +3322,32 @@ async fn rename_member(
         nim_id: (!target.nim_id.is_empty()).then(|| target.nim_id.clone()),
     };
     let account_id = state.gateway.session_identity().await?.1;
+    state
+        .database_executor
+        .expect_member_card_update(
+            account_id.clone(),
+            group_id,
+            target.user_id,
+            nickname.clone(),
+            format!("manual-rename:{}:{}", group_id, target.user_id),
+        )
+        .await?;
     let result = state.gateway.rename(group_id, &target_ref, &nickname).await;
+    let rename_failed = result
+        .as_ref()
+        .map(|receipt| receipt.status == "failed")
+        .unwrap_or(true);
+    if rename_failed {
+        let _ = state
+            .database_executor
+            .consume_expected_member_card_update(
+                account_id.clone(),
+                group_id,
+                target.user_id,
+                nickname.clone(),
+            )
+            .await;
+    }
     archive_manual_gateway_result(
         &state,
         &account_id,
@@ -4395,7 +4422,18 @@ async fn auto_start_wangshangliao(
             status.as_str(),
             "ready" | "devtools-ready" | "nim-not-ready"
         ) {
-            last_problem = None;
+            if last_problem.take().is_some() {
+                let detail = if status == "ready" {
+                    "旺商聊协议会话已就绪。"
+                } else {
+                    "DevTools 已连接，请在旺商聊完成登录，DH BOT 会继续等待会话初始化。"
+                };
+                publish_wang_startup_status(
+                    &app,
+                    Some(&startup_status),
+                    wang_startup_event(status, detail, false),
+                );
+            }
             continue;
         }
 

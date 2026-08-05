@@ -431,6 +431,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
   sensitive INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS expected_member_card_updates (
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  card_name TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(account_id, group_id, user_id, card_name)
+);
 CREATE TABLE IF NOT EXISTS ai_provider_endpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
@@ -1059,6 +1069,39 @@ impl DatabaseExecutor {
         .await
     }
 
+    pub async fn expect_member_card_update(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        card_name: String,
+        source_key: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.expect_member_card_update(
+                &account_id,
+                group_id,
+                user_id,
+                &card_name,
+                &source_key,
+            )
+        })
+        .await
+    }
+
+    pub async fn consume_expected_member_card_update(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        card_name: String,
+    ) -> AppResult<bool> {
+        self.execute(move |database| {
+            database.consume_expected_member_card_update(&account_id, group_id, user_id, &card_name)
+        })
+        .await
+    }
+
     pub async fn mark_member_not_present(
         &self,
         account_id: String,
@@ -1328,6 +1371,16 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn fail_ai_run_terminal(
+        &self,
+        account_id: String,
+        run_key: String,
+        error: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.fail_ai_run_terminal(&account_id, &run_key, &error))
+            .await
+    }
+
     pub async fn claim_summary_run(
         &self,
         account_id: String,
@@ -1503,10 +1556,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 11 {
+    if old_version > 12 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v11"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v12"),
         ));
     }
     let transaction = connection
@@ -1635,6 +1688,9 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
     transaction
         .execute_batch("CREATE TABLE IF NOT EXISTS gateway_capability_verifications (fingerprint TEXT NOT NULL,capability TEXT NOT NULL,source TEXT NOT NULL,status TEXT NOT NULL,automatic_allowed INTEGER NOT NULL DEFAULT 0,evidence_hash TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',verified_at TEXT NOT NULL,PRIMARY KEY(fingerprint,capability)); CREATE TABLE IF NOT EXISTS ai_provider_endpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',api_backend TEXT NOT NULL DEFAULT 'chat_completions',model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',secret_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,health_status TEXT NOT NULL DEFAULT 'unchecked',failure_count INTEGER NOT NULL DEFAULT 0,cooldown_until TEXT,last_error TEXT NOT NULL DEFAULT '',last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx ON ai_provider_endpoints(account_id,enabled DESC,priority,id);")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch("CREATE TABLE IF NOT EXISTS expected_member_card_updates (account_id TEXT NOT NULL,group_id INTEGER NOT NULL,user_id INTEGER NOT NULL,card_name TEXT NOT NULL,source_key TEXT NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(account_id,group_id,user_id,card_name)); CREATE INDEX IF NOT EXISTS expected_member_card_updates_expiry_idx ON expected_member_card_updates(expires_at);")
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     add_column_if_missing(
         &transaction,
         "ai_provider_endpoints",
@@ -1666,7 +1722,7 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
-        .execute_batch("PRAGMA user_version = 11;")
+        .execute_batch("PRAGMA user_version = 12;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -1952,7 +2008,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let now = Utc::now().to_rfc3339();
             transaction.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, now],
             )?;
             if transaction
@@ -2052,7 +2108,7 @@ impl Database {
     pub fn ensure_business_apps(&self, account_id: &str) -> AppResult<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, Utc::now().to_rfc3339()],
             )?;
             Ok(())
@@ -2523,6 +2579,53 @@ impl Database {
             connection.execute("UPDATE members SET violation_count=violation_count+1,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?", params![Utc::now().to_rfc3339(),account_id,group_id,user_id])?;
             connection.query_row("SELECT violation_count FROM members WHERE account_id=? AND group_id=? AND user_id=?", params![account_id,group_id,user_id], |row| row.get(0))
         }).map_err(|error| AppError::new("member_violation", error.to_string()))
+    }
+
+    pub fn expect_member_card_update(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        card_name: &str,
+        source_key: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now();
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM expected_member_card_updates WHERE expires_at<?",
+                params![now.to_rfc3339()],
+            )?;
+            connection.execute(
+                "INSERT INTO expected_member_card_updates(account_id,group_id,user_id,card_name,source_key,expires_at,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,group_id,user_id,card_name) DO UPDATE SET source_key=excluded.source_key,expires_at=excluded.expires_at,created_at=excluded.created_at",
+                params![account_id,group_id,user_id,card_name,source_key,(now + ChronoDuration::minutes(2)).to_rfc3339(),now.to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("member_card_expectation", error.to_string()))
+    }
+
+    pub fn consume_expected_member_card_update(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        card_name: &str,
+    ) -> AppResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM expected_member_card_updates WHERE expires_at<?",
+                params![now],
+            )?;
+            let consumed = transaction.execute(
+                "DELETE FROM expected_member_card_updates WHERE account_id=? AND group_id=? AND user_id=? AND card_name=? AND expires_at>=?",
+                params![account_id,group_id,user_id,card_name,now],
+            )? > 0;
+            transaction.commit()?;
+            Ok(consumed)
+        })
+        .map_err(|error| AppError::new("member_card_expectation", error.to_string()))
     }
 
     pub fn set_member_blacklisted(
@@ -3654,12 +3757,29 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 11);
+        assert_eq!(status.schema_version, 12);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn expected_member_card_updates_are_exact_and_single_use() {
+        let database = populated_database();
+        database
+            .expect_member_card_update("a", 1, 9, "DH群员0009", "test:rename")
+            .unwrap();
+        assert!(!database
+            .consume_expected_member_card_update("a", 1, 9, "其他名称")
+            .unwrap());
+        assert!(database
+            .consume_expected_member_card_update("a", 1, 9, "DH群员0009")
+            .unwrap());
+        assert!(!database
+            .consume_expected_member_card_update("a", 1, 9, "DH群员0009")
+            .unwrap());
     }
 
     #[test]
@@ -3994,7 +4114,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 11);
+        assert_eq!(database.status().unwrap().schema_version, 12);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -4022,7 +4142,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 11);
+        assert_eq!(reopened.status().unwrap().schema_version, 12);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -4054,7 +4174,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 11);
+        assert_eq!(database.status().unwrap().schema_version, 12);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -4068,7 +4188,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_and_v3_to_v11_idempotently() {
+    fn migrates_v2_and_v3_to_v12_idempotently() {
         for version in [2_i64, 3_i64] {
             let directory = tempdir().unwrap();
             let paths = AppPaths {
@@ -4093,7 +4213,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 11);
+            assert_eq!(database.status().unwrap().schema_version, 12);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -4107,7 +4227,7 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 11);
+            assert_eq!(reopened.status().unwrap().schema_version, 12);
             assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1

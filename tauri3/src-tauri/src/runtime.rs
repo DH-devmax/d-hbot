@@ -45,9 +45,15 @@ struct IncomingJob {
     message: Message,
 }
 
+#[derive(Debug, Clone)]
+struct AiReplyJob {
+    message: Message,
+}
+
 struct PredictionNarrationJob {
     account_id: String,
     cache_key: String,
+    narration: Value,
     provider: Arc<dyn AiProvider>,
     request: AiRequest,
 }
@@ -72,6 +78,14 @@ fn classify_effect_error(error: &AppError) -> EffectDispatchStatus {
     } else {
         EffectDispatchStatus::Failed
     }
+}
+
+fn next_connection_retry(delay: Duration) -> Duration {
+    Duration::from_millis(
+        (delay.as_millis() as u64)
+            .saturating_mul(2)
+            .clamp(250, 2_000),
+    )
 }
 
 pub trait Clock: Send + Sync {
@@ -155,7 +169,9 @@ impl RuntimeDependencies {
             events: Arc::new(NoopEventSink),
             ai_factory: Arc::new(ConfiguredAiProviderFactory::default()),
             semantic_classifier: Arc::new(moderation::DeterministicSemanticClassifier::default()),
-            prediction_source: Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?),
+            prediction_source: Arc::new(prediction::PublicLotterySource::new(
+                Duration::from_secs(8),
+            )?),
         })
     }
 }
@@ -257,7 +273,7 @@ impl BackendRuntime {
             prediction_narration_tx,
             prediction_narration_rx: Arc::new(tokio::sync::Mutex::new(prediction_narration_rx)),
             prediction_narration_pending: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
-            ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -315,11 +331,16 @@ impl BackendRuntime {
                 },
             };
             if let Ok(decision) = job.provider.decide(&job.request).await {
-                self.prediction_narration_cache.insert_scoped(
-                    &job.account_id,
-                    job.cache_key.clone(),
-                    decision,
-                );
+                if crate::business_apps::validate_prediction_narration(
+                    &decision.reply,
+                    &job.narration,
+                ) {
+                    self.prediction_narration_cache.insert_scoped(
+                        &job.account_id,
+                        job.cache_key.clone(),
+                        decision,
+                    );
+                }
             }
             self.prediction_narration_pending
                 .lock()
@@ -477,23 +498,61 @@ impl BackendRuntime {
                 "unmute" => self.gateway.unmute(item.group_id, user_id).await,
                 "remove" => self.gateway.remove_member(item.group_id, user_id).await,
                 "rename" => {
-                    self.gateway
-                        .rename(
-                            item.group_id,
-                            &MemberRef {
-                                user_id: (user_id > 0).then_some(user_id),
-                                nim_id: payload
-                                    .get("nimId")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                                    .filter(|value| !value.trim().is_empty()),
-                            },
-                            payload
-                                .get("nickname")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        )
-                        .await
+                    let nickname = crate::cardnames::validate_card_name(
+                        payload
+                            .get("nickname")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                    match nickname {
+                        Err(error) => Err(error),
+                        Ok(nickname) => match self
+                            .database
+                            .expect_member_card_update(
+                                item.account_id.clone(),
+                                item.group_id,
+                                user_id,
+                                nickname.clone(),
+                                item.dedupe_key.clone(),
+                            )
+                            .await
+                        {
+                            Err(error) => Err(error),
+                            Ok(()) => {
+                                let result = self
+                                    .gateway
+                                    .rename(
+                                        item.group_id,
+                                        &MemberRef {
+                                            user_id: (user_id > 0).then_some(user_id),
+                                            nim_id: payload
+                                                .get("nimId")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                                .filter(|value| !value.trim().is_empty()),
+                                        },
+                                        &nickname,
+                                    )
+                                    .await;
+                                let rename_failed = result
+                                    .as_ref()
+                                    .map(|receipt| receipt.status == "failed")
+                                    .unwrap_or(true);
+                                if rename_failed {
+                                    let _ = self
+                                        .database
+                                        .consume_expected_member_card_update(
+                                            item.account_id.clone(),
+                                            item.group_id,
+                                            user_id,
+                                            nickname,
+                                        )
+                                        .await;
+                                }
+                                result
+                            }
+                        },
+                    }
                 }
                 "blacklist" => self
                     .database
@@ -701,6 +760,46 @@ impl BackendRuntime {
             .entry((account_id.to_string(), session_epoch, group_id))
             .or_insert_with(|| {
                 let (sender, mut receiver) = mpsc::channel::<IncomingJob>(128);
+                let (ai_sender, mut ai_receiver) = mpsc::channel::<AiReplyJob>(128);
+                let ai_runtime = self.clone();
+                let ai_app = app.clone();
+                let ai_account = account_id.to_string();
+                worker_tasks.spawn(async move {
+                    while let Some(job) = ai_receiver.recv().await {
+                        let Ok(_permit) = ai_runtime.ai_rule_gate.acquire().await else {
+                            break;
+                        };
+                        if let Err(error) = ai_runtime
+                            .process_deferred_ai(
+                                &ai_app,
+                                &ai_account,
+                                sender_id,
+                                job.message.clone(),
+                            )
+                            .await
+                        {
+                            let _ = ai_runtime
+                                .database
+                                .record_audit(AuditEvent {
+                                    id: 0,
+                                    account_id: ai_account.clone(),
+                                    group_id: job.message.group_id,
+                                    user_id: job.message.user_id,
+                                    actor: "DH BOT".into(),
+                                    event: "ai_reply_worker_failed".into(),
+                                    level: "warning".into(),
+                                    details: serde_json::json!({
+                                        "messageId": job.message.id,
+                                        "status": "failed",
+                                        "error": error.message,
+                                    })
+                                    .to_string(),
+                                    created_at: Utc::now(),
+                                })
+                                .await;
+                        }
+                    }
+                });
                 let runtime = self.clone();
                 let app_handle = app.clone();
                 let account = account_id.to_string();
@@ -713,7 +812,13 @@ impl BackendRuntime {
                             .unwrap_or(false)
                         {
                             let result = runtime
-                                .process_job(&app_handle, &account, sender_id, job.clone())
+                                .process_job(
+                                    &app_handle,
+                                    &account,
+                                    sender_id,
+                                    job.clone(),
+                                    &ai_sender,
+                                )
                                 .await;
                             let (success, error) = match result {
                                 Ok(()) => (true, String::new()),
@@ -1653,6 +1758,7 @@ impl BackendRuntime {
         let mut active_account = String::new();
         let mut session_epoch = 0u64;
         let mut last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
+        let mut connection_retry = Duration::from_millis(250);
         'connection: loop {
             let diagnostic = self.gateway.diagnose().await;
             self.events.emit(
@@ -1661,11 +1767,15 @@ impl BackendRuntime {
             );
             let _ = app.emit("gateway-capabilities", self.gateway.capabilities());
             if diagnostic.status != ConnectionStatus::Ready {
-                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
+                let delay = connection_retry;
+                connection_retry = next_connection_retry(connection_retry);
+                tokio::select! { _ = sleep(delay) => {}, _ = self.shutdown.cancelled() => break }
                 continue;
             }
             if self.gateway.install_message_listener().await.is_err() {
-                tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
+                let delay = connection_retry;
+                connection_retry = next_connection_retry(connection_retry);
+                tokio::select! { _ = sleep(delay) => {}, _ = self.shutdown.cancelled() => break }
                 continue;
             }
             let (sender_id, account_id) = match self.gateway.session_identity().await {
@@ -1673,10 +1783,13 @@ impl BackendRuntime {
                 Err(error) => {
                     self.logger.write("WARN", &error.message);
                     let _ = app.emit("connection-error", &error);
-                    tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break };
+                    let delay = connection_retry;
+                    connection_retry = next_connection_retry(connection_retry);
+                    tokio::select! { _ = sleep(delay) => {}, _ = self.shutdown.cancelled() => break };
                     continue;
                 }
             };
+            connection_retry = Duration::from_millis(250);
             let gateway_epoch = self.gateway.session_epoch();
             if active_account != account_id || session_epoch != gateway_epoch {
                 workers.clear();
@@ -2459,7 +2572,9 @@ impl BackendRuntime {
             reported_member_event_mismatches.clear();
             reported_ignored_events.clear();
             last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
-            tokio::select! { _ = sleep(Duration::from_secs(5)) => {}, _ = self.shutdown.cancelled() => break }
+            let delay = connection_retry;
+            connection_retry = next_connection_retry(connection_retry);
+            tokio::select! { _ = sleep(delay) => {}, _ = self.shutdown.cancelled() => break }
         }
         drop(workers);
         while worker_tasks.join_next().await.is_some() {}
@@ -2563,6 +2678,26 @@ impl BackendRuntime {
                         saved.user_id == member.user_id
                             || (!member.nim_id.is_empty() && saved.nim_id == member.nim_id)
                     });
+                let previous_card_name = saved
+                    .as_ref()
+                    .map(|saved| saved.card_name.trim().to_string())
+                    .unwrap_or_default();
+                let incoming_card_name = member.card_name.trim().to_string();
+                let expected_update = if saved.is_some()
+                    && !incoming_card_name.is_empty()
+                    && previous_card_name != incoming_card_name
+                {
+                    self.database
+                        .consume_expected_member_card_update(
+                            account_id.to_string(),
+                            group_id,
+                            member.user_id,
+                            incoming_card_name.clone(),
+                        )
+                        .await?
+                } else {
+                    false
+                };
                 if let Some(saved) = &saved {
                     merge_managed_member_state(&mut member, saved);
                 }
@@ -2573,10 +2708,12 @@ impl BackendRuntime {
                     .map(|saved| saved.locked_card_name.trim())
                     .filter(|locked| !locked.is_empty() && *locked != member.card_name.trim())
                     .map(str::to_string);
-                let new_violation = restore_name.is_some()
-                    && saved
-                        .as_ref()
-                        .is_none_or(|saved| saved.card_name != member.card_name);
+                let new_violation = is_external_member_card_update(
+                    saved.is_some(),
+                    &previous_card_name,
+                    &incoming_card_name,
+                    expected_update,
+                );
                 self.database.upsert_member(member.clone()).await?;
                 if new_violation {
                     member.violation_count = self
@@ -2587,6 +2724,14 @@ impl BackendRuntime {
                             member.user_id,
                         )
                         .await?;
+                    self.process_member_update_rules(
+                        app,
+                        account_id,
+                        durable_event_id,
+                        group_id,
+                        &member,
+                    )
+                    .await;
                 }
                 if let Some(locked) = restore_name {
                     self.enqueue_effect(
@@ -2634,6 +2779,161 @@ impl BackendRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn process_member_update_rules(
+        &self,
+        app: &AppHandle,
+        account_id: &str,
+        durable_event_id: &str,
+        group_id: i64,
+        member: &Member,
+    ) {
+        let Some(_group) = self
+            .database
+            .list_groups(Some(account_id.to_string()))
+            .await
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|group| group.group_id == group_id))
+            .filter(|group| group.enabled && group.machine_rules_enabled)
+        else {
+            return;
+        };
+        let rules = self
+            .database
+            .list_rules(account_id.to_string(), Some(group_id))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rule| rule.enabled && !rule.is_ai_rule() && rule.matcher == "rename_count")
+            .collect::<Vec<_>>();
+        if rules.is_empty() {
+            return;
+        }
+        let input = moderation::ModerationInput {
+            member,
+            kind: "member_updated",
+            text: "",
+            now: self.clock.now_utc(),
+            recent: &[],
+            rename_violations: member.violation_count,
+        };
+        let started = std::time::Instant::now();
+        let decision =
+            moderation::evaluate_with_classifier(&rules, &input, self.semantic_classifier.as_ref());
+        let elapsed_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        let event_message_id = durable_event_numeric_id(durable_event_id);
+        for rule in &rules {
+            let matched = decision
+                .matches
+                .iter()
+                .find(|matched| matched.rule_id == rule.id);
+            let _ = self
+                .database
+                .record_rule_evaluation(
+                    account_id.into(),
+                    group_id,
+                    member.user_id,
+                    event_message_id,
+                    rule.id,
+                    "machine".into(),
+                    matched.is_some(),
+                    None,
+                    rule.mode.clone(),
+                    if matched.is_some() {
+                        "命中".into()
+                    } else {
+                        "未命中".into()
+                    },
+                    matched
+                        .map(|value| value.reason.clone())
+                        .unwrap_or_default(),
+                    elapsed_ms,
+                )
+                .await;
+        }
+        if decision.matches.is_empty() {
+            return;
+        }
+        let synthetic_message = Message {
+            id: event_message_id,
+            account_id: account_id.into(),
+            group_id,
+            server_message_id: String::new(),
+            sequence: 0,
+            user_id: member.user_id,
+            sender_name: member.card_name.clone(),
+            kind: "member_updated".into(),
+            text: String::new(),
+            sent_at: self.clock.now_utc(),
+            received_at: self.clock.now_utc(),
+            processed_at: None,
+            acknowledged_at: None,
+            processing_state: "processed".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            last_error: String::new(),
+            mentions_json: "[]".into(),
+            source_kind: Some("member-event".into()),
+            flow: None,
+        };
+        let skipped_actions = decision
+            .action_intents
+            .iter()
+            .filter(|intent| intent.action.kind == "recall")
+            .map(|intent| intent.action.kind.clone())
+            .collect::<Vec<_>>();
+        let member_event_actions = decision
+            .action_intents
+            .iter()
+            .filter(|intent| intent.action.kind != "recall")
+            .cloned()
+            .collect::<Vec<_>>();
+        let skip_reason = if skipped_actions.is_empty() {
+            ""
+        } else {
+            "成员更新事件没有可撤回的消息"
+        };
+        let sender_id = self
+            .gateway
+            .session_identity()
+            .await
+            .map(|value| value.0)
+            .unwrap_or(0);
+        if !member_event_actions.is_empty() {
+            self.execute_rule_actions(
+                Some(app),
+                account_id,
+                sender_id,
+                &synthetic_message,
+                &member_event_actions,
+                decision.automatic,
+            )
+            .await;
+        }
+        let _ = self
+            .database
+            .record_audit(AuditEvent {
+                id: 0,
+                account_id: account_id.into(),
+                group_id,
+                user_id: member.user_id,
+                actor: "DH BOT".into(),
+                event: "machine_rule_evaluated".into(),
+                level: "info".into(),
+                details: serde_json::json!({
+                    "memberEventId": durable_event_id,
+                    "violationCount": member.violation_count,
+                    "matchedRuleIds": decision.matches.iter().map(|matched| matched.rule_id).collect::<Vec<_>>(),
+                    "skippedActions": skipped_actions,
+                    "skipReason": skip_reason,
+                    "automatic": decision.automatic,
+                    "elapsedMs": elapsed_ms,
+                })
+                .to_string(),
+                created_at: Utc::now(),
+            })
+            .await;
     }
 
     async fn enqueue_member_card_job(
@@ -2830,6 +3130,7 @@ impl BackendRuntime {
         account_id: &str,
         sender_id: i64,
         job: IncomingJob,
+        ai_sender: &mpsc::Sender<AiReplyJob>,
     ) -> AppResult<()> {
         if self
             .database
@@ -2995,33 +3296,42 @@ impl BackendRuntime {
         let ai_reply_allowed = self
             .ai_permission(account_id, group.group_id, "reply", group.ai_enabled)
             .await;
+        let mut ai_reply_queued = false;
         if group.enabled
             && group.ai_enabled
             && ai_reply_allowed
             && !group.manual_takeover
             && message_explicitly_mentions(&job.message, account_id, sender_id)
         {
-            if let Some(business_app) = self.business_apps.find_for_message(&job.message.text) {
-                let app_id = business_app.manifest().id.to_string();
-                let management_enabled = self.is_group_manager(sender_id, group.group_id).await;
-                if management_enabled
-                    && self
+            match ai_sender.try_send(AiReplyJob {
+                message: job.message.clone(),
+            }) {
+                Ok(()) => ai_reply_queued = true,
+                Err(error) => {
+                    let reason = match error {
+                        mpsc::error::TrySendError::Full(_) => "群 AI 队列已满",
+                        mpsc::error::TrySendError::Closed(_) => "群 AI 队列已关闭",
+                    };
+                    let _ = self
                         .database
-                        .business_app_enabled(account_id.to_string(), app_id)
-                        .await?
-                {
-                    self.process_business_app(
-                        account_id,
-                        &group,
-                        &member,
-                        &job.message,
-                        business_app,
-                    )
-                    .await?;
+                        .record_audit(AuditEvent {
+                            id: 0,
+                            account_id: account_id.into(),
+                            group_id: group.group_id,
+                            user_id: member.user_id,
+                            actor: "DH BOT".into(),
+                            event: "ai_reply_queue_failed".into(),
+                            level: "warning".into(),
+                            details: serde_json::json!({
+                                "messageId": job.message.id,
+                                "status": "failed",
+                                "reason": reason,
+                            })
+                            .to_string(),
+                            created_at: Utc::now(),
+                        })
+                        .await;
                 }
-            } else {
-                self.process_ai(app, account_id, &group, &member, &job.message)
-                    .await?;
             }
         }
         if !deferred_ai_rules.is_empty() {
@@ -3061,7 +3371,11 @@ impl BackendRuntime {
                     &job.message,
                     job.sequence,
                     "processed",
-                    "rules-and-ai-evaluated",
+                    if ai_reply_queued {
+                        "deterministic-rules-complete-ai-queued"
+                    } else {
+                        "deterministic-rules-complete"
+                    },
                 ),
                 created_at: Utc::now(),
             })
@@ -3075,6 +3389,65 @@ impl BackendRuntime {
             },
         );
         Ok(())
+    }
+
+    async fn process_deferred_ai(
+        &self,
+        app: &AppHandle,
+        account_id: &str,
+        sender_id: i64,
+        message: Message,
+    ) -> AppResult<()> {
+        if self
+            .database
+            .get_setting("automation.mode".into())
+            .await?
+            .as_deref()
+            == Some("paused")
+        {
+            return Ok(());
+        }
+        let Some(group) = self
+            .database
+            .list_groups(Some(account_id.to_string()))
+            .await?
+            .into_iter()
+            .find(|group| group.group_id == message.group_id)
+        else {
+            return Ok(());
+        };
+        if !group.enabled
+            || !group.ai_enabled
+            || group.manual_takeover
+            || !self
+                .ai_permission(account_id, group.group_id, "reply", group.ai_enabled)
+                .await
+            || !message_explicitly_mentions(&message, account_id, sender_id)
+        {
+            return Ok(());
+        }
+        let member = self
+            .database
+            .list_members(account_id.to_string(), group.group_id)
+            .await?
+            .into_iter()
+            .find(|member| member.user_id == message.user_id)
+            .unwrap_or_else(|| placeholder_member(account_id, &message));
+        if let Some(business_app) = self.business_apps.find_for_message(&message.text) {
+            let app_id = business_app.manifest().id.to_string();
+            if self.is_group_manager(sender_id, group.group_id).await
+                && self
+                    .database
+                    .business_app_enabled(account_id.to_string(), app_id)
+                    .await?
+            {
+                self.process_business_app(account_id, &group, &member, &message, business_app)
+                    .await?;
+            }
+            return Ok(());
+        }
+        self.process_ai(app, account_id, &group, &member, &message)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3462,8 +3835,17 @@ impl BackendRuntime {
                             .prediction_narration_cache
                             .get_scoped(account_id, &cache_key)
                         {
-                            reply = decision.reply;
-                            ai_used = true;
+                            if crate::business_apps::validate_prediction_narration(
+                                &decision.reply,
+                                narration,
+                            ) {
+                                reply = decision.reply;
+                                ai_used = true;
+                            } else {
+                                self.prediction_narration_cache
+                                    .remove_scoped(account_id, &cache_key);
+                                ai_error = "AI 润色字段不完整，已使用即时统计模板".into();
+                            }
                         } else {
                             let request = AiRequest {
                                 version: "1",
@@ -3491,6 +3873,7 @@ impl BackendRuntime {
                                     PredictionNarrationJob {
                                         account_id: account_id.into(),
                                         cache_key: cache_key.clone(),
+                                        narration: narration.clone(),
                                         provider,
                                         request,
                                     },
@@ -3857,19 +4240,9 @@ impl BackendRuntime {
                         }),
                     )
                     .await;
-                let fallback_error = fallback
-                    .as_ref()
-                    .err()
-                    .map(|fallback_error| fallback_error.message.clone())
-                    .unwrap_or_default();
                 let _ = self
                     .database
-                    .finish_ai_run(
-                        account_id.to_string(),
-                        run_key,
-                        fallback.is_ok(),
-                        fallback_error,
-                    )
+                    .fail_ai_run_terminal(account_id.to_string(), run_key, error.message.clone())
                     .await;
                 fallback
             }
@@ -4155,6 +4528,18 @@ fn merge_managed_member_state(incoming: &mut Member, saved: &Member) {
     }
 }
 
+fn is_external_member_card_update(
+    saved_exists: bool,
+    previous_card_name: &str,
+    incoming_card_name: &str,
+    expected_update: bool,
+) -> bool {
+    saved_exists
+        && !expected_update
+        && !incoming_card_name.trim().is_empty()
+        && previous_card_name.trim() != incoming_card_name.trim()
+}
+
 fn gateway_record_id(record: &GatewayRecord) -> String {
     if record.kind == GatewayRecordKind::Message {
         if let Some(id) = record
@@ -4174,6 +4559,15 @@ fn gateway_record_id(record: &GatewayRecord) -> String {
         }
     }
     format!("{}:{}", record.session, record.sequence)
+}
+
+fn durable_event_numeric_id(value: &str) -> i64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    -((hash & 0x3fff_ffff_ffff_ffff) as i64) - 1
 }
 
 fn session_hash(session: &str) -> String {
@@ -4504,6 +4898,40 @@ mod tests {
             preferred_member_display_name("我知", "DH群员0001", "我不知道啊").as_deref(),
             Some("我知")
         );
+    }
+
+    #[test]
+    fn only_external_member_card_changes_increment_rename_violations() {
+        assert!(is_external_member_card_update(
+            true,
+            "原名",
+            "外部改名",
+            false
+        ));
+        assert!(!is_external_member_card_update(
+            true, "原名", "DH改名", true
+        ));
+        assert!(!is_external_member_card_update(true, "原名", "", false));
+        assert!(!is_external_member_card_update(
+            false,
+            "",
+            "首次发现",
+            false
+        ));
+        assert!(!is_external_member_card_update(
+            true, "相同", " 相同 ", false
+        ));
+    }
+
+    #[test]
+    fn connection_retry_is_bounded_and_fast() {
+        let mut delay = Duration::from_millis(250);
+        let mut observed = Vec::new();
+        for _ in 0..5 {
+            observed.push(delay.as_millis());
+            delay = next_connection_retry(delay);
+        }
+        assert_eq!(observed, vec![250, 500, 1_000, 2_000, 2_000]);
     }
 
     #[test]
