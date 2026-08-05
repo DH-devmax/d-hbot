@@ -23,6 +23,7 @@ mod platform;
 mod prediction;
 mod repository;
 mod runtime;
+mod runtime_work;
 mod scheduler;
 mod secrets;
 mod shutdown;
@@ -58,6 +59,7 @@ use models::{
     Message, ModerationRule, Page, ScheduleRun, TaskItem,
 };
 use paths::AppPaths;
+use runtime_work::{RuntimeCoordination, RuntimeWorkSnapshot};
 use secrets::SecretStore;
 use shutdown::ShutdownSignal;
 
@@ -391,6 +393,7 @@ pub struct AppState {
     pub close_behavior: Arc<RwLock<String>>,
     pub ai_pool: ai::AiProviderPool,
     pub prediction_source: Arc<dyn PredictionSource>,
+    pub runtime_coordination: RuntimeCoordination,
     startup_status: Arc<Mutex<Option<WangStartupEvent>>>,
     wang_start_lock: Arc<tokio::sync::Mutex<()>>,
     pub logger: diagnostics::Logger,
@@ -435,6 +438,7 @@ impl AppState {
             close_behavior: Arc::new(RwLock::new("ask".into())),
             ai_pool: ai::AiProviderPool::default(),
             prediction_source,
+            runtime_coordination: RuntimeCoordination::default(),
             startup_status: Arc::new(Mutex::new(None)),
             wang_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             logger,
@@ -479,6 +483,19 @@ fn health(state: State<'_, AppState>) -> Health {
         build_channel: BuildChannel::CURRENT.name(),
         fixture_available: BuildChannel::CURRENT.fixture_available(),
     }
+}
+
+#[tauri::command]
+fn get_runtime_work_snapshot(state: State<'_, AppState>) -> RuntimeWorkSnapshot {
+    state.runtime_coordination.tracker.snapshot()
+}
+
+#[tauri::command]
+fn acknowledge_runtime_work_failures(state: State<'_, AppState>, ids: Vec<String>) {
+    state
+        .runtime_coordination
+        .tracker
+        .acknowledge_failures(&ids);
 }
 
 #[cfg(feature = "fixture")]
@@ -896,10 +913,20 @@ async fn list_members(
         for plan in preview.items.into_iter().filter(|plan| {
             plan.status == "planned" && newly_discovered.contains(&plan.member.user_id)
         }) {
-            state
+            if state
                 .database_executor
                 .enqueue_card_job(account_id.clone(), group_id, plan, true)
-                .await?;
+                .await?
+            {
+                let work_id = runtime::runtime_lane_id("cardRename", &account_id, group_id);
+                state.runtime_coordination.tracker.enqueue(
+                    &work_id,
+                    "cardRename",
+                    "批量修改群名片",
+                    "群名片队列",
+                );
+                state.runtime_coordination.notify();
+            }
         }
     }
     let _ = app.emit(
@@ -2112,7 +2139,9 @@ async fn list_tasks(
 async fn save_task(state: State<'_, AppState>, task: TaskItem) -> AppResult<i64> {
     require_account(&state, &task.account_id).await?;
     require_manager(&state, task.group_id).await?;
-    state.database_executor.save_task(task).await
+    let id = state.database_executor.save_task(task).await?;
+    state.runtime_coordination.notify();
+    Ok(id)
 }
 
 #[tauri::command]
@@ -2152,7 +2181,9 @@ async fn save_schedule(state: State<'_, AppState>, mut schedule: GroupSchedule) 
         schedule.timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
     }
     let _ = scheduler::evaluate_utc(&schedule, schedule.group_ids[0], Utc::now())?;
-    state.database_executor.save_schedule(schedule).await
+    let id = state.database_executor.save_schedule(schedule).await?;
+    state.runtime_coordination.notify();
+    Ok(id)
 }
 
 #[tauri::command]
@@ -3742,7 +3773,17 @@ async fn apply_card_names(
             .await?
         {
             queued += 1;
+            let work_id = runtime::runtime_lane_id("cardRename", &account_id, group_id);
+            state.runtime_coordination.tracker.enqueue(
+                &work_id,
+                "cardRename",
+                "批量修改群名片",
+                "群名片队列",
+            );
         }
+    }
+    if queued > 0 {
+        state.runtime_coordination.notify();
     }
     Ok(queued)
 }
@@ -3774,10 +3815,23 @@ async fn retry_card_rename_jobs(
             "只能重试当前已登录账号的名片任务",
         ));
     }
-    state
+    let retried = state
         .database_executor
-        .retry_failed_card_jobs(account_id, group_id)
-        .await
+        .retry_failed_card_jobs(account_id.clone(), group_id)
+        .await?;
+    if retried > 0 {
+        let work_id = runtime::runtime_lane_id("cardRename", &account_id, group_id);
+        for _ in 0..retried {
+            state.runtime_coordination.tracker.enqueue(
+                &work_id,
+                "cardRename",
+                "批量修改群名片",
+                "群名片队列",
+            );
+        }
+        state.runtime_coordination.notify();
+    }
+    Ok(retried)
 }
 
 fn redact_archived_receipt(mut receipt: GatewayReceipt) -> GatewayReceipt {
@@ -3997,6 +4051,8 @@ macro_rules! dh_handlers {
     ($($developer:ident),* $(,)?) => {
         tauri::generate_handler![
             health,
+            get_runtime_work_snapshot,
+            acknowledge_runtime_work_failures,
             database_status,
             export_support_bundle,
             get_close_behavior,
@@ -4616,6 +4672,7 @@ pub fn run() {
                 app.state::<AppState>().ai_pool.clone(),
                 app.state::<AppState>().prediction_source.clone(),
             )
+            .with_coordination(app.state::<AppState>().runtime_coordination.clone())
             .spawn(app_handle.clone());
             runtime_tasks.push(bridge::spawn(
                 app.state::<AppState>().gateway.clone(),

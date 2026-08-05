@@ -6,6 +6,7 @@ import { Activity, BookOpen, Bug, CalendarClock, LayoutDashboard, LoaderCircle, 
 import './styles.css'
 import './window-titlebar.css'
 import './brand.css'
+import './runtime-work.css'
 import './runtime.css'
 import './pages.css'
 import './close-dialog.css'
@@ -26,9 +27,10 @@ import CloseDialog from './components/CloseDialog'
 import ButtonHelp from './components/ButtonHelp'
 import AboutDialog from './components/AboutDialog'
 import WindowTitlebar from './components/WindowTitlebar'
+import RuntimeWorkIndicator from './components/RuntimeWorkIndicator'
 import ErrorBanner from './components/ErrorBanner'
 import type { Diagnostic } from './runtimeTypes'
-import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
+import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName, RuntimeWorkSnapshot } from './types'
 import { api, readableError } from './api/client'
 
 class AppErrorBoundary extends React.Component<{ children: ReactNode }, { message: string }> {
@@ -50,6 +52,7 @@ type MaintenanceResult = { success: boolean; errorCode: string; message: string 
 
 const wangInformationalStatuses = new Set(['discovering', 'validating', 'starting', 'started-waiting', 'ready', 'devtools-ready', 'nim-not-ready'])
 const wangTransientStatuses = new Set(['discovering', 'validating', 'starting', 'started-waiting'])
+const emptyWorkSnapshot: RuntimeWorkSnapshot = { active: null, items: [], counts: { running: 0, queued: 0, retrying: 0, failed: 0 }, updatedAt: '' }
 
 function WangStatusBanner({ diagnostic, startup }: { diagnostic: Diagnostic | null; startup: WangStartupEvent | null }) {
   if (diagnostic?.status === 'ready') return null
@@ -119,7 +122,8 @@ function App() {
   const [error, setError] = useState('')
   const [wangStartupError, setWangStartupError] = useState('')
   const [automationPaused, setAutomationPaused] = useState(false)
-  const [pageEpoch, setPageEpoch] = useState(0)
+  const [workSnapshot, setWorkSnapshot] = useState<RuntimeWorkSnapshot>(emptyWorkSnapshot)
+  const [workDrawerOpen, setWorkDrawerOpen] = useState(false)
   const [closePrompt, setClosePrompt] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
@@ -168,7 +172,6 @@ function App() {
     setOverviewAudits([])
     setSummaries([])
     setSelectedGroup(null)
-    setPageEpoch(value => value + 1)
     return true
   }
 
@@ -267,7 +270,8 @@ function App() {
       const nextAccount = event.payload.nimAccount || ''
       if (nextAccount && switchAccount(nextAccount)) void refresh()
     }))
-    for (const eventName of ['sync-progress', 'message-received', 'task-progress', 'schedule-updated', 'gateway-capabilities']) listeners.push(listen(eventName, () => setPageEpoch(value => value + 1)))
+    listeners.push(listen<RuntimeWorkSnapshot>('runtime-work-updated', event => setWorkSnapshot(event.payload)))
+    void invoke<RuntimeWorkSnapshot>('get_runtime_work_snapshot').then(setWorkSnapshot).catch(() => undefined)
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
     listeners.push(listen<WangStartupEvent>('wangshangliao-status', event => handleWangStartup(event.payload)))
     void invoke<WangStartupEvent | null>('take_wang_startup_status').then(payload => {
@@ -315,9 +319,21 @@ function App() {
 
   const activeGroup = useMemo(() => groups.find(group => group.groupId === selectedGroup), [groups, selectedGroup])
   const connectionLabel = diagnostic ? statusText(diagnostic.status) : '检查中'
+  const closeWorkDrawer = () => {
+    setWorkDrawerOpen(false)
+    const failedIds = workSnapshot.items.filter(item => item.state === 'failed' || item.state === 'unknown').map(item => item.id)
+    if (!failedIds.length) return
+    const acknowledged = new Set(failedIds)
+    setWorkSnapshot(current => {
+      const items = current.items.filter(item => !acknowledged.has(item.id) || (item.state !== 'failed' && item.state !== 'unknown'))
+      return { ...current, items, counts: { ...current.counts, failed: items.filter(item => item.state === 'failed' || item.state === 'unknown').length } }
+    })
+    void invoke('acknowledge_runtime_work_failures', { ids: failedIds }).catch(() => undefined)
+  }
+  const toggleWorkDrawer = () => workDrawerOpen ? closeWorkDrawer() : setWorkDrawerOpen(true)
 
   return <div className="app-window"><WindowTitlebar /><main className="shell">
-    <aside className="sidebar"><div className="brand"><img className="brand-logo" src="/logo.png" alt="DH BOT" /></div><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
+    <aside className="sidebar"><RuntimeWorkIndicator snapshot={workSnapshot} open={workDrawerOpen} onToggle={toggleWorkDrawer} onClose={closeWorkDrawer} onNavigate={setPage} /><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => { setPage(label); if (workDrawerOpen) closeWorkDrawer() }} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
     <section className="workspace">
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}

@@ -26,6 +26,7 @@ tauri3/src/                         React 页面和 typed client
     | invoke() / 事件
 tauri3/src-tauri/src/lib.rs         Tauri command、权限和服务编排
     |-- runtime.rs                  消息/事件流水线、规则、AI、任务和 outbox worker
+    |-- runtime_work.rs             脱敏运行任务快照、进度、队列聚合和事件合并
     |-- gateway.rs                  RuntimeGateway、CDP、Electron IPC、NIM 和回执
     |-- database.rs                 schema、迁移、DatabaseExecutor
     |-- repository.rs               事务查询、分页、claim 和审计写入
@@ -89,6 +90,8 @@ Tokio/Tauri command --(Run job)--> 256 项有界队列 --> dh-sqlite --> rusqlit
   5 秒，仍不确定的副作用写为 `unknown`。
 - 数据库迁移使用事务和启动前快照，字段补齐按 `PRAGMA table_info` 幂等执行。
 - 所有数据库时间存 UTC；计划额外保存 Windows 时区和本地日期键。
+- 消息处理所需的群、成员、最近消息和启用规则由一个 `message_processing_context` job
+  一次返回，避免单条消息在 actor 队列中产生四次往返。
 
 数据库字段边界和唯一约束见 [`DATABASE-SCHEMA.md`](DATABASE-SCHEMA.md)。
 
@@ -122,6 +125,17 @@ AI 输入只包含当前群、当前消息之前的上下文和已绑定知识�
 
 回读失败或 transport 结果不确定时标记“待人工确认”，不自动补发。账号级外部写队列
 保持至少 500ms 间隔；这是协议保护，不是规则冷却。
+
+### 运行任务与并发模型
+
+`RuntimeWorkTracker` 以账号、群和任务类型的哈希通道聚合运行任务。快照只含标签、状态、
+进度、后续数量和脱敏错误；事件最多每 100ms 发出一次。可测任务报告步骤百分比，不可测
+网络任务使用不定进度。成功项保留 5 秒，失败和未知项由前端关闭只读抽屉时确认清除。
+
+并发边界固定为：每群消息有序、每群 AI 回复有序、AI/预测网络请求最多 2 个并发、
+账号协议写入串行且间隔至少 500ms。数据库继续使用单连接 actor，不对 SQLite 启用并行写。
+空闲 worker 等待共享通知并以 30 秒超时兜底；启动时从持久队列恢复显示数量，但使用
+`max(已观察数量, 数据库积压)` 消除启动扫描和 worker 同时 claim 的重复计数竞态。
 
 ## 6. 业务应用和预测
 

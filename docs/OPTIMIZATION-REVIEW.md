@@ -21,12 +21,21 @@
 | P1 | 预测不同彩种互相串行 | 全局请求 mutex；base cache 锁跨网络 await | 最多 2 个只读请求并发、同彩种 single-flight、base cache 网络调用不持锁、调用方超时不再被强制放大到 20 秒 |
 | P1 | 9222 重载恢复超过 5 秒 | 未就绪、监听安装和身份读取均固定睡眠 5 秒 | 攉为 250/500/1000/2000ms 有界退避，会话成功后复位 |
 | P1 | 报告 PID、哈希和状态口径不一致 | 多个步骤分别采样并手工拼接 | 最终阶段一次重查进程与 9222/9223，统一生成 `PASS/FAIL/SKIPPED`、六个规定文件和诊断 ZIP |
+| P1 | 长任务没有统一进度与队列入口 | 页面只显示局部 loading，后台 worker 状态不可见 | Logo 进度环、左下当前任务、只读队列抽屉；运行时任务按脱敏通道聚合，成功保留 5 秒，失败保留到抽屉关闭 |
+| P1 | 单条消息产生多次数据库 actor 往返 | 群、成员、上下文和规则分别查询 | 新增 `message_processing_context`，在一个 job 内返回处理上下文 |
+| P1 | 空闲 worker 高频查询 SQLite | effect 500ms、名片等 5 秒轮询 | 写入后通知 worker，空闲时事件驱动等待，30 秒仅作恢复兜底 |
+| P1 | 并行策略分散且预测润色未纳入统一上限 | 不同 AI 路径分别调度 | AI 回复、AI 规则和预测润色共享最多 2 个许可；同群有序、账号写入串行边界不变 |
+| P1 | portable ZIP 不在交付目录但被写入哈希清单 | ZIP 生成在 `dist` 上级，验证器不检查清单引用 | ZIP 改为写入 `dist/production`；验证器强制解压扫描并逐项校验缺失、重复、额外文件和 SHA-256 |
 
 ## 已执行的自动验证
 
-- `cargo check`：通过。
-- `cargo test --no-default-features`：202 PASS，0 FAIL，1 个需要外部临时凭据的 live test 跳过。
-- `pnpm test`：58 PASS，0 FAIL。
+- `cargo check --no-default-features` 与 `cargo check --features fixture`：通过。
+- 上一轮完整 `cargo test --no-default-features` 为 202 PASS、0 FAIL、1 SKIPPED。本轮新增 Rust 测试已由全目标 Clippy 编译，但本机测试 EXE 启动遇到系统加载错误 `0xc0000139`，断言未执行，不计为 PASS。
+- `pnpm test`：62 PASS，0 FAIL。
+- `cargo clippy --all-targets --features fixture -- -D warnings`：通过。
+- Fixture Playwright：1 PASS，1 个仅用于生成手册截图的场景按配置跳过。
+- 协议采集、校验与脱敏：34 PASS，0 FAIL。
+- 生产边界、生产隔离和生产依赖审计：通过，未发现已知生产依赖漏洞。
 - PowerShell AST：`package-windows.ps1`、`verify-windows-production.ps1`、`test-windows-real-machine.ps1` 通过。
 - Node 语法与 `package.json` 解析：通过。
 
@@ -34,7 +43,6 @@
 
 | 优先级 | 项目 | 当前风险 | 所需证据 |
 | --- | --- | --- | --- |
-| P0 | 新源码生产构建 | 当前验证尚未产生本分支最终 EXE/ZIP/setup 哈希 | 本机 release + NSIS + portable，深度扫描，`SHA256SUMS.txt` 与 `HASHES.txt` 一致 |
 | P0 | 安装/卸载进程隔离 | 已从命名上消除已知冲突，仍需验证 NSIS 行为 | portable 运行时安装/卸载；确认仅提示或处理安装版，不结束 portable 与旺商聊 |
 | P0 | 真实旺商聊回归 | 自动测试不等同于真实协议回执 | 9222/9223 页面、账号、NIM、能力矩阵和协议指纹的只读记录；写入前单独汇报 |
 | P0 | 改名与规则真实回调 | Fixture 已覆盖状态机，真实回调字段可能随客户端版本变化 | 20 字符内改名、回读、恢复；内部回调不计数，外部改名计数 1/5 次 |
@@ -57,4 +65,4 @@
 
 ## 当前结论
 
-代码级阻断项已完成修复并通过本地自动测试。发布结论仍为“仅限内部 beta”，直到本分支重新生成生产产物并完成 Windows 安装边界、双实例只读探测和经确认的真实群回归。
+代码级阻断项已完成修复；本分支已重新生成 EXE、portable ZIP 和 setup，并通过生产隔离、解包和清单哈希门禁。发布结论仍为“仅限内部 beta”，直到完成 Windows 安装边界、双实例只读探测和经确认的真实群回归。

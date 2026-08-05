@@ -118,6 +118,8 @@ export function installStylePreviewFixture() {
       case 'test_ai': return { decision: { reply: String(args.message || '').includes('群公告') ? '请文明交流。涉及资金、账号或验证码时，请先联系管理员核实。' : '你好，我可以协助处理群规、FAQ 和群内任务。当前资料不足时，我会建议联系管理员确认。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 18, model: 'deepseek-v4-pro', knowledgeSource: args.includeBuiltInKnowledge ? 'DH 默认群规与 FAQ' : '空上下文' }
       case 'get_wang_profile_status': return { state: '样式预览', scriptHash: 'STYLE-PREVIEW-HASH', backupPath: null, requiresElevation: false, detail: '当前只用于页面样式调整。' }
       case 'get_gateway_capabilities': return { announcement: 'supported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }
+      case 'get_runtime_work_snapshot': return { active: { id: 'STYLE-TASK', kind: 'message', label: '处理群消息', scopeLabel: '大海兼职群', state: 'running', percent: 42, queued: 3, startedAt: '2026-08-06T00:00:00Z', retryAt: null, completedAt: null, error: '' }, items: [{ id: 'STYLE-TASK', kind: 'message', label: '处理群消息', scopeLabel: '大海兼职群', state: 'running', percent: 42, queued: 3, startedAt: '2026-08-06T00:00:00Z', retryAt: null, completedAt: null, error: '' }], counts: { running: 1, queued: 3, retrying: 0, failed: 0 }, updatedAt: '2026-08-06T00:00:00Z' }
+      case 'acknowledge_runtime_work_failures': return null
       case 'get_runtime_mode': return { mode: 'fixture', dataDir: '样式预览内存数据', restartRequired: false }
       case 'take_wang_startup_status': return null
       default:

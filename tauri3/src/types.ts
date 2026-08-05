@@ -2,6 +2,29 @@ export type PageName = '总览' | '群组与成员' | '消息台' | '规则' | '
 
 export type LoadState = 'idle' | 'loading' | 'empty' | 'ready' | 'error' | 'offlineCached'
 
+export type RuntimeWorkState = 'running' | 'queued' | 'retrying' | 'succeeded' | 'failed' | 'unknown'
+
+export type RuntimeWorkItem = {
+  id: string
+  kind: string
+  label: string
+  scopeLabel: string
+  state: RuntimeWorkState
+  percent?: number | null
+  queued: number
+  startedAt?: string | null
+  retryAt?: string | null
+  completedAt?: string | null
+  error: string
+}
+
+export type RuntimeWorkSnapshot = {
+  active?: RuntimeWorkItem | null
+  items: RuntimeWorkItem[]
+  counts: { running: number; queued: number; retrying: number; failed: number }
+  updatedAt: string
+}
+
 export type Group = {
   accountId: string
   groupId: number

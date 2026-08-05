@@ -10,6 +10,8 @@
 - `export_support_bundle`：生成本地脱敏诊断 ZIP，不自动上传。
 - `get_close_behavior`、`reset_close_behavior`、`resolve_close_action`：管理右上角关闭行为。
 - `get_gateway_capabilities`：读取逐项能力状态、来源、人工/自动许可和原因。
+- `get_runtime_work_snapshot`：读取脱敏的当前任务、队列数量、进度和失败快照。
+- `acknowledge_runtime_work_failures`：按前端本次已显示的任务 ID 确认失败或未知项；不重试、跳过或改写业务任务。
 
 ## 群、成员、消息与人工群控
 
@@ -75,8 +77,8 @@ API Key 在 Windows 通过 DPAPI 保存；命令响应、日志、审计和支�
 
 前端订阅以下只含不可变结果的事件：`wangshangliao-status`、`connection-status`、
 `connection-error`、`gateway-capabilities`、`sync-progress`、`message-received`、
-`task-progress`、`schedule-updated`、`automation-paused`。后台网络和协议 worker 不直接修改
-React 页面状态；页面收到事件后按账号重新读取对应数据。
+`task-progress`、`schedule-updated`、`automation-paused`、`runtime-work-updated`。业务数据事件由
+页面按账号重新读取；运行任务事件是最多每 100ms 合并一次的完整脱敏快照，可直接替换前端任务状态。
 
 ## 开发版边界
 

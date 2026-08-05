@@ -19,6 +19,21 @@ use crate::models::{
 };
 use crate::paths::AppPaths;
 
+pub struct MessageProcessingContext {
+    pub group: Group,
+    pub member: Option<Member>,
+    pub recent_messages: Vec<Message>,
+    pub rules: Vec<ModerationRule>,
+}
+
+pub struct RuntimeBacklog {
+    pub account_id: String,
+    pub group_id: i64,
+    pub lane: String,
+    pub detail: String,
+    pub count: usize,
+}
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -686,6 +701,10 @@ impl DatabaseExecutor {
         self.execute(Database::status).await
     }
 
+    pub async fn runtime_backlog(&self) -> AppResult<Vec<RuntimeBacklog>> {
+        self.execute(Database::runtime_backlog).await
+    }
+
     pub async fn ingest_gateway_batch(
         &self,
         events: Vec<GatewayInboxEvent>,
@@ -1232,6 +1251,33 @@ impl DatabaseExecutor {
     ) -> AppResult<Vec<ModerationRule>> {
         self.execute(move |database| database.list_rules(&account_id, group_id))
             .await
+    }
+
+    pub async fn message_processing_context(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<Option<MessageProcessingContext>> {
+        self.execute(move |database| {
+            let Some(group) = database.get_group(&account_id, group_id)? else {
+                return Ok(None);
+            };
+            let member = database.get_member(&account_id, group_id, user_id)?;
+            let recent_messages = database.recent_messages(&account_id, group_id, 20)?;
+            let rules = if group.machine_rules_enabled || group.ai_rules_enabled {
+                database.list_rules(&account_id, Some(group_id))?
+            } else {
+                Vec::new()
+            };
+            Ok(Some(MessageProcessingContext {
+                group,
+                member,
+                recent_messages,
+                rules,
+            }))
+        })
+        .await
     }
 
     pub async fn rule_cooldown_allows(
@@ -1804,6 +1850,62 @@ fn recover_processing_effects(
 }
 
 impl Database {
+    fn runtime_backlog(&self) -> AppResult<Vec<RuntimeBacklog>> {
+        self.with_connection(|connection| {
+            let mut backlog = Vec::new();
+            let mut messages = connection.prepare(
+                "SELECT account_id,group_id,COUNT(*) FROM messages WHERE acknowledged_at IS NOT NULL AND processed_at IS NULL AND processing_state IN ('pending','queued','retry','processing') GROUP BY account_id,group_id",
+            )?;
+            backlog.extend(
+                messages
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "message".into(),
+                            detail: String::new(),
+                            count: row.get::<_, i64>(2)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut effects = connection.prepare(
+                "SELECT account_id,group_id,effect_type,COUNT(*) FROM effect_outbox WHERE state IN ('queued','retry','processing') GROUP BY account_id,group_id,effect_type",
+            )?;
+            backlog.extend(
+                effects
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "write".into(),
+                            detail: row.get(2)?,
+                            count: row.get::<_, i64>(3)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut cards = connection.prepare(
+                "SELECT account_id,group_id,COUNT(*) FROM card_rename_jobs WHERE state IN ('queued','retry','processing') GROUP BY account_id,group_id",
+            )?;
+            backlog.extend(
+                cards
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "cardRename".into(),
+                            detail: String::new(),
+                            count: row.get::<_, i64>(2)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(backlog)
+        })
+        .map_err(|error| AppError::new("runtime_backlog", error.to_string()))
+    }
+
     pub fn open(paths: &AppPaths) -> AppResult<Self> {
         if let Some(parent) = paths.database.parent() {
             std::fs::create_dir_all(parent)
@@ -2482,6 +2584,19 @@ impl Database {
         }).map_err(|error| AppError::new("groups_read", error.to_string()))
     }
 
+    fn get_group(&self, account_id: &str, group_id: i64) -> AppResult<Option<Group>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,machine_rules_enabled,ai_rules_enabled,manual_takeover,welcome_message,updated_at FROM groups WHERE account_id=? AND group_id=?",
+                    params![account_id, group_id],
+                    group_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("group_read", error.to_string()))
+    }
+
     pub fn upsert_member(&self, member: &Member) -> AppResult<i64> {
         self.upsert_member_from_wire(member)
     }
@@ -2524,6 +2639,24 @@ impl Database {
             let rows = statement.query_map(params![account_id, group_id], member_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("members_read", error.to_string()))
+    }
+
+    fn get_member(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<Option<Member>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND user_id=?",
+                    params![account_id, group_id, user_id],
+                    member_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("member_read", error.to_string()))
     }
 
     pub fn mark_members_not_present(

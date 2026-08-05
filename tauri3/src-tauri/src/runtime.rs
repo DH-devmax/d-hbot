@@ -27,6 +27,7 @@ use crate::models::{
     Account, ActionRecord, AuditEvent, DailySummary, EffectOutboxItem, EffectOutboxRequest,
     GatewayInboxEvent, Group, Member, MemberRef, Message, ModerationRule, RuleAction, TaskItem,
 };
+use crate::runtime_work::RuntimeCoordination;
 use crate::secrets::SecretStore;
 use crate::shutdown::ShutdownSignal;
 use crate::{knowledge, moderation, prediction, scheduler};
@@ -50,8 +51,19 @@ struct AiReplyJob {
     message: Message,
 }
 
+struct AiRuleJob {
+    account_id: String,
+    sender_id: i64,
+    group: Group,
+    member: Member,
+    message: Message,
+    recent_events: Vec<moderation::RecentEvent>,
+    rules: Vec<ModerationRule>,
+}
+
 struct PredictionNarrationJob {
     account_id: String,
+    group_id: i64,
     cache_key: String,
     narration: Value,
     provider: Arc<dyn AiProvider>,
@@ -86,6 +98,26 @@ fn next_connection_retry(delay: Duration) -> Duration {
             .saturating_mul(2)
             .clamp(250, 2_000),
     )
+}
+
+pub(crate) fn runtime_lane_id(kind: &str, account_id: &str, group_id: i64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(account_id.as_bytes());
+    hasher.update(group_id.to_le_bytes());
+    format!("{}-{}", kind, &format!("{:x}", hasher.finalize())[..12])
+}
+
+fn effect_label(effect_type: &str) -> &'static str {
+    match effect_type {
+        "send_text" => "发送群消息",
+        "recall" => "撤回群消息",
+        "mute" | "unmute" => "更新成员禁言",
+        "rename" => "修改群名片",
+        "group_mute" => "更新群发言状态",
+        "remove" => "移出群成员",
+        _ => "执行群操作",
+    }
 }
 
 pub trait Clock: Send + Sync {
@@ -216,6 +248,7 @@ pub struct BackendRuntime {
     prediction_narration_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PredictionNarrationJob>>>,
     prediction_narration_pending: Arc<tokio::sync::Mutex<HashSet<String>>>,
     ai_rule_gate: Arc<tokio::sync::Semaphore>,
+    coordination: RuntimeCoordination,
 }
 
 impl BackendRuntime {
@@ -274,12 +307,23 @@ impl BackendRuntime {
             prediction_narration_rx: Arc::new(tokio::sync::Mutex::new(prediction_narration_rx)),
             prediction_narration_pending: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            coordination: RuntimeCoordination::default(),
         }
+    }
+
+    pub fn with_coordination(mut self, coordination: RuntimeCoordination) -> Self {
+        self.coordination = coordination;
+        self
     }
 
     pub fn spawn(mut self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
         self.events = Arc::new(TauriEventSink::new(app.clone()));
-        let mut workers = Vec::with_capacity(8);
+        self.coordination.tracker.attach(app.clone());
+        let mut workers = Vec::with_capacity(9);
+        let backlog = self.clone();
+        workers.push(tauri::async_runtime::spawn(async move {
+            backlog.seed_runtime_work().await;
+        }));
         let card_queue = self.clone();
         let card_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
@@ -310,14 +354,39 @@ impl BackendRuntime {
             summaries.summary_loop(summaries_app).await;
         }));
         let effects = self.clone();
+        let effects_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
-            effects.effect_loop(app).await;
+            effects.effect_loop(effects_app).await;
         }));
         let prediction_narration = self.clone();
         workers.push(tauri::async_runtime::spawn(async move {
             prediction_narration.prediction_narration_loop().await;
         }));
         workers
+    }
+
+    async fn seed_runtime_work(&self) {
+        let Ok(items) = self.database.runtime_backlog().await else {
+            return;
+        };
+        for item in items {
+            let (id_kind, kind, label, scope) = match item.lane.as_str() {
+                "message" => ("message", "message", "处理群消息", "群消息队列"),
+                "cardRename" => ("cardRename", "cardRename", "批量修改群名片", "群名片队列"),
+                "write" => (
+                    item.detail.as_str(),
+                    "write",
+                    effect_label(&item.detail),
+                    "群操作",
+                ),
+                _ => continue,
+            };
+            let work_id = runtime_lane_id(id_kind, &item.account_id, item.group_id);
+            self.coordination
+                .tracker
+                .seed_queued_count(&work_id, kind, label, scope, item.count);
+        }
+        self.coordination.notify();
     }
 
     async fn prediction_narration_loop(&self) {
@@ -330,17 +399,47 @@ impl BackendRuntime {
                     None => break,
                 },
             };
-            if let Ok(decision) = job.provider.decide(&job.request).await {
-                if crate::business_apps::validate_prediction_narration(
-                    &decision.reply,
-                    &job.narration,
-                ) {
+            let work_id = runtime_lane_id("prediction", &job.account_id, job.group_id);
+            let Ok(_permit) = self.ai_rule_gate.clone().acquire_owned().await else {
+                self.coordination.tracker.start_named(
+                    &work_id,
+                    "prediction",
+                    "生成预测说明",
+                    "业务应用",
+                    None,
+                );
+                self.coordination
+                    .tracker
+                    .finish(&work_id, "failed", "AI 调度器已停止");
+                break;
+            };
+            self.coordination.tracker.start_named(
+                &work_id,
+                "prediction",
+                "生成预测说明",
+                "业务应用",
+                None,
+            );
+            let outcome = match job.provider.decide(&job.request).await {
+                Ok(decision)
+                    if crate::business_apps::validate_prediction_narration(
+                        &decision.reply,
+                        &job.narration,
+                    ) =>
+                {
                     self.prediction_narration_cache.insert_scoped(
                         &job.account_id,
                         job.cache_key.clone(),
                         decision,
                     );
+                    Ok(())
                 }
+                Ok(_) => Err("AI 预测说明格式不完整"),
+                Err(_) => Err("AI 预测说明生成失败"),
+            };
+            match outcome {
+                Ok(()) => self.coordination.tracker.finish(&work_id, "succeeded", ""),
+                Err(error) => self.coordination.tracker.finish(&work_id, "failed", error),
             }
             self.prediction_narration_pending
                 .lock()
@@ -363,7 +462,8 @@ impl BackendRuntime {
                 "真实校准期间已暂停自动副作用，避免后台任务修改测试群状态",
             ));
         }
-        self.database
+        let enqueued = self
+            .database
             .enqueue_effect(EffectOutboxRequest {
                 account_id: account_id.into(),
                 group_id,
@@ -372,6 +472,16 @@ impl BackendRuntime {
                 dedupe_key,
             })
             .await?;
+        if enqueued.inserted && matches!(enqueued.state.as_str(), "queued" | "retry") {
+            let work_id = runtime_lane_id(effect_type, account_id, group_id);
+            self.coordination.tracker.enqueue(
+                &work_id,
+                "write",
+                effect_label(effect_type),
+                "群操作",
+            );
+            self.coordination.notify();
+        }
         Ok(())
     }
 
@@ -394,19 +504,38 @@ impl BackendRuntime {
 
     async fn effect_loop(&self, app: AppHandle) {
         loop {
+            let mut dispatched = false;
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((_, account_id)) = self.gateway.session_identity().await {
                     if let Ok(Some((permit, item))) =
                         self.claim_effect_for_dispatch(account_id).await
                     {
+                        let work_id =
+                            runtime_lane_id(&item.effect_type, &item.account_id, item.group_id);
+                        self.coordination.tracker.start_named(
+                            &work_id,
+                            "write",
+                            effect_label(&item.effect_type),
+                            "群操作",
+                            None,
+                        );
                         self.dispatch_effect_permitted(Some(&app), item, &permit)
                             .await;
+                        dispatched = true;
                     }
                 }
             }
-            tokio::select! {
-                _ = sleep(Duration::from_millis(500)) => {},
-                _ = self.shutdown.cancelled() => break,
+            if dispatched {
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(500)) => {},
+                    _ = self.shutdown.cancelled() => break,
+                }
+            } else {
+                tokio::select! {
+                    _ = self.coordination.wake.notified() => {},
+                    _ = sleep(Duration::from_secs(30)) => {},
+                    _ = self.shutdown.cancelled() => break,
+                }
             }
         }
     }
@@ -431,6 +560,7 @@ impl BackendRuntime {
         item: EffectOutboxItem,
         _permit: &AutomaticWritePermit,
     ) {
+        let work_id = runtime_lane_id(&item.effect_type, &item.account_id, item.group_id);
         let payload: Value = serde_json::from_str(&item.payload_json).unwrap_or(Value::Null);
         let user_id = payload.get("userId").and_then(Value::as_i64).unwrap_or(0);
         let duration = payload
@@ -674,12 +804,20 @@ impl BackendRuntime {
             .await
         {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => {
+                self.coordination
+                    .tracker
+                    .finish(&work_id, "failed", "操作结果没有完成归档");
+                return;
+            }
             Err(error) => {
                 self.logger.write(
                     "ERROR",
                     &format!("副作用结果原子归档失败：{}", error.message),
                 );
+                self.coordination
+                    .tracker
+                    .finish(&work_id, "unknown", &error.message);
                 return;
             }
         }
@@ -743,6 +881,44 @@ impl BackendRuntime {
                 );
             }
         }
+        match status {
+            EffectDispatchStatus::Succeeded => {
+                self.coordination.tracker.finish(&work_id, "succeeded", "")
+            }
+            EffectDispatchStatus::Failed if item.attempts < 5 => self
+                .coordination
+                .tracker
+                .retrying(&work_id, None, &error_text),
+            EffectDispatchStatus::Unknown => {
+                self.coordination
+                    .tracker
+                    .finish(&work_id, "unknown", &error_text)
+            }
+            EffectDispatchStatus::Failed | EffectDispatchStatus::TerminalFailed => self
+                .coordination
+                .tracker
+                .finish(&work_id, "failed", &error_text),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_incoming_job(
+        &self,
+        sender: &mpsc::Sender<IncomingJob>,
+        account_id: &str,
+        job: IncomingJob,
+    ) {
+        let work_id = runtime_lane_id("message", account_id, job.message.group_id);
+        self.coordination
+            .tracker
+            .enqueue(&work_id, "message", "处理群消息", "群消息队列");
+        if let Err(error) = sender.try_send(job) {
+            let reason = match error {
+                mpsc::error::TrySendError::Full(_) => "群消息队列繁忙，已保留到持久队列等待重试",
+                mpsc::error::TrySendError::Closed(_) => "群消息处理队列已关闭",
+            };
+            self.coordination.tracker.reject_enqueue(&work_id, reason);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -761,15 +937,55 @@ impl BackendRuntime {
             .or_insert_with(|| {
                 let (sender, mut receiver) = mpsc::channel::<IncomingJob>(128);
                 let (ai_sender, mut ai_receiver) = mpsc::channel::<AiReplyJob>(128);
+                let (ai_rule_sender, mut ai_rule_receiver) = mpsc::channel::<AiRuleJob>(128);
+                let rule_runtime = self.clone();
+                let rule_app = app.clone();
+                worker_tasks.spawn(async move {
+                    while let Some(job) = ai_rule_receiver.recv().await {
+                        let work_id =
+                            runtime_lane_id("aiRule", &job.account_id, job.group.group_id);
+                        let Ok(_permit) = rule_runtime.ai_rule_gate.clone().acquire_owned().await
+                        else {
+                            rule_runtime.coordination.tracker.start(&work_id, None);
+                            rule_runtime.coordination.tracker.finish(
+                                &work_id,
+                                "failed",
+                                "AI 调度器已停止",
+                            );
+                            break;
+                        };
+                        rule_runtime
+                            .process_ai_rules_background(
+                                rule_app.clone(),
+                                job.account_id,
+                                job.sender_id,
+                                job.group,
+                                job.member,
+                                job.message,
+                                job.recent_events,
+                                job.rules,
+                            )
+                            .await;
+                    }
+                });
                 let ai_runtime = self.clone();
                 let ai_app = app.clone();
                 let ai_account = account_id.to_string();
                 worker_tasks.spawn(async move {
                     while let Some(job) = ai_receiver.recv().await {
-                        let Ok(_permit) = ai_runtime.ai_rule_gate.acquire().await else {
+                        let work_id = runtime_lane_id("aiReply", &ai_account, job.message.group_id);
+                        let Ok(_permit) = ai_runtime.ai_rule_gate.clone().acquire_owned().await
+                        else {
+                            ai_runtime.coordination.tracker.start(&work_id, None);
+                            ai_runtime.coordination.tracker.finish(
+                                &work_id,
+                                "failed",
+                                "AI 调度器已停止",
+                            );
                             break;
                         };
-                        if let Err(error) = ai_runtime
+                        ai_runtime.coordination.tracker.start(&work_id, None);
+                        match ai_runtime
                             .process_deferred_ai(
                                 &ai_app,
                                 &ai_account,
@@ -778,25 +994,38 @@ impl BackendRuntime {
                             )
                             .await
                         {
-                            let _ = ai_runtime
-                                .database
-                                .record_audit(AuditEvent {
-                                    id: 0,
-                                    account_id: ai_account.clone(),
-                                    group_id: job.message.group_id,
-                                    user_id: job.message.user_id,
-                                    actor: "DH BOT".into(),
-                                    event: "ai_reply_worker_failed".into(),
-                                    level: "warning".into(),
-                                    details: serde_json::json!({
-                                        "messageId": job.message.id,
-                                        "status": "failed",
-                                        "error": error.message,
+                            Ok(()) => {
+                                ai_runtime
+                                    .coordination
+                                    .tracker
+                                    .finish(&work_id, "succeeded", "")
+                            }
+                            Err(error) => {
+                                ai_runtime.coordination.tracker.finish(
+                                    &work_id,
+                                    "failed",
+                                    &error.message,
+                                );
+                                let _ = ai_runtime
+                                    .database
+                                    .record_audit(AuditEvent {
+                                        id: 0,
+                                        account_id: ai_account.clone(),
+                                        group_id: job.message.group_id,
+                                        user_id: job.message.user_id,
+                                        actor: "DH BOT".into(),
+                                        event: "ai_reply_worker_failed".into(),
+                                        level: "warning".into(),
+                                        details: serde_json::json!({
+                                            "messageId": job.message.id,
+                                            "status": "failed",
+                                            "error": error.message,
+                                        })
+                                        .to_string(),
+                                        created_at: Utc::now(),
                                     })
-                                    .to_string(),
-                                    created_at: Utc::now(),
-                                })
-                                .await;
+                                    .await;
+                            }
                         }
                     }
                 });
@@ -805,12 +1034,15 @@ impl BackendRuntime {
                 let account = account_id.to_string();
                 worker_tasks.spawn(async move {
                     while let Some(job) = receiver.recv().await {
+                        let work_id = runtime_lane_id("message", &account, job.message.group_id);
+                        runtime.coordination.tracker.start(&work_id, Some(4));
                         if runtime
                             .database
                             .claim_message(job.message.id)
                             .await
                             .unwrap_or(false)
                         {
+                            runtime.coordination.tracker.progress(&work_id, 1, 4);
                             let result = runtime
                                 .process_job(
                                     &app_handle,
@@ -818,16 +1050,28 @@ impl BackendRuntime {
                                     sender_id,
                                     job.clone(),
                                     &ai_sender,
+                                    &ai_rule_sender,
+                                    &work_id,
                                 )
                                 .await;
-                            let (success, error) = match result {
+                            let (success, error) = match &result {
                                 Ok(()) => (true, String::new()),
-                                Err(error) => (false, error.message),
+                                Err(error) => (false, error.message.clone()),
                             };
+                            runtime.coordination.tracker.finish(
+                                &work_id,
+                                if success { "succeeded" } else { "failed" },
+                                &error,
+                            );
                             let _ = runtime
                                 .database
                                 .finish_message_processing(job.message.id, success, error)
                                 .await;
+                        } else {
+                            runtime
+                                .coordination
+                                .tracker
+                                .finish(&work_id, "succeeded", "");
                         }
                     }
                 });
@@ -887,11 +1131,20 @@ impl BackendRuntime {
                             {
                                 continue;
                             }
+                            let work_id = runtime_lane_id("summary", &account_id, group_id);
+                            self.coordination.tracker.start_named(
+                                &work_id,
+                                "summary",
+                                "生成每日摘要",
+                                "计划任务",
+                                None,
+                            );
                             match self
                                 .generate_scheduled_summary(&account_id, group_id, &local_date)
                                 .await
                             {
                                 Ok(summary) => {
+                                    self.coordination.tracker.finish(&work_id, "succeeded", "");
                                     let _ = self
                                         .database
                                         .finish_summary_run(
@@ -905,6 +1158,11 @@ impl BackendRuntime {
                                     let _ = app.emit("task-progress", serde_json::json!({"kind":"dailySummary","groupId":group_id,"summaryId":summary.id,"success":true}));
                                 }
                                 Err(error) => {
+                                    self.coordination.tracker.finish(
+                                        &work_id,
+                                        "failed",
+                                        &error.message,
+                                    );
                                     let _ = self
                                         .database
                                         .finish_summary_run(
@@ -936,7 +1194,7 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
+            tokio::select! { _ = self.coordination.wake.notified() => {}, _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
@@ -1020,6 +1278,14 @@ impl BackendRuntime {
                         .await
                         .unwrap_or_default();
                     for task in tasks {
+                        let work_id = runtime_lane_id("reminder", &task.account_id, task.group_id);
+                        self.coordination.tracker.start_named(
+                            &work_id,
+                            "reminder",
+                            "准备任务提醒",
+                            "计划任务",
+                            None,
+                        );
                         let text = format!(
                             "任务提醒：{}{}",
                             task.title,
@@ -1057,6 +1323,11 @@ impl BackendRuntime {
                                 )
                             }
                         };
+                        self.coordination.tracker.finish(
+                            &work_id,
+                            if success { "succeeded" } else { "failed" },
+                            if success { "" } else { &details },
+                        );
                         let _ = self
                             .database
                             .record_audit(AuditEvent {
@@ -1075,7 +1346,7 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
+            tokio::select! { _ = self.coordination.wake.notified() => {}, _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
@@ -1095,6 +1366,16 @@ impl BackendRuntime {
                         if let Ok(Some(job)) =
                             self.database.claim_next_card_job(account_id.clone()).await
                         {
+                            let work_id =
+                                runtime_lane_id("cardRename", &job.account_id, job.group_id);
+                            self.coordination.tracker.start_named(
+                                &work_id,
+                                "cardRename",
+                                "批量修改群名片",
+                                "群名片队列",
+                                Some(3),
+                            );
+                            self.coordination.tracker.progress(&work_id, 1, 3);
                             let paused = self
                                 .database
                                 .get_setting(format!(
@@ -1128,6 +1409,7 @@ impl BackendRuntime {
                             };
                             let result = match result {
                                 Ok(receipt) => {
+                                    self.coordination.tracker.progress(&work_id, 2, 3);
                                     sleep(Duration::from_millis(500)).await;
                                     match self.gateway.list_members(job.group_id).await {
                                         Ok(roster) => {
@@ -1199,6 +1481,14 @@ impl BackendRuntime {
                                 .database
                                 .finish_card_job(job.clone(), success, retryable, error.clone())
                                 .await;
+                            if success {
+                                self.coordination.tracker.progress(&work_id, 3, 3);
+                                self.coordination.tracker.finish(&work_id, "succeeded", "");
+                            } else if retryable && job.attempts < 5 {
+                                self.coordination.tracker.retrying(&work_id, None, &error);
+                            } else {
+                                self.coordination.tracker.finish(&work_id, "failed", &error);
+                            }
                             if success && job.welcome_pending {
                                 let welcome = self
                                     .database
@@ -1259,7 +1549,8 @@ impl BackendRuntime {
                 }
             }
             tokio::select! {
-                _ = sleep(Duration::from_secs(5)) => {},
+                _ = self.coordination.wake.notified() => {},
+                _ = sleep(Duration::from_secs(30)) => {},
                 _ = self.shutdown.cancelled() => break,
             }
         }
@@ -1623,9 +1914,20 @@ impl BackendRuntime {
             .into_iter()
             .filter(|plan| plan.status == "planned" && member_ids.contains(&plan.member.user_id))
         {
-            self.database
+            if self
+                .database
                 .enqueue_card_job(account_id.to_string(), group_id, plan, true)
-                .await?;
+                .await?
+            {
+                let work_id = runtime_lane_id("cardRename", account_id, group_id);
+                self.coordination.tracker.enqueue(
+                    &work_id,
+                    "cardRename",
+                    "批量修改群名片",
+                    "群名片队列",
+                );
+                self.coordination.notify();
+            }
         }
         Ok(())
     }
@@ -1662,6 +1964,14 @@ impl BackendRuntime {
                                 {
                                     continue;
                                 }
+                                let work_id = runtime_lane_id("schedule", &account_id, *group_id);
+                                self.coordination.tracker.start_named(
+                                    &work_id,
+                                    "schedule",
+                                    "执行群计划",
+                                    "计划任务",
+                                    None,
+                                );
                                 let allowed = self
                                     .gateway
                                     .list_members(*group_id)
@@ -1706,6 +2016,11 @@ impl BackendRuntime {
                                     Ok(()) => (true, String::new()),
                                     Err(error) => (false, error.message),
                                 };
+                                self.coordination.tracker.finish(
+                                    &work_id,
+                                    if success { "succeeded" } else { "failed" },
+                                    &error,
+                                );
                                 if !success {
                                     let _ = self
                                         .database
@@ -1745,7 +2060,7 @@ impl BackendRuntime {
                     }
                 }
             }
-            tokio::select! { _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
+            tokio::select! { _ = self.coordination.wake.notified() => {}, _ = sleep(Duration::from_secs(30)) => {}, _ = self.shutdown.cancelled() => break }
         }
     }
 
@@ -1816,9 +2131,29 @@ impl BackendRuntime {
                 .database
                 .ensure_account_defaults(account_id.clone())
                 .await;
-            if let Ok(groups) = self.gateway.list_groups().await {
-                for group in groups {
-                    let _ = self.database.upsert_group(group).await;
+            let sync_work_id = runtime_lane_id("sync", &account_id, 0);
+            self.coordination.tracker.start_named(
+                &sync_work_id,
+                "sync",
+                "同步群资料",
+                "旺商聊",
+                Some(2),
+            );
+            match self.gateway.list_groups().await {
+                Ok(groups) => {
+                    self.coordination.tracker.progress(&sync_work_id, 1, 2);
+                    for group in groups {
+                        let _ = self.database.upsert_group(group).await;
+                    }
+                    self.coordination.tracker.progress(&sync_work_id, 2, 2);
+                    self.coordination
+                        .tracker
+                        .finish(&sync_work_id, "succeeded", "");
+                }
+                Err(error) => {
+                    self.coordination
+                        .tracker
+                        .finish(&sync_work_id, "failed", &error.message)
                 }
             }
             let _ = app.emit(
@@ -1847,10 +2182,14 @@ impl BackendRuntime {
                         &account_id,
                         sender_id,
                     );
-                    let _ = sender.try_send(IncomingJob {
-                        sequence: message.sequence.max(0) as u64,
-                        message,
-                    });
+                    self.enqueue_incoming_job(
+                        &sender,
+                        &account_id,
+                        IncomingJob {
+                            sequence: message.sequence.max(0) as u64,
+                            message,
+                        },
+                    );
                 }
             }
             let mut last_batch_session: Option<String> = None;
@@ -1876,10 +2215,14 @@ impl BackendRuntime {
                                 &account_id,
                                 sender_id,
                             );
-                            let _ = sender.try_send(IncomingJob {
-                                sequence: message.sequence.max(0) as u64,
-                                message,
-                            });
+                            self.enqueue_incoming_job(
+                                &sender,
+                                &account_id,
+                                IncomingJob {
+                                    sequence: message.sequence.max(0) as u64,
+                                    message,
+                                },
+                            );
                         }
                     }
                     if let Ok(inbox) = self
@@ -1998,7 +2341,11 @@ impl BackendRuntime {
                                                                 &account_id,
                                                                 sender_id,
                                                             );
-                                                            let _ = sender.try_send(job);
+                                                            self.enqueue_incoming_job(
+                                                                &sender,
+                                                                &account_id,
+                                                                job,
+                                                            );
                                                         }
                                                     }
                                                     Err(error) => {
@@ -2560,7 +2907,7 @@ impl BackendRuntime {
                                     &account_id,
                                     sender_id,
                                 );
-                                let _ = sender.try_send(job);
+                                self.enqueue_incoming_job(&sender, &account_id, job);
                                 let _ = app.emit("message-received", &raw);
                             }
                         }
@@ -2967,9 +3314,20 @@ impl BackendRuntime {
             .into_iter()
             .find(|plan| plan.member.user_id == member.user_id && plan.status == "planned")
         {
-            self.database
+            if self
+                .database
                 .enqueue_card_job(account_id.to_string(), group_id, plan, true)
-                .await?;
+                .await?
+            {
+                let work_id = runtime_lane_id("cardRename", account_id, group_id);
+                self.coordination.tracker.enqueue(
+                    &work_id,
+                    "cardRename",
+                    "批量修改群名片",
+                    "群名片队列",
+                );
+                self.coordination.notify();
+            }
         }
         Ok(())
     }
@@ -3124,6 +3482,7 @@ impl BackendRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_job(
         &self,
         app: &AppHandle,
@@ -3131,6 +3490,8 @@ impl BackendRuntime {
         sender_id: i64,
         job: IncomingJob,
         ai_sender: &mpsc::Sender<AiReplyJob>,
+        ai_rule_sender: &mpsc::Sender<AiRuleJob>,
+        work_id: &str,
     ) -> AppResult<()> {
         if self
             .database
@@ -3164,38 +3525,26 @@ impl BackendRuntime {
                 .await;
             return Ok(());
         }
-        let Some(group) = self
+        let Some(context) = self
             .database
-            .list_groups(Some(account_id.to_string()))
-            .await
-            .ok()
-            .and_then(|groups| {
-                groups
-                    .into_iter()
-                    .find(|group| group.group_id == job.message.group_id)
-            })
+            .message_processing_context(
+                account_id.to_string(),
+                job.message.group_id,
+                job.message.user_id,
+            )
+            .await?
         else {
             return Ok(());
         };
-        let member = self
-            .database
-            .list_members(account_id.to_string(), group.group_id)
-            .await
-            .ok()
-            .and_then(|members| {
-                members
-                    .into_iter()
-                    .find(|member| member.user_id == job.message.user_id)
-            })
+        let group = context.group;
+        let member = context
+            .member
             .unwrap_or_else(|| placeholder_member(account_id, &job.message));
+        self.coordination.tracker.progress(work_id, 2, 4);
         if member.join_source == "message-discovered" {
             let _ = self.database.upsert_member(member.clone()).await;
         }
-        let recent_messages = self
-            .database
-            .recent_messages(account_id.to_string(), group.group_id, 20)
-            .await
-            .unwrap_or_default();
+        let recent_messages = context.recent_messages;
         let recent_events = recent_messages
             .iter()
             .map(|message| moderation::RecentEvent {
@@ -3206,93 +3555,89 @@ impl BackendRuntime {
             .collect::<Vec<_>>();
         let mut deferred_ai_rules = Vec::new();
         if group.machine_rules_enabled || group.ai_rules_enabled {
-            if let Ok(rules) = self
-                .database
-                .list_rules(account_id.to_string(), Some(group.group_id))
-                .await
-            {
-                let input = moderation::ModerationInput {
-                    member: &member,
-                    kind: &job.message.kind,
-                    text: &job.message.text,
-                    now: self.clock.now_utc(),
-                    recent: &recent_events,
-                    rename_violations: member.violation_count,
-                };
-                if group.machine_rules_enabled {
-                    let machine_rules = rules
-                        .iter()
-                        .filter(|rule| !rule.is_ai_rule() && rule.enabled)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let started = std::time::Instant::now();
-                    let decision = moderation::evaluate_with_classifier(
-                        &machine_rules,
-                        &input,
-                        self.semantic_classifier.as_ref(),
-                    );
-                    let elapsed_ms = started.elapsed().as_millis() as i64;
-                    let matched_ids = decision
+            let rules = context.rules;
+            let input = moderation::ModerationInput {
+                member: &member,
+                kind: &job.message.kind,
+                text: &job.message.text,
+                now: self.clock.now_utc(),
+                recent: &recent_events,
+                rename_violations: member.violation_count,
+            };
+            if group.machine_rules_enabled {
+                let machine_rules = rules
+                    .iter()
+                    .filter(|rule| !rule.is_ai_rule() && rule.enabled)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let started = std::time::Instant::now();
+                let decision = moderation::evaluate_with_classifier(
+                    &machine_rules,
+                    &input,
+                    self.semantic_classifier.as_ref(),
+                );
+                let elapsed_ms = started.elapsed().as_millis() as i64;
+                let matched_ids = decision
+                    .matches
+                    .iter()
+                    .map(|matched| matched.rule_id)
+                    .collect::<std::collections::HashSet<_>>();
+                for rule in &machine_rules {
+                    let matched = decision
                         .matches
                         .iter()
-                        .map(|matched| matched.rule_id)
-                        .collect::<std::collections::HashSet<_>>();
-                    for rule in &machine_rules {
-                        let matched = decision
-                            .matches
-                            .iter()
-                            .find(|matched| matched.rule_id == rule.id);
-                        let _ = self
-                            .database
-                            .record_rule_evaluation(
-                                account_id.into(),
-                                group.group_id,
-                                member.user_id,
-                                job.message.id,
-                                rule.id,
-                                "machine".into(),
-                                matched.is_some(),
-                                None,
-                                rule.mode.clone(),
-                                if matched.is_some() {
-                                    "命中".into()
-                                } else {
-                                    "未命中".into()
-                                },
-                                matched
-                                    .map(|value| value.reason.clone())
-                                    .unwrap_or_default(),
-                                elapsed_ms,
-                            )
-                            .await;
-                    }
-                    if !matched_ids.is_empty() {
-                        let _ = self.database.record_audit(AuditEvent { id:0, account_id:account_id.into(), group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"machine_rule_evaluated".into(), level:"info".into(), details:serde_json::json!({"messageId":job.message.id,"matchedRuleIds":matched_ids,"automatic":decision.automatic,"elapsedMs":elapsed_ms}).to_string(), created_at:Utc::now() }).await;
-                    }
-                    self.execute_rule_actions(
-                        Some(app),
-                        account_id,
-                        sender_id,
-                        &job.message,
-                        &decision.action_intents,
-                        decision.automatic,
-                    )
-                    .await;
+                        .find(|matched| matched.rule_id == rule.id);
+                    let _ = self
+                        .database
+                        .record_rule_evaluation(
+                            account_id.into(),
+                            group.group_id,
+                            member.user_id,
+                            job.message.id,
+                            rule.id,
+                            "machine".into(),
+                            matched.is_some(),
+                            None,
+                            rule.mode.clone(),
+                            if matched.is_some() {
+                                "命中".into()
+                            } else {
+                                "未命中".into()
+                            },
+                            matched
+                                .map(|value| value.reason.clone())
+                                .unwrap_or_default(),
+                            elapsed_ms,
+                        )
+                        .await;
                 }
+                if !matched_ids.is_empty() {
+                    let _ = self.database.record_audit(AuditEvent { id:0, account_id:account_id.into(), group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"machine_rule_evaluated".into(), level:"info".into(), details:serde_json::json!({"messageId":job.message.id,"matchedRuleIds":matched_ids,"automatic":decision.automatic,"elapsedMs":elapsed_ms}).to_string(), created_at:Utc::now() }).await;
+                }
+                self.execute_rule_actions(
+                    Some(app),
+                    account_id,
+                    sender_id,
+                    &job.message,
+                    &decision.action_intents,
+                    decision.automatic,
+                )
+                .await;
+            }
 
-                if group.ai_rules_enabled
-                    && group.enabled
-                    && !group.manual_takeover
-                    && message_supports_ai_rules(&job.message.kind, &job.message.text)
-                {
-                    deferred_ai_rules = rules
-                        .iter()
-                        .filter(|rule| rule.is_ai_rule() && rule.enabled)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                }
+            if group.ai_rules_enabled
+                && group.enabled
+                && !group.manual_takeover
+                && message_supports_ai_rules(&job.message.kind, &job.message.text)
+            {
+                deferred_ai_rules = rules
+                    .iter()
+                    .filter(|rule| rule.is_ai_rule() && rule.enabled)
+                    .cloned()
+                    .collect::<Vec<_>>();
             }
         }
+        self.coordination.tracker.progress(work_id, 3, 4);
         let ai_reply_allowed = self
             .ai_permission(account_id, group.group_id, "reply", group.ai_enabled)
             .await;
@@ -3303,6 +3648,10 @@ impl BackendRuntime {
             && !group.manual_takeover
             && message_explicitly_mentions(&job.message, account_id, sender_id)
         {
+            let ai_work_id = runtime_lane_id("aiReply", account_id, group.group_id);
+            self.coordination
+                .tracker
+                .enqueue(&ai_work_id, "aiReply", "生成 @DH 回复", "群聊 AI");
             match ai_sender.try_send(AiReplyJob {
                 message: job.message.clone(),
             }) {
@@ -3312,6 +3661,9 @@ impl BackendRuntime {
                         mpsc::error::TrySendError::Full(_) => "群 AI 队列已满",
                         mpsc::error::TrySendError::Closed(_) => "群 AI 队列已关闭",
                     };
+                    self.coordination
+                        .tracker
+                        .reject_enqueue(&ai_work_id, reason);
                     let _ = self
                         .database
                         .record_audit(AuditEvent {
@@ -3335,27 +3687,49 @@ impl BackendRuntime {
             }
         }
         if !deferred_ai_rules.is_empty() {
-            let runtime = self.clone();
-            let app = app.clone();
-            let account_id = account_id.to_string();
-            let group = group.clone();
-            let member = member.clone();
-            let message = job.message.clone();
-            let recent_events = recent_events.clone();
-            tauri::async_runtime::spawn(async move {
-                runtime
-                    .process_ai_rules_background(
-                        app,
-                        account_id,
-                        sender_id,
-                        group,
-                        member,
-                        message,
-                        recent_events,
-                        deferred_ai_rules,
-                    )
+            let ai_rule_work_id = runtime_lane_id("aiRule", account_id, group.group_id);
+            self.coordination.tracker.enqueue(
+                &ai_rule_work_id,
+                "aiRule",
+                "AI 规则判断",
+                "群聊语义分类",
+            );
+            if let Err(error) = ai_rule_sender.try_send(AiRuleJob {
+                account_id: account_id.to_string(),
+                sender_id,
+                group: group.clone(),
+                member: member.clone(),
+                message: job.message.clone(),
+                recent_events: recent_events.clone(),
+                rules: deferred_ai_rules,
+            }) {
+                let reason = match error {
+                    mpsc::error::TrySendError::Full(_) => "AI 规则队列已满",
+                    mpsc::error::TrySendError::Closed(_) => "AI 规则队列已关闭",
+                };
+                self.coordination
+                    .tracker
+                    .reject_enqueue(&ai_rule_work_id, reason);
+                let _ = self
+                    .database
+                    .record_audit(AuditEvent {
+                        id: 0,
+                        account_id: account_id.into(),
+                        group_id: group.group_id,
+                        user_id: member.user_id,
+                        actor: "DH BOT".into(),
+                        event: "ai_rule_queue_rejected".into(),
+                        level: "warning".into(),
+                        details: serde_json::json!({
+                            "messageId": job.message.id,
+                            "status": "failed",
+                            "error": reason,
+                        })
+                        .to_string(),
+                        created_at: Utc::now(),
+                    })
                     .await;
-            });
+            }
         }
         let _ = self
             .database
@@ -3380,6 +3754,7 @@ impl BackendRuntime {
                 created_at: Utc::now(),
             })
             .await;
+        self.coordination.tracker.progress(work_id, 4, 4);
         let _ = app.emit(
             "task-progress",
             RuntimeProgress {
@@ -3462,9 +3837,14 @@ impl BackendRuntime {
         recent_events: Vec<moderation::RecentEvent>,
         ai_rules: Vec<ModerationRule>,
     ) {
-        let Ok(_permit) = self.ai_rule_gate.acquire().await else {
-            return;
-        };
+        let work_id = runtime_lane_id("aiRule", &account_id, group.group_id);
+        self.coordination.tracker.start_named(
+            &work_id,
+            "aiRule",
+            "AI 规则判断",
+            "群聊语义分类",
+            None,
+        );
         let mut categories = ai_rules
             .iter()
             .map(|rule| rule.pattern.trim().to_string())
@@ -3473,6 +3853,7 @@ impl BackendRuntime {
         categories.sort();
         categories.dedup();
         if categories.is_empty() {
+            self.coordination.tracker.finish(&work_id, "succeeded", "");
             return;
         }
         let input = moderation::ModerationInput {
@@ -3560,8 +3941,12 @@ impl BackendRuntime {
                     decision.automatic,
                 )
                 .await;
+                self.coordination.tracker.finish(&work_id, "succeeded", "");
             }
             Err(error) => {
+                self.coordination
+                    .tracker
+                    .finish(&work_id, "failed", &error.message);
                 let _ = self.database.record_audit(AuditEvent { id:0, account_id, group_id:group.group_id, user_id:member.user_id, actor:"DH BOT".into(), event:"ai_rule_failed".into(), level:"warning".into(), details:serde_json::json!({"messageId":message.id,"error":error.message,"decision":"未执行，不使用本地猜测结果","execution":"background"}).to_string(), created_at:Utc::now() }).await;
             }
         }
@@ -3869,9 +4254,18 @@ impl BackendRuntime {
                                 .await
                                 .insert(cache_key.clone());
                             if should_queue {
+                                let work_id =
+                                    runtime_lane_id("prediction", account_id, group.group_id);
+                                self.coordination.tracker.enqueue(
+                                    &work_id,
+                                    "prediction",
+                                    "生成预测说明",
+                                    "业务应用",
+                                );
                                 match self.prediction_narration_tx.try_send(
                                     PredictionNarrationJob {
                                         account_id: account_id.into(),
+                                        group_id: group.group_id,
                                         cache_key: cache_key.clone(),
                                         narration: narration.clone(),
                                         provider,
@@ -3882,6 +4276,9 @@ impl BackendRuntime {
                                         ai_error = "已返回即时统计模板；AI 润色正在后台预热".into();
                                     }
                                     Err(_) => {
+                                        self.coordination
+                                            .tracker
+                                            .reject_enqueue(&work_id, "AI 预测说明队列繁忙");
                                         self.prediction_narration_pending
                                             .lock()
                                             .await
