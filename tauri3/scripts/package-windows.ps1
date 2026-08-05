@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('production', 'developer')]
   [string]$Channel
@@ -31,21 +31,24 @@ if ($Channel -eq 'production') {
   & (Join-Path $Root 'scripts\verify-windows-production.ps1') -ArtifactDirectory $Dist
   if ($LASTEXITCODE -ne 0) { throw 'Windows 生产产物深度扫描失败' }
   $Zip = Join-Path $Root "dist\DH-BOT-$Version-windows-x64-portable.zip"
+  $PortableStage = Join-Path $Root ("dist\portable-" + [guid]::NewGuid().ToString('N'))
   Remove-Item $Zip -Force -ErrorAction SilentlyContinue
-  $PortableFiles = @(
-    (Join-Path $Dist 'DH-BOT.exe'),
-    (Join-Path $Dist 'DH-Manual-ZH.md'),
-    (Join-Path $Dist 'DH-Manual-ZH.pdf'),
-    (Join-Path $Dist 'DH-BOT-Default-Rules.json')
-  )
-  Compress-Archive -Path $PortableFiles -DestinationPath $Zip
-  $VerifyZip = Join-Path ([System.IO.Path]::GetTempPath()) ("dh-bot-production-" + [guid]::NewGuid().ToString('N'))
   try {
+    New-Item -ItemType Directory -Force -Path $PortableStage | Out-Null
+    Copy-Item (Join-Path $Dist 'DH-BOT.exe') (Join-Path $PortableStage 'DH-BOT-Portable.exe')
+    Copy-Item (Join-Path $Dist 'DH-Manual-ZH.md') $PortableStage
+    Copy-Item (Join-Path $Dist 'DH-Manual-ZH.pdf') $PortableStage
+    Copy-Item (Join-Path $Dist 'DH-BOT-Default-Rules.json') $PortableStage
+    & node (Join-Path $Root 'scripts\verify-production.mjs') $PortableStage
+    if ($LASTEXITCODE -ne 0) { throw '便携包生产隔离校验失败' }
+    Compress-Archive -Path (Join-Path $PortableStage '*') -DestinationPath $Zip
+    $VerifyZip = Join-Path ([System.IO.Path]::GetTempPath()) ("dh-bot-production-" + [guid]::NewGuid().ToString('N'))
     Expand-Archive -Path $Zip -DestinationPath $VerifyZip
     & node (Join-Path $Root 'scripts\verify-production.mjs') $VerifyZip
     if ($LASTEXITCODE -ne 0) { throw '便携包生产隔离校验失败' }
   } finally {
-    Remove-Item $VerifyZip -Recurse -Force -ErrorAction SilentlyContinue
+    if ($VerifyZip) { Remove-Item $VerifyZip -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Item $PortableStage -Recurse -Force -ErrorAction SilentlyContinue
   }
 } else {
   Copy-Item (Join-Path $Target 'dh-bot.exe') (Join-Path $Dist 'DH-BOT-Dev.exe')

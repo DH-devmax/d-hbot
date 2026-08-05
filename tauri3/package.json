@@ -29,11 +29,11 @@
     "verify:docs": "python3 ../tools/verify_docs.py && python3 ../tools/verify_repository_redaction.py",
     "tauri:build:production": "pnpm verify:production:boundary && pnpm clean:production && tauri build --features custom-protocol -- --no-default-features",
     "tauri:build:developer": "pnpm build:fixture-resource && pnpm clean:bundle && tauri build --features fixture,custom-protocol --config src-tauri/tauri.fixture.conf.json",
-    "package:windows:production": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel production",
-    "package:windows:developer": "pwsh -NoProfile -File scripts/package-windows.ps1 -Channel developer",
+    "package:windows:production": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Channel production",
+    "package:windows:developer": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Channel developer",
     "verify:production": "node scripts/verify-production.mjs",
-    "verify:windows:production": "pwsh -NoProfile -File scripts/verify-windows-production.ps1 -ArtifactDirectory dist/production",
-    "test:windows:real": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-real-machine.ps1"
+    "verify:windows:production": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-production.ps1 -ArtifactDirectory dist/production",
+    "test:windows:real": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-real-machine.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

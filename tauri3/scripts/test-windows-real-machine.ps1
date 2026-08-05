@@ -2,6 +2,7 @@
   [Parameter(Mandatory = $true)]
   [string]$Artifact,
   [string]$ExpectedSha256 = '',
+  [string]$SourceSha = '',
   [string]$OutputDirectory = '',
   [ValidateRange(10, 120)]
   [int]$StartupTimeoutSeconds = 45,
@@ -22,9 +23,14 @@ function Add-Result(
   [string]$Status,
   [string]$Detail
 ) {
+  $NormalizedStatus = switch ($Status) {
+    'passed' { 'PASS' }
+    'failed' { 'FAIL' }
+    default { 'SKIPPED' }
+  }
   $script:Results.Add([ordered]@{
     name = $Name
-    status = $Status
+    status = $NormalizedStatus
     detail = $Detail
     checkedAt = [DateTime]::UtcNow.ToString('o')
   })
@@ -34,7 +40,7 @@ function Add-Result(
     'warning' { 'Yellow' }
     default { 'Gray' }
   }
-  Write-Host ("[{0}] {1}: {2}" -f $Status.ToUpperInvariant(), $Name, $Detail) -ForegroundColor $Color
+  Write-Host ("[{0}] {1}: {2}" -f $NormalizedStatus, $Name, $Detail) -ForegroundColor $Color
 }
 
 function Get-HttpProbe([string]$Url) {
@@ -129,6 +135,7 @@ function Write-Reports([string]$Directory, [System.Collections.IDictionary]$Repo
   $Lines.Add("- Windows：$($Report.environment.osVersion)")
   $Lines.Add("- 产物：$($Report.artifact.path)")
   $Lines.Add("- SHA-256：``$($Report.artifact.sha256)``")
+  $Lines.Add("- 结果：PASS $($Report.summary.pass) / FAIL $($Report.summary.fail) / SKIPPED $($Report.summary.skipped)")
   $Lines.Add('')
   $Lines.Add('| 检查项 | 结果 | 详情 |')
   $Lines.Add('| --- | --- | --- |')
@@ -145,7 +152,44 @@ function Write-Reports([string]$Directory, [System.Collections.IDictionary]$Repo
   $Lines.Add('4. 登录旺商聊后重启 DH BOT 和旺商聊，确认原登录状态继续可用。')
   $Lines.Add('5. 退出 DH BOT 后，旺商聊继续运行，DH BOT 及其 WebView2 子进程消失。')
   $Lines | Set-Content -LiteralPath $MarkdownPath -Encoding utf8
+  $Lines | Set-Content -LiteralPath (Join-Path $Directory 'TEST-REPORT.md') -Encoding utf8
+  $Report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $Directory 'TEST-RESULTS.json') -Encoding utf8
+
+  $Report.results | ForEach-Object {
+    '[{0}] {1}: {2}' -f $_.status, $_.name, ([string]$_.detail).Replace("`r", ' ').Replace("`n", ' ')
+  } | Set-Content -LiteralPath (Join-Path $Directory 'AUTOMATED-TESTS.log') -Encoding utf8
+
+  $ProcessLines = [System.Collections.Generic.List[string]]::new()
+  $ProcessLines.Add('DH BOT final process and DevTools snapshot')
+  $ProcessLines.Add("GeneratedAt=$($Report.generatedAt)")
+  $ProcessLines.Add("StartedPid=$($Report.process.startedPid)")
+  foreach ($Item in $Report.process.relevant) {
+    $ProcessLines.Add("PID=$($Item.pid) ParentPID=$($Item.parentPid) Name=$($Item.name) Path=$($Item.path) CommandLine=$($Item.commandLine)")
+  }
+  foreach ($Probe in $Report.devtoolsFinal) {
+    $ProcessLines.Add("URL=$($Probe.url) Success=$($Probe.success) StatusCode=$($Probe.statusCode) Error=$($Probe.error)")
+  }
+  $ProcessLines | Set-Content -LiteralPath (Join-Path $Directory 'PROCESS-AND-PORTS.txt') -Encoding utf8
+
+  @(
+    "SOURCE_GIT_SHA=$($Report.sourceSha)",
+    "ARTIFACT_SHA256=$($Report.artifact.artifactSha256)  $($Report.artifact.path)",
+    "EXE_SHA256=$($Report.artifact.sha256)  $($Report.artifact.executable)"
+  ) | Set-Content -LiteralPath (Join-Path $Directory 'HASHES.txt') -Encoding ascii
+
+  $Failures = @($Report.results | Where-Object { $_.status -eq 'FAIL' })
+  if ($Failures.Count -eq 0) {
+    'No failed automated checks in this run.' | Set-Content -LiteralPath (Join-Path $Directory 'FAILURE-CONTEXT.txt') -Encoding utf8
+  } else {
+    $Failures | ForEach-Object { '[FAIL] {0}: {1}' -f $_.name, $_.detail } |
+      Set-Content -LiteralPath (Join-Path $Directory 'FAILURE-CONTEXT.txt') -Encoding utf8
+  }
+
+  $DiagnosticZip = Join-Path $Directory ('DH-BOT-Diagnostic-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.zip')
+  $DiagnosticFiles = Get-ChildItem -LiteralPath $Directory -File | Where-Object { $_.Extension -ne '.zip' }
+  Compress-Archive -LiteralPath $DiagnosticFiles.FullName -DestinationPath $DiagnosticZip
   Write-Host "报告已写入：$MarkdownPath"
+  Write-Host "诊断包已写入：$DiagnosticZip"
 }
 
 $NativeSource = @'
@@ -209,6 +253,15 @@ Add-Type -TypeDefinition $NativeSource
 
 $script:Results = [System.Collections.Generic.List[object]]::new()
 $ArtifactPath = Resolve-FullPath $Artifact
+$ArtifactHash = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($SourceSha)) {
+  $Git = Get-Command git.exe -ErrorAction SilentlyContinue
+  $GitPath = if ($Git) { $Git.Source } elseif (Test-Path -LiteralPath 'C:\Program Files\Git\cmd\git.exe') { 'C:\Program Files\Git\cmd\git.exe' } else { '' }
+  if ($GitPath) {
+    $SourceSha = (& $GitPath -C (Split-Path -Parent $Root) rev-parse HEAD 2>$null | Select-Object -First 1)
+  }
+}
+if ([string]::IsNullOrWhiteSpace($SourceSha)) { $SourceSha = 'UNKNOWN' }
 if (-not $OutputDirectory) {
   $OutputDirectory = Join-Path ([Environment]::GetFolderPath('Desktop')) ('DH-BOT-Test-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
@@ -221,18 +274,18 @@ try {
     New-Item -ItemType Directory -Force -Path $WorkingDirectory | Out-Null
     Expand-Archive -LiteralPath $ArtifactPath -DestinationPath $WorkingDirectory
     $Files = @(Get-ChildItem -LiteralPath $WorkingDirectory -File)
-    $Allowed = @('DH-BOT.exe', 'DH-Manual-ZH.md', 'DH-Manual-ZH.pdf', 'DH-BOT-Default-Rules.json')
+    $Allowed = @('DH-BOT-Portable.exe', 'DH-Manual-ZH.md', 'DH-Manual-ZH.pdf', 'DH-BOT-Default-Rules.json')
     $Unexpected = @($Files | Where-Object { $Allowed -notcontains $_.Name })
     if ($Unexpected.Count -eq 0 -and -not @(Get-ChildItem -LiteralPath $WorkingDirectory -Directory)) {
       Add-Result '便携包文件边界' 'passed' '只包含主程序、手册和默认规则'
     } else {
       Add-Result '便携包文件边界' 'failed' ('出现额外内容：' + (($Unexpected.Name) -join ', '))
     }
-    $Executable = Join-Path $WorkingDirectory 'DH-BOT.exe'
+    $Executable = Join-Path $WorkingDirectory 'DH-BOT-Portable.exe'
   }
 
   if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
-    throw "产物中缺少 DH-BOT.exe：$Executable"
+    throw "产物中缺少 DH BOT 主程序：$Executable"
   }
 
   $Hash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -266,7 +319,9 @@ try {
 
   $DevToolsBefore = @(
     (Get-HttpProbe 'http://127.0.0.1:9222/json/version'),
-    (Get-HttpProbe 'http://127.0.0.1:9222/json/list')
+    (Get-HttpProbe 'http://127.0.0.1:9222/json/list'),
+    (Get-HttpProbe 'http://127.0.0.1:9223/json/version'),
+    (Get-HttpProbe 'http://127.0.0.1:9223/json/list')
   )
   $DhProcess = $null
   $WindowBeforeMinimize = $null
@@ -275,7 +330,9 @@ try {
   $DescendantIds = @()
 
   if (-not $SkipLaunch) {
-    $ExistingDh = @(Get-Process -Name 'DH-BOT' -ErrorAction SilentlyContinue)
+    $ExistingDh = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $_.ProcessName -in @('DH-BOT', 'DH-BOT-Portable')
+    })
     if ($ExistingDh.Count -gt 0) {
       Add-Result '单实例前置状态' 'warning' "检测到已有 DH-BOT：$($ExistingDh.Id -join ', ')；请先从托盘真正退出后重测"
     } else {
@@ -345,6 +402,13 @@ try {
     } else {
       Add-Result '旺商聊 DevTools 9222' 'failed' "version=$($VersionProbe.error)；list=$($ListProbe.error)"
     }
+    $SecondaryVersionProbe = Get-HttpProbe 'http://127.0.0.1:9223/json/version'
+    $SecondaryListProbe = Get-HttpProbe 'http://127.0.0.1:9223/json/list'
+    if ($SecondaryVersionProbe.success -or $SecondaryListProbe.success) {
+      Add-Result '测试账号 DevTools 9223' 'passed' "json/version=$($SecondaryVersionProbe.statusCode)，json/list=$($SecondaryListProbe.statusCode)"
+    } else {
+      Add-Result '测试账号 DevTools 9223' 'info' '9223 当前未就绪；双账号业务测试需单独启动后确认'
+    }
 
     $RuntimeSnapshot = Get-ProcessSnapshot
     $WangProcesses = @($RuntimeSnapshot | Where-Object {
@@ -390,9 +454,26 @@ try {
     }
   }
 
+  $FinalSnapshot = Get-ProcessSnapshot
+  $RelevantProcesses = @($FinalSnapshot | Where-Object {
+    $_.name -match 'DH-BOT|msedgewebview2|wangshangliao|旺商聊' -or
+    $_.commandLine -match 'remote-debugging-port(?:=|\s+)(9222|9223)'
+  })
+  $DevToolsFinal = @(
+    (Get-HttpProbe 'http://127.0.0.1:9222/json/version'),
+    (Get-HttpProbe 'http://127.0.0.1:9222/json/list'),
+    (Get-HttpProbe 'http://127.0.0.1:9223/json/version'),
+    (Get-HttpProbe 'http://127.0.0.1:9223/json/list')
+  )
+  $FinalProcess = $null
+  if ($DhProcess) {
+    $FinalProcess = @($FinalSnapshot | Where-Object { $_.pid -eq $DhProcess.Id } | Select-Object -First 1)
+    if ($FinalProcess.Count -eq 1) { $FinalProcess = $FinalProcess[0] } else { $FinalProcess = $null }
+  }
   $Report = [ordered]@{
     schema = 1
     generatedAt = [DateTime]::UtcNow.ToString('o')
+    sourceSha = $SourceSha
     environment = [ordered]@{
       osVersion = [Environment]::OSVersion.VersionString
       edition = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -402,22 +483,34 @@ try {
     }
     artifact = [ordered]@{
       path = $ArtifactPath
+      artifactSha256 = $ArtifactHash
       executable = $Executable
       sha256 = $Hash
       size = (Get-Item -LiteralPath $Executable).Length
       signatureStatus = [string]$Signature.Status
     }
+    process = [ordered]@{
+      startedPid = if ($DhProcess) { $DhProcess.Id } else { 0 }
+      final = $FinalProcess
+      relevant = $RelevantProcesses
+    }
     devtoolsBeforeLaunch = $DevToolsBefore
+    devtoolsFinal = $DevToolsFinal
     windows = [ordered]@{
       beforeMinimize = $WindowBeforeMinimize
       minimized = $WindowMinimized
       restored = $WindowRestored
     }
+    summary = [ordered]@{
+      pass = @($script:Results | Where-Object { $_.status -eq 'PASS' }).Count
+      fail = @($script:Results | Where-Object { $_.status -eq 'FAIL' }).Count
+      skipped = @($script:Results | Where-Object { $_.status -eq 'SKIPPED' }).Count
+    }
     results = @($script:Results)
   }
   Write-Reports $OutputDirectory $Report
 
-  $Failures = @($script:Results | Where-Object { $_.status -eq 'failed' })
+  $Failures = @($script:Results | Where-Object { $_.status -eq 'FAIL' })
   if ($Failures.Count -gt 0) {
     Write-Host "实机验收发现 $($Failures.Count) 项失败，请查看报告。" -ForegroundColor Red
     exit 1

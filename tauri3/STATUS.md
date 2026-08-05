@@ -1,6 +1,6 @@
 # DH BOT 3.0 beta.1 状态
 
-技术快照（2026-08-01）：应用版本 `3.0.0-beta.1`，SQLite schema v11，生产构建
+技术快照（2026-08-06）：应用版本 `3.0.0-beta.1`，SQLite schema v12，生产构建
 `--no-default-features`，生产端点 `127.0.0.1:9222`。本文件中的测试数量是该源码快照的
 本地结果；Windows 新产物必须重新生成 SHA-256，不能复用历史包哈希。
 
@@ -9,14 +9,14 @@
 - `gpt-5.6-luna`、Responses、`xhigh` 已完成模型目录、离群调用和真实群回复验证。
 - 脱敏测试群 A 的机器规则、AI 控制规则、知识绑定/解绑、缓存和 NIM 撤回已通过。
 - 真实撤回以 `nim.recallMsg` 的 `verified` 回执及 NIM 历史回读为空为验收依据。
-- 预测逻辑通过离群回归；生产因缺少可持续开奖源凭据保持停用。
+- 预测逻辑通过离群回归；加拿大28与 PC28/北京28已接入无需 Key 的公开或官方开奖源，应用仍由管理员明确启用。
 - 完整证据见 `docs/REAL-GROUP-TEST-20260731.md`。
 
 当前 Rust + Tauri 重构的代码闭环约 **99%**，考虑尚未完成的 Windows 本地生产构建、真实旺商聊契约证据和实机 RC 验收，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、业务页面与自动化测试已落地。
 
 ## 已完成
 
-- schema v11 幂等迁移：在既有消息、outbox、知识、任务和业务应用结构上增加账号级 `ai_provider_endpoints` 与 Responses 思考深度，并增加机器/AI 规则类型、多群绑定、稳定成员白名单、独立群开关、规则评估记录和业务能力校验记录。
+- schema v12 幂等迁移：在既有消息、outbox、知识、任务和业务应用结构上增加账号级 `ai_provider_endpoints`、Responses 思考深度和短期群名片预期回调表，并增加机器/AI 规则类型、多群绑定、稳定成员白名单、独立群开关、规则评估记录和业务能力校验记录。
 - `DatabaseExecutor` 独占 `Database::open` 交付的唯一 SQLite 连接，使用 `dh-sqlite` 线程、256 有界队列、FIFO 排空和 `Shutdown` 回执。Tauri/runtime 生产路径不再持有可直接调用的同步数据库。
 - 连接、消息、名片、规则、提醒、摘要、计划和诊断桥 worker 统一监督；退出最多等待 5 秒，未确认副作归档为 `unknown`，再排空 SQLite。
 - 消息链路固定为“批量持久化 → 连续 ACK → 按群串行派发”；重复、乱序、重试、重启恢复、解码失败和未知回执可追踪。
@@ -26,9 +26,9 @@
 - 机器规则命中后直接进入 outbox，不调用模型；AI 控制规则一次请求统一判断全部语义类别。聊天模型返回的 `recall` 动作会被忽略。
 - 其他成员消息撤回使用 `nim.getHistoryMsgs` 精确定位和 `nim.recallMsg`，撤回通知作为成功依据；HTTP 业务码 `1001` 被标记为永久失败且不重试。
 - AI 仅由明确 `@DH` 或提及元数据触发；总开关、回复/任务/撤回/禁言/移出权限、最近上下文、知识分块和 `ai_runs` 已接通。
-- AI 使用持久连接池、2 秒连接/60 秒单连接生成/65 秒总预算、主备健康冷却、8 条上下文、3 条知识、Chat Completions 512 tokens / Responses 1024 tokens、10 分钟纯 FAQ 缓存和 60 秒知识命中缓存；运行审计记录缓存与分段耗时但不记录提示词或密钥。
+- AI 使用持久连接池、2 秒连接/15 秒单连接生成/20 秒总预算、主备健康冷却、每群顺序回复队列、跨群最多 2 并发、8 条上下文、3 条知识、Chat Completions 512 tokens / Responses 1024 tokens、10 分钟纯 FAQ 缓存和 60 秒知识命中缓存；运行审计记录缓存与分段耗时但不记录提示词或密钥。
 - 预测已从消息硬编码分支迁入 `BusinessAppRegistry`；默认停用，严格要求 AI `reply` 权限，完成数据新鲜度检查、确定性统计、AI 纯文字润色、模板回退与运行去重。
-- 预测数据源已替换为 ZCG 开奖契约适配器，覆盖 `pcdd/jnd/btc28/bj28/tx28`、动态配置与两组备用域名、四类字段形状、真实开奖时间、10 秒最新/60 秒历史缓存和 single-flight。没有独立 Token 时保持停用；群回复先返回即时统计模板，不等待 AI。
+- 预测数据源已替换为 `PublicLotterySource`：加拿大28优先 BCLC 官方 Keno，官方端点失败时使用公开 Keno 原始数据镜像；中国福彩网官方快乐8支持 PC28/北京28。所有结果保留真实开奖时间并明确标注 DH 派生。缓存按开奖频率调整并使用 single-flight。BTC28 与腾讯分分彩28因缺少可核验算法或官方源继续显示不可用；ZCG Token 链路仅保留为显式兼容回退。群回复先返回即时统计模板，不等待 AI。
 - 任务提醒持久 claim、每日摘要、电脑时区、跨午夜/DST 开关群计划和计划历史已完成。
 - Contract v2 包含版本/主脚本哈希、请求、双层响应、回调和标准化状态；运行时能力采用 `Supported/ManualVerification/Unavailable/Unsupported`，并记录 ZCG、Electron、NIM 或人工回执来源。
 - 生产 `CdpGateway` 使用独立能力注册表；ZCG 基线能力由启动时路由、IPC 和 NIM 只读探测逐项决定，未知版本仅在结构不一致时降为 `Unavailable` 或 `ManualVerification`。旺商聊专有写能力继续按 Contract v2 与写后回读证据开放。Fixture 校准表不会编入生产包。
@@ -51,8 +51,8 @@
 
 ## 当前验证
 
-- `cargo test --no-default-features`：核心库 186 项通过、1 项需要临时 AI 环境的 live test 默认忽略；另有 20 项真实 macOS 旺商聊测试按显式环境变量保持忽略。覆盖 schema v11、多 Provider 与思考深度迁移、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备 503 切换、提示词预算、缓存边界、ZCG 数据形状、真实时间、single-flight 与缓存校验。
-- `cargo test --features fixture`：核心库 192 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过，24 项真实 macOS AI/旺商聊测试按显式环境变量保持忽略。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
+- `cargo test --no-default-features`：核心库 202 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v12、多 Provider 与思考深度迁移、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、single-flight 与缓存校验。
+- `cargo test --features fixture`：核心库 208 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
 - 群公告发布语义已固定为 `add-notice → 按新 noticeId 回读 → NIM 广播`，每次明确发布都会新增历史；`notice-opt` 仅保留给明确选择旧公告后的编辑流程。
 - 两套 `cargo clippy --all-targets -- -D warnings` 通过。
 - `pnpm test`：58 项 RTL/Vitest 通过，包含业务应用、多 Provider 离群测试、批量群控、机器/AI 规则、知识、审计汉化、调试诊断包和消息游标分页回归测试。

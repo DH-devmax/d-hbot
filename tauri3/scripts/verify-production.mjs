@@ -64,18 +64,18 @@ if (!rootStat?.isDirectory()) throw new Error(`生产产物目录不存在：${r
 const productionFiles = await files(root)
 if (!productionFiles.length) throw new Error('生产产物目录为空')
 
-const mainExecutable = productionFiles.find(file => /^DH-BOT\.exe$/i.test(path.basename(file)))
+const mainExecutable = productionFiles.find(file => /^DH-BOT(?:-Portable)?\.exe$/i.test(path.basename(file)))
 if (mainExecutable) {
   const executableContent = await readFile(mainExecutable)
   const subsystem = peSubsystem(executableContent)
   if (subsystem === null) {
-    throw new Error('DH-BOT.exe 不是有效的 Windows PE 可执行文件')
+    throw new Error(`${path.basename(mainExecutable)} 不是有效的 Windows PE 可执行文件`)
   }
   if (subsystem !== 2) {
-    throw new Error(`DH-BOT.exe 不是 Windows GUI 子系统（Subsystem=${subsystem}），将显示 CMD 窗口`)
+    throw new Error(`${path.basename(mainExecutable)} 不是 Windows GUI 子系统（Subsystem=${subsystem}），将显示 CMD 窗口`)
   }
   if (!executableContent.includes(Buffer.from('/assets/index-'))) {
-    throw new Error('DH-BOT.exe 没有内嵌 Tauri 前端资源，请使用 custom-protocol 生产构建')
+    throw new Error(`${path.basename(mainExecutable)} 没有内嵌 Tauri 前端资源，请使用 custom-protocol 生产构建`)
   }
 }
 
@@ -95,6 +95,6 @@ for (const file of productionFiles) {
   }
 }
 
-const executable = productionFiles.some(file => /DH-BOT(?:\.exe)?$/i.test(path.basename(file)))
+const executable = productionFiles.some(file => /^DH-BOT(?:-Portable)?\.exe$/i.test(path.basename(file)))
 if (requireExecutable && !executable) throw new Error('生产目录中没有 DH-BOT 主程序')
 console.log(`生产产物隔离检查通过：${productionFiles.length} 个文件`)
