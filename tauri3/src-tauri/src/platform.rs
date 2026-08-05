@@ -887,6 +887,10 @@ pub async fn start(
             stop_process(process)?;
         }
     }
+    let previous_pids = processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
     if let Ok(Some(detail)) = migrate_login_partition() {
         profile_detail.push_str(&detail);
     }
@@ -899,20 +903,30 @@ pub async fn start(
         ])
         .env("DH_WSL_PARTITION", "dh-primary")
         .creation_flags(0x08000000);
-    let child = command.spawn().map_err(|error| {
-        AppError::new("wangshangliao_start", format!("启动旺商聊失败：{error}"))
-    })?;
+    let spawned_pid = match command.spawn() {
+        Ok(child) => Some(child.id()),
+        Err(error) if error.raw_os_error() == Some(740) => {
+            launch_wang_elevated(&image_path, port)?;
+            None
+        }
+        Err(error) => {
+            return Err(AppError::new(
+                "wangshangliao_start",
+                format!("启动旺商聊失败：{error}"),
+            ))
+        }
+    };
     let file_version = image_file_version(&image_path).unwrap_or_default();
     let image_sha256 = sha256_file(&image_path).unwrap_or_default();
     let created_at = format_system_time(SystemTime::now());
-    let started = ProcessRef {
-        pid: child.id(),
+    let fallback_process = spawned_pid.map(|pid| ProcessRef {
+        pid,
         image_path: image_path.to_string_lossy().into(),
         started_at: created_at.clone(),
         creation_time: created_at,
         file_version,
         sha256: image_sha256,
-    };
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
         let connection = inspect(&devtools)
@@ -922,7 +936,11 @@ pub async fn start(
             connection.as_str(),
             "ready" | "devtools-ready" | "nim-not-ready"
         ) {
-            activate(started.pid)?;
+            let started = find_started_process(&image_path, &previous_pids, spawned_pid)?
+                .or_else(|| fallback_process.clone());
+            if let Some(process) = &started {
+                activate(process.pid)?;
+            }
             return Ok(WangStartResult {
                 status: connection.clone(),
                 detail: if connection == "ready" {
@@ -934,18 +952,73 @@ pub async fn start(
                 },
                 needs_confirmation: false,
                 maintenance_request_id: None,
-                process: Some(started),
+                process: started,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let started =
+        find_started_process(&image_path, &previous_pids, spawned_pid)?.or(fallback_process);
     Ok(WangStartResult {
         status: "started-waiting".into(),
         detail: format!("旺商聊进程已启动，但 DevTools 尚未响应。{profile_detail}"),
         needs_confirmation: false,
         maintenance_request_id: None,
-        process: Some(started),
+        process: started,
     })
+}
+
+#[cfg(windows)]
+fn launch_wang_elevated(image_path: &Path, port: &str) -> AppResult<()> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = wide("runas");
+    let file = wide(image_path.as_os_str());
+    let parameters = wide(format!(
+        "--remote-debugging-port={port} --remote-allow-origins=http://127.0.0.1:{port}"
+    ));
+    let directory = image_path
+        .parent()
+        .map(|value| wide(value.as_os_str()))
+        .unwrap_or_default();
+    let result = unsafe {
+        ShellExecuteW(
+            0 as HWND,
+            verb.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            directory.as_ptr(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as usize <= 32 {
+        return Err(AppError::new(
+            "wangshangliao_elevation",
+            "旺商聊需要管理员权限，但提升请求未完成",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn find_started_process(
+    image_path: &Path,
+    previous_pids: &[u32],
+    spawned_pid: Option<u32>,
+) -> AppResult<Option<ProcessRef>> {
+    let processes = list_processes(image_path)?;
+    Ok(processes
+        .iter()
+        .find(|process| Some(process.pid) == spawned_pid)
+        .cloned()
+        .or_else(|| {
+            processes
+                .into_iter()
+                .filter(|process| !previous_pids.contains(&process.pid))
+                .max_by(|left, right| left.creation_time.cmp(&right.creation_time))
+        }))
 }
 
 #[cfg(windows)]

@@ -11,6 +11,8 @@ DH BOT 的预测层只把已确认的数据适配器编译进 EXE，并在回复
 
 ZCG 中确认的是开奖与历史数据契约，不是直接输出结论的“预测接口”。当前已整理 `pcdd`、`jnd`、`btc28`、`bj28`、`tx28` 五个请求名称，以及 `issue/kjcodes/time`、`expect/opencode/opentime`、`preDrawIssue/preDrawCode/preDrawTime`、`full_expect/open_code/open_time` 四类响应字段。动态配置中的旧主机已经失效，`gsdatas` 与 `mbf52` 备用服务仍要求 Token。
 
-DH BOT 不复用 ZCG 登录 Token。开发环境可通过临时 `DH_PREDICTION_TOKEN` 验证脱敏契约；没有独立、可持续凭据时，生产预测应用保持停用。旧网页抓取和通用正则适配器已经移除。
+DH BOT 不复用 ZCG 登录 Token。当前生产适配器已改为公开源优先：加拿大28先读取 BCLC 官方 Keno 年度开奖文件，官方端点临时不可达时回退到公开 Keno 原始数据镜像；PC28/北京28读取中国福彩网官方快乐8结果，并由 DH 按公开规则派生三位数。来源页、原始开奖时间和派生边界都会显示在健康状态中。
+
+比特币28虽可读取公开区块数据，但目前没有统一、可核验的官方 28 派生算法；腾讯分分彩28也没有找到可核验的官方公开开奖源。这两项保持“不可用”，不会用网页抓取、随机值或本机时间伪装结果。`DH_PREDICTION_TOKEN` 只保留为旧 ZCG 契约的显式兼容回退。
 
 完整校验和见 `ZCG-REFERENCE-SHA256.txt`。发布包只携带 `DH-BOT-Default-Rules.json`，该文件是 DH BOT 群管规则模板，只保留经验上兼容的规则行为。
