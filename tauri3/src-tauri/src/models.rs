@@ -243,6 +243,12 @@ pub struct EffectOutboxItem {
     pub created_at: DateTime<Utc>,
     pub claimed_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub priority: i64,
+    pub lane: String,
+    pub order_key: Option<String>,
+    pub correlation_id: String,
+    pub origin: String,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

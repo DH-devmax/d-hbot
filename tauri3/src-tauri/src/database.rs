@@ -1670,10 +1670,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 13 {
+    if old_version > 14 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v13"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v14"),
         ));
     }
     let transaction = connection
@@ -1883,8 +1883,49 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
             [],
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    // ── v14：effect_outbox 扩展列 + 索引 + 保留策略表 ──────────────────────────
+    // 所有变更均为纯增量，零行为改动；已有行从列默认值获得对应值。
+    for (table, column, definition) in [
+        ("effect_outbox", "priority",       "INTEGER NOT NULL DEFAULT 100"),
+        ("effect_outbox", "lane",           "TEXT NOT NULL DEFAULT 'default'"),
+        ("effect_outbox", "order_key",      "TEXT"),
+        ("effect_outbox", "correlation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("effect_outbox", "origin",         "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("effect_outbox", "expires_at",     "TEXT"),
+    ] {
+        add_column_if_missing(&transaction, table, column, definition).map_err(|error| {
+            AppError::new(
+                "database_migration",
+                format!("补齐 {table}.{column} 失败：{error}"),
+            )
+        })?;
+    }
     transaction
-        .execute_batch("PRAGMA user_version = 13;")
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS retention_policies (
+               table_name  TEXT    NOT NULL PRIMARY KEY,
+               max_days    INTEGER NOT NULL DEFAULT 90,
+               max_rows    INTEGER NOT NULL DEFAULT 100000,
+               batch_size  INTEGER NOT NULL DEFAULT 500,
+               enabled     INTEGER NOT NULL DEFAULT 1,
+               updated_at  TEXT    NOT NULL
+             );
+             INSERT OR IGNORE INTO retention_policies(table_name,max_days,max_rows,batch_size,enabled,updated_at) VALUES
+               ('messages',        90,  200000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('audit_events',   180,  100000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('effect_outbox',   30,   50000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('gateway_inbox',   14,   50000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('rule_evaluations',60,  100000, 500, 1, '2026-01-01T00:00:00Z');
+             CREATE INDEX IF NOT EXISTS audit_events_account_time_idx ON audit_events(account_id, created_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS effect_outbox_claim_idx ON effect_outbox(state, priority, created_at, id);
+             CREATE INDEX IF NOT EXISTS effect_outbox_order_key_idx ON effect_outbox(order_key, state) WHERE order_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS messages_account_group_time_idx ON messages(account_id, group_id, received_at DESC);
+             CREATE INDEX IF NOT EXISTS gateway_inbox_account_time_idx ON gateway_inbox(account_id, received_at);
+             CREATE INDEX IF NOT EXISTS rule_evaluations_account_time_idx ON rule_evaluations(account_id, created_at);",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 14;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -3363,7 +3404,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let ids = {
                 let mut statement = transaction.prepare(
-                    "SELECT id FROM effect_outbox WHERE (?1 IS NULL OR account_id=?1) AND state IN ('queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?2) ORDER BY created_at,id LIMIT ?3",
+                    "SELECT id FROM effect_outbox WHERE (?1 IS NULL OR account_id=?1) AND state IN ('queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?2) ORDER BY priority,created_at,id LIMIT ?3",
                 )?;
                 let result = statement
                     .query_map(
@@ -3381,7 +3422,7 @@ impl Database {
                 )?;
                 if changed == 1 {
                     claimed.push(transaction.query_row(
-                        "SELECT id,account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,receipt_json,created_at,claimed_at,completed_at FROM effect_outbox WHERE id=?",
+                    "SELECT id,account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,receipt_json,created_at,claimed_at,completed_at,priority,lane,order_key,correlation_id,origin,expires_at FROM effect_outbox WHERE id=?",
                         params![id],
                         effect_outbox_from_row,
                     )?);
@@ -3969,6 +4010,12 @@ fn effect_outbox_from_row(row: &Row<'_>) -> rusqlite::Result<EffectOutboxItem> {
         created_at: parse_time(row.get(11)?),
         claimed_at: optional_time(row.get(12)?),
         completed_at: optional_time(row.get(13)?),
+        priority: row.get(14)?,
+        lane: row.get(15)?,
+        order_key: row.get(16)?,
+        correlation_id: row.get(17)?,
+        origin: row.get(18)?,
+        expires_at: optional_time(row.get(19)?),
     })
 }
 
@@ -4056,7 +4103,7 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 13);
+        assert_eq!(status.schema_version, 14);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
@@ -4413,7 +4460,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 13);
+        assert_eq!(database.status().unwrap().schema_version, 14);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -4441,7 +4488,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 13);
+        assert_eq!(reopened.status().unwrap().schema_version, 14);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -4473,7 +4520,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 13);
+        assert_eq!(database.status().unwrap().schema_version, 14);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -4512,7 +4559,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 13);
+            assert_eq!(database.status().unwrap().schema_version, 14);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -4526,8 +4573,7 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 13);
-            assert_eq!(
+            assert_eq!(reopened.status().unwrap().schema_version, 14);            assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1
             );
@@ -4566,9 +4612,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 13);
-
-        // 未发出的提醒必须继续生效，否则升级后就静默失效了。
+        assert_eq!(database.status().unwrap().schema_version, 14);
         let (enabled, next_run_at, local_time): (i64, Option<String>, String) = database
             .with_connection(|connection| {
                 connection.query_row(

@@ -2,7 +2,7 @@
 
 DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管理工作台。
 
-当前源码技术快照：应用版本 `3.0.0-beta.1`，SQLite schema v13，生产端点
+当前源码技术快照：应用版本 `3.0.0-beta.1`，SQLite schema v14，生产端点
 `127.0.0.1:9222`，默认 AI 模型 `deepseek-v4-pro`。
 
 3.0 代码位于 [`tauri3/`](tauri3/)，Rust/Tauri 是当前唯一活动架构。正式程序不包含 Go 运行时、Go sidecar 或 Go 构建入口。旧 Go 2.7 实现只作为只读架构参考，可通过 `go-2.7-final` 标签或 [`archive/go-2.7-final/`](archive/go-2.7-final/) 中的源码 ZIP 查阅，不参与任何生产构建。
@@ -12,7 +12,7 @@ DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管
 - 多群组与成员同步，以 `groupId` 识别群，以 `userId` / `nimId` 识别成员。
 - 确定性群管规则、群名片、黑名单、知识库、AI 回复、任务、每日摘要和定时开关群。
 - AI 群回复只由明确 `@DH` 或旺商聊提及元数据触发。
-- SQLite schema v13，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
+- SQLite schema v14，有序 inbox、幂等 outbox、动作回执归档、重启恢复和完整审计。
 - Windows 托盘、单实例、旺商聊 DevTools 启动、固定登录分区和 UAC 维护流程。
 
 ## 本地构建与测试
@@ -55,7 +55,7 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 - `docs/ARCHITECTURE.md`：React、Tauri、Rust、SQLite 与 CDP/NIM 数据流。
 - `docs/TECHNICAL-DESIGN.md`：模块地图、消息流水线、执行器、outbox、AI 和发布门禁。
 - `docs/API-REFERENCE.md`：生产 Tauri commands、事件通道、权限和开发命令隔离边界。
-- `docs/DATABASE-SCHEMA.md`：schema v13 表、身份约束、状态恢复和备份边界。
+- `docs/DATABASE-SCHEMA.md`：schema v14 表、身份约束、状态恢复和备份边界。
 - `docs/PROTOCOL-CONTRACT.md`：ZCG 基线、旺商聊专有协议、能力探测和回执错误分类。
 - `docs/FEATURE-CATALOG.md`：功能入口、命令、默认开关、权限和能力状态。
 - `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互和测试规范。
