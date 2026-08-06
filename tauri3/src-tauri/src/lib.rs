@@ -22,6 +22,7 @@ mod moderation;
 mod paths;
 mod platform;
 mod prediction;
+mod queue_kernel;
 mod repository;
 mod runtime;
 mod runtime_work;
