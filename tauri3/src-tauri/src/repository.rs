@@ -2,12 +2,12 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 
-use crate::database::{Database, DatabaseExecutor};
+use crate::database::Database;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ActionRecord, AuditEvent, DailySummary, GroupAiPermissions, GroupSchedule, KnowledgeBase,
-    KnowledgeBinding, KnowledgeChunk, KnowledgeDocument, Message, ModerationRule, RuleAction,
-    ScheduleRun, TaskItem, UniqueRun,
+    ActionRecord, Activity, ActivityRun, AuditEvent, DailySummary, DueActivityRun,
+    GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeChunk,
+    KnowledgeDocument, Message, ModerationRule, RuleAction, ScheduleRun, TaskItem, UniqueRun,
 };
 
 impl Database {
@@ -153,13 +153,6 @@ impl Database {
             rows.collect::<Result<Vec<_>, _>>()
         })
         .map_err(|error| AppError::new("messages_query", error.to_string()))
-    }
-
-    pub fn mark_message_processed(&self, id: i64, acknowledged: bool) -> AppResult<()> {
-        if acknowledged {
-            self.mark_message_acknowledged(id)?;
-        }
-        self.finish_message_processing(id, true, "")
     }
 
     pub fn recent_messages(
@@ -657,6 +650,297 @@ impl Database {
         .map_err(|error| AppError::new("task_delete", error.to_string()))
     }
 
+    pub fn list_activities(
+        &self,
+        account_id: &str,
+        include_deleted: bool,
+    ) -> AppResult<Vec<Activity>> {
+        self.with_connection(|connection| {
+            let mut activities = {
+                let mut statement = connection.prepare(
+                    "SELECT id,account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,deleted_at,created_at,updated_at FROM activities WHERE account_id=? AND (?2=1 OR deleted_at IS NULL) ORDER BY enabled DESC,updated_at DESC,id DESC",
+                )?;
+                let rows = statement
+                    .query_map(params![account_id, bool_i(include_deleted)], activity_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            for activity in &mut activities {
+                hydrate_activity(connection, activity)?;
+            }
+            Ok(activities)
+        })
+        .map_err(|error| AppError::new("activities_read", error.to_string()))
+    }
+
+    pub fn activity(&self, account_id: &str, activity_id: i64) -> AppResult<Option<Activity>> {
+        self.with_connection(|connection| {
+            let mut activity = connection
+                .query_row(
+                    "SELECT id,account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,deleted_at,created_at,updated_at FROM activities WHERE account_id=? AND id=?",
+                    params![account_id, activity_id],
+                    activity_from_row,
+                )
+                .optional()?;
+            if let Some(value) = &mut activity {
+                hydrate_activity(connection, value)?;
+            }
+            Ok(activity)
+        })
+        .map_err(|error| AppError::new("activity_read", error.to_string()))
+    }
+
+    pub fn save_activity(&self, activity: &Activity) -> AppResult<i64> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            let weekdays = serde_json::to_string(&activity.weekdays)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let activity_id = if activity.id > 0 {
+                let changed = transaction.execute(
+                    "UPDATE activities SET name=?,content=?,enabled=?,ai_optimize=?,ai_instructions=?,timezone=?,start_date=?,end_date=?,weekdays_json=?,next_run_at=?,source_key=?,deleted_at=?,updated_at=? WHERE id=? AND account_id=?",
+                    params![activity.name,activity.content,bool_i(activity.enabled),bool_i(activity.ai_optimize),activity.ai_instructions,activity.timezone,activity.start_date,activity.end_date,weekdays,activity.next_run_at.map(|value|value.to_rfc3339()),activity.source_key,activity.deleted_at.map(|value|value.to_rfc3339()),now,activity.id,activity.account_id],
+                )?;
+                if changed != 1 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                activity.id
+            } else {
+                transaction.execute(
+                    "INSERT INTO activities(account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![activity.account_id,activity.name,activity.content,bool_i(activity.enabled),bool_i(activity.ai_optimize),activity.ai_instructions,activity.timezone,activity.start_date,activity.end_date,weekdays,activity.next_run_at.map(|value|value.to_rfc3339()),activity.source_key,activity.deleted_at.map(|value|value.to_rfc3339()),now,now],
+                )?;
+                transaction.last_insert_rowid()
+            };
+            transaction.execute("DELETE FROM activity_groups WHERE activity_id=?", params![activity_id])?;
+            transaction.execute("DELETE FROM activity_times WHERE activity_id=?", params![activity_id])?;
+            for group_id in &activity.group_ids {
+                transaction.execute(
+                    "INSERT INTO activity_groups(activity_id,account_id,group_id) VALUES(?,?,?)",
+                    params![activity_id, activity.account_id, group_id],
+                )?;
+            }
+            for local_time in &activity.send_times {
+                transaction.execute(
+                    "INSERT INTO activity_times(activity_id,local_time) VALUES(?,?)",
+                    params![activity_id, local_time],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(activity_id)
+        })
+        .map_err(|error| AppError::new("activity_write", error.to_string()))
+    }
+
+    pub fn save_activity_once(&self, activity: &Activity, source_key: &str) -> AppResult<i64> {
+        if source_key.trim().is_empty() {
+            return self.save_activity(activity);
+        }
+        if let Some(id) = self
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT id FROM activities WHERE account_id=? AND source_key=?",
+                        params![activity.account_id, source_key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
+            .map_err(|error| AppError::new("activity_read", error.to_string()))?
+        {
+            return Ok(id);
+        }
+        let mut value = activity.clone();
+        value.source_key = source_key.to_string();
+        match self.save_activity(&value) {
+            Ok(id) => Ok(id),
+            Err(error) if error.message.contains("UNIQUE constraint failed") => self
+                .with_connection(|connection| {
+                    connection.query_row(
+                        "SELECT id FROM activities WHERE account_id=? AND source_key=?",
+                        params![value.account_id, source_key],
+                        |row| row.get(0),
+                    )
+                })
+                .map_err(|read_error| AppError::new("activity_read", read_error.to_string())),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn delete_activity(&self, account_id: &str, activity_id: i64) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE activities SET enabled=0,next_run_at=NULL,deleted_at=?,updated_at=? WHERE id=? AND account_id=?",
+                params![now, now, activity_id, account_id],
+            )
+        })
+        .map(|_| ())
+        .map_err(|error| AppError::new("activity_delete", error.to_string()))
+    }
+
+    pub fn list_activity_runs(
+        &self,
+        account_id: &str,
+        activity_id: Option<i64>,
+        limit: usize,
+    ) -> AppResult<Vec<ActivityRun>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id,activity_id,account_id,group_id,scheduled_for,run_key,state,text,content_source,attempts,next_retry_at,last_error,created_at,updated_at,completed_at FROM activity_runs WHERE account_id=? AND (?2 IS NULL OR activity_id=?2) ORDER BY scheduled_for DESC,id DESC LIMIT ?3",
+            )?;
+            let rows = statement
+                .query_map(params![account_id, activity_id, limit.clamp(1, 500) as i64], activity_run_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .map_err(|error| AppError::new("activity_runs_read", error.to_string()))
+    }
+
+    pub fn generate_due_activity_runs(
+        &self,
+        account_id: &str,
+        now: DateTime<Utc>,
+        grace_minutes: i64,
+        limit: usize,
+    ) -> AppResult<usize> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let mut activities = {
+                let mut statement = transaction.prepare(
+                    "SELECT id,account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,deleted_at,created_at,updated_at FROM activities WHERE account_id=? AND enabled=1 AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at<=? ORDER BY next_run_at,id LIMIT ?",
+                )?;
+                let rows = statement
+                    .query_map(params![account_id, now.to_rfc3339(), limit.clamp(1, 100) as i64], activity_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut created = 0usize;
+            for activity in &mut activities {
+                hydrate_activity(&transaction, activity)?;
+                let Some(scheduled_for) = activity.next_run_at else { continue };
+                let missed = scheduled_for < now - chrono::Duration::minutes(grace_minutes.max(0));
+                let state = if missed { "missed" } else { "pending" };
+                for group_id in &activity.group_ids {
+                    let run_key = crate::activities::scheduled_run_key(activity.id, *group_id, scheduled_for);
+                    created += transaction.execute(
+                        "INSERT OR IGNORE INTO activity_runs(activity_id,account_id,group_id,scheduled_for,run_key,state,last_error,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        params![activity.id,activity.account_id,group_id,scheduled_for.to_rfc3339(),run_key,state,if missed { "missed_schedule_window" } else { "" },now.to_rfc3339(),now.to_rfc3339(),if missed { Some(now.to_rfc3339()) } else { None }],
+                    )?;
+                }
+                let next = crate::activities::next_occurrence(activity, scheduled_for)
+                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.message))?;
+                transaction.execute(
+                    "UPDATE activities SET next_run_at=?,updated_at=? WHERE id=?",
+                    params![next.map(|value|value.to_rfc3339()),now.to_rfc3339(),activity.id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(created)
+        })
+        .map_err(|error| AppError::new("activity_schedule_generate", error.to_string()))
+    }
+
+    pub fn claim_activity_preparations(
+        &self,
+        account_id: &str,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> AppResult<Vec<DueActivityRun>> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let runs = {
+                let mut statement = transaction.prepare(
+                    "SELECT id,activity_id,account_id,group_id,scheduled_for,run_key,state,text,content_source,attempts,next_retry_at,last_error,created_at,updated_at,completed_at FROM activity_runs WHERE account_id=? AND state IN ('pending','retry') AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY scheduled_for,id LIMIT ?",
+                )?;
+                let rows = statement
+                    .query_map(params![account_id, now.to_rfc3339(), limit.clamp(1, 20) as i64], activity_run_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut claimed = Vec::new();
+            for mut run in runs {
+                let changed = transaction.execute(
+                    "UPDATE activity_runs SET state='preparing',attempts=attempts+1,next_retry_at=NULL,last_error='',updated_at=? WHERE id=? AND state IN ('pending','retry')",
+                    params![now.to_rfc3339(),run.id],
+                )?;
+                if changed != 1 { continue; }
+                run.state = "preparing".into();
+                run.attempts += 1;
+                let mut activity = transaction.query_row(
+                    "SELECT id,account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,deleted_at,created_at,updated_at FROM activities WHERE id=?",
+                    params![run.activity_id],
+                    activity_from_row,
+                )?;
+                hydrate_activity(&transaction, &mut activity)?;
+                claimed.push(DueActivityRun { run, activity });
+            }
+            transaction.commit()?;
+            Ok(claimed)
+        })
+        .map_err(|error| AppError::new("activity_run_claim", error.to_string()))
+    }
+
+    pub fn create_activity_runs_now(
+        &self,
+        activity: &Activity,
+        now: DateTime<Utc>,
+        token: &str,
+    ) -> AppResult<usize> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let mut created = 0usize;
+            for group_id in &activity.group_ids {
+                let run_key = format!("activity:{}:{}:manual:{}", activity.id, group_id, token);
+                created += transaction.execute(
+                    "INSERT OR IGNORE INTO activity_runs(activity_id,account_id,group_id,scheduled_for,run_key,state,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)",
+                    params![activity.id,activity.account_id,group_id,now.to_rfc3339(),run_key,now.to_rfc3339(),now.to_rfc3339()],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(created)
+        })
+        .map_err(|error| AppError::new("activity_publish_now", error.to_string()))
+    }
+
+    pub fn finish_activity_run(&self, run_id: i64, state: &str, error: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE activity_runs SET state=?,last_error=?,next_retry_at=NULL,completed_at=?,updated_at=? WHERE id=?",
+                params![state,error,Utc::now().to_rfc3339(),Utc::now().to_rfc3339(),run_id],
+            )?;
+            Ok(())
+        })
+        .map_err(|write_error| AppError::new("activity_run_finish", write_error.to_string()))
+    }
+
+    pub fn activity_context(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        limit: usize,
+    ) -> AppResult<(Vec<Activity>, Vec<ActivityRun>)> {
+        self.with_connection(|connection| {
+            let mut activities = {
+                let mut statement = connection.prepare(
+                    "SELECT a.id,a.account_id,a.name,a.content,a.enabled,a.ai_optimize,a.ai_instructions,a.timezone,a.start_date,a.end_date,a.weekdays_json,a.next_run_at,a.source_key,a.deleted_at,a.created_at,a.updated_at FROM activities a JOIN activity_groups g ON g.activity_id=a.id WHERE a.account_id=? AND g.group_id=? AND a.enabled=1 AND a.deleted_at IS NULL ORDER BY a.next_run_at,a.id LIMIT ?",
+                )?;
+                let rows = statement.query_map(params![account_id,group_id,limit.clamp(1,20) as i64],activity_from_row)?.collect::<Result<Vec<_>,_>>()?;
+                rows
+            };
+            for activity in &mut activities { hydrate_activity(connection, activity)?; }
+            let runs = {
+                let mut statement = connection.prepare(
+                    "SELECT id,activity_id,account_id,group_id,scheduled_for,run_key,state,text,content_source,attempts,next_retry_at,last_error,created_at,updated_at,completed_at FROM activity_runs WHERE account_id=? AND group_id=? AND state='succeeded' ORDER BY scheduled_for DESC,id DESC LIMIT ?",
+                )?;
+                let rows = statement.query_map(params![account_id,group_id,limit.clamp(1,20) as i64],activity_run_from_row)?.collect::<Result<Vec<_>,_>>()?;
+                rows
+            };
+            Ok((activities,runs))
+        })
+        .map_err(|error| AppError::new("activity_context_read", error.to_string()))
+    }
+
     pub fn save_daily_summary(&self, summary: &DailySummary) -> AppResult<i64> {
         self.with_connection(|connection| {
             connection.execute("INSERT INTO daily_summaries(account_id,group_id,local_date,content,source,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,group_id,local_date) DO UPDATE SET content=excluded.content,source=excluded.source,created_at=excluded.created_at",params![summary.account_id,summary.group_id,summary.local_date,summary.content,summary.source,summary.created_at.to_rfc3339()])?;
@@ -690,6 +974,23 @@ impl Database {
             finish_unique_run(
                 connection, "ai_runs", account_id, None, run_key, success, error,
             )
+        })
+        .map_err(|error| AppError::new("ai_run_finish", error.to_string()))
+    }
+
+    pub fn fail_ai_run_terminal(
+        &self,
+        account_id: &str,
+        run_key: &str,
+        error: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE ai_runs SET state='failed',completed_at=?,next_retry_at=NULL,last_error=?,updated_at=? WHERE account_id=? AND run_key=? AND state='processing'",
+                params![now, error, now, account_id, run_key],
+            )?;
+            Ok(())
         })
         .map_err(|error| AppError::new("ai_run_finish", error.to_string()))
     }
@@ -1021,282 +1322,70 @@ impl Database {
     }
 }
 
-impl DatabaseExecutor {
-    pub(crate) async fn query_messages(
-        &self,
-        query: crate::MessageQuery,
-    ) -> AppResult<Vec<Message>> {
-        self.execute(move |database| database.query_messages(&query))
-            .await
-    }
+fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<Activity> {
+    let weekdays_json: String = row.get(10)?;
+    Ok(Activity {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        name: row.get(2)?,
+        content: row.get(3)?,
+        enabled: row.get::<_, i64>(4)? != 0,
+        ai_optimize: row.get::<_, i64>(5)? != 0,
+        ai_instructions: row.get(6)?,
+        timezone: row.get(7)?,
+        start_date: row.get(8)?,
+        end_date: row.get(9)?,
+        weekdays: serde_json::from_str(&weekdays_json).unwrap_or_default(),
+        send_times: Vec::new(),
+        group_ids: Vec::new(),
+        next_run_at: optional_time(row.get(11)?),
+        source_key: row.get(12)?,
+        deleted_at: optional_time(row.get(13)?),
+        created_at: parse_time(row.get(14)?),
+        updated_at: parse_time(row.get(15)?),
+    })
+}
 
-    pub async fn archive_effect_dispatch(
-        &self,
-        outbox_id: i64,
-        status: String,
-        error: String,
-        receipt_json: String,
-        action: Option<ActionRecord>,
-        audit: AuditEvent,
-    ) -> AppResult<bool> {
-        self.execute(move |database| {
-            database.archive_effect_dispatch(
-                outbox_id,
-                &status,
-                &error,
-                &receipt_json,
-                action.as_ref(),
-                &audit,
-            )
-        })
-        .await
-    }
+fn hydrate_activity(connection: &Connection, activity: &mut Activity) -> rusqlite::Result<()> {
+    activity.group_ids = {
+        let mut statement = connection.prepare(
+            "SELECT group_id FROM activity_groups WHERE activity_id=? ORDER BY group_id",
+        )?;
+        let rows = statement
+            .query_map(params![activity.id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    activity.send_times = {
+        let mut statement = connection.prepare(
+            "SELECT local_time FROM activity_times WHERE activity_id=? ORDER BY local_time",
+        )?;
+        let rows = statement
+            .query_map(params![activity.id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    Ok(())
+}
 
-    pub async fn set_setting(&self, key: String, value: String, sensitive: bool) -> AppResult<()> {
-        self.execute(move |database| database.set_setting(&key, &value, sensitive))
-            .await
-    }
-
-    pub async fn set_group_features(
-        &self,
-        account_id: String,
-        group_id: i64,
-        enabled: bool,
-        ai_enabled: bool,
-        moderation_enabled: bool,
-        manual_takeover: bool,
-    ) -> AppResult<()> {
-        self.execute(move |database| {
-            database.set_group_features(
-                &account_id,
-                group_id,
-                enabled,
-                ai_enabled,
-                moderation_enabled,
-                manual_takeover,
-            )
-        })
-        .await
-    }
-
-    pub async fn set_group_rule_features(
-        &self,
-        account_id: String,
-        group_id: i64,
-        machine_enabled: bool,
-        ai_enabled: bool,
-    ) -> AppResult<()> {
-        self.execute(move |database| {
-            database.set_group_rule_features(&account_id, group_id, machine_enabled, ai_enabled)
-        })
-        .await
-    }
-
-    pub async fn set_group_welcome(
-        &self,
-        account_id: String,
-        group_id: i64,
-        welcome_message: String,
-    ) -> AppResult<()> {
-        self.execute(move |database| {
-            database.set_group_welcome(&account_id, group_id, &welcome_message)
-        })
-        .await
-    }
-
-    pub async fn save_group_ai_permissions(&self, value: GroupAiPermissions) -> AppResult<()> {
-        self.execute(move |database| database.save_group_ai_permissions(&value))
-            .await
-    }
-
-    pub async fn save_rule(&self, rule: ModerationRule) -> AppResult<i64> {
-        self.execute(move |database| database.save_rule(&rule))
-            .await
-    }
-
-    pub async fn delete_rule(&self, account_id: String, rule_id: i64) -> AppResult<()> {
-        self.execute(move |database| database.delete_rule(&account_id, rule_id))
-            .await
-    }
-
-    pub async fn import_rules(
-        &self,
-        account_id: String,
-        rules: Vec<ModerationRule>,
-    ) -> AppResult<usize> {
-        self.execute(move |database| database.import_rules(&account_id, &rules))
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_rule_evaluation(
-        &self,
-        account_id: String,
-        group_id: i64,
-        user_id: i64,
-        message_id: i64,
-        rule_id: i64,
-        rule_type: String,
-        matched: bool,
-        confidence: Option<f64>,
-        mode: String,
-        decision: String,
-        reason: String,
-        elapsed_ms: i64,
-    ) -> AppResult<()> {
-        self.execute(move |database| {
-            database.record_rule_evaluation(
-                &account_id,
-                group_id,
-                user_id,
-                message_id,
-                rule_id,
-                &rule_type,
-                matched,
-                confidence,
-                &mode,
-                &decision,
-                &reason,
-                elapsed_ms,
-            )
-        })
-        .await
-    }
-
-    pub async fn list_knowledge_bases(&self, account_id: String) -> AppResult<Vec<KnowledgeBase>> {
-        self.execute(move |database| database.list_knowledge_bases(&account_id))
-            .await
-    }
-
-    pub async fn create_knowledge_base(&self, base: KnowledgeBase) -> AppResult<i64> {
-        self.execute(move |database| database.create_knowledge_base(&base))
-            .await
-    }
-
-    pub async fn update_knowledge_base(&self, base: KnowledgeBase) -> AppResult<()> {
-        self.execute(move |database| database.update_knowledge_base(&base))
-            .await
-    }
-
-    pub async fn clone_knowledge_base(
-        &self,
-        account_id: String,
-        base_id: i64,
-        name: String,
-    ) -> AppResult<i64> {
-        self.execute(move |database| database.clone_knowledge_base(&account_id, base_id, &name))
-            .await
-    }
-
-    pub async fn delete_knowledge_base(&self, account_id: String, base_id: i64) -> AppResult<()> {
-        self.execute(move |database| database.delete_knowledge_base(&account_id, base_id))
-            .await
-    }
-
-    pub async fn knowledge_base_account(&self, base_id: i64) -> AppResult<String> {
-        self.execute(move |database| database.knowledge_base_account(base_id))
-            .await
-    }
-
-    pub async fn list_knowledge_documents(
-        &self,
-        base_id: i64,
-    ) -> AppResult<Vec<KnowledgeDocument>> {
-        self.execute(move |database| database.list_knowledge_documents(base_id))
-            .await
-    }
-
-    pub async fn upsert_knowledge_document(&self, document: KnowledgeDocument) -> AppResult<i64> {
-        self.execute(move |database| database.upsert_knowledge_document(&document))
-            .await
-    }
-
-    pub async fn delete_knowledge_document(&self, base_id: i64, document_id: i64) -> AppResult<()> {
-        self.execute(move |database| database.delete_knowledge_document(base_id, document_id))
-            .await
-    }
-
-    pub async fn replace_knowledge_chunks(
-        &self,
-        document_id: i64,
-        chunks: Vec<KnowledgeChunk>,
-    ) -> AppResult<()> {
-        self.execute(move |database| database.replace_knowledge_chunks(document_id, &chunks))
-            .await
-    }
-
-    pub async fn bind_knowledge_base(
-        &self,
-        account_id: String,
-        base_id: i64,
-        group_ids: Vec<i64>,
-    ) -> AppResult<()> {
-        self.execute(move |database| database.bind_knowledge_base(base_id, &account_id, &group_ids))
-            .await
-    }
-
-    pub async fn list_knowledge_bindings(
-        &self,
-        account_id: String,
-        base_id: Option<i64>,
-    ) -> AppResult<Vec<KnowledgeBinding>> {
-        self.execute(move |database| database.list_knowledge_bindings(&account_id, base_id))
-            .await
-    }
-
-    pub async fn list_tasks(
-        &self,
-        account_id: String,
-        group_id: Option<i64>,
-    ) -> AppResult<Vec<TaskItem>> {
-        self.execute(move |database| database.list_tasks(&account_id, group_id))
-            .await
-    }
-
-    pub async fn save_task(&self, task: TaskItem) -> AppResult<i64> {
-        self.execute(move |database| database.save_task(&task))
-            .await
-    }
-
-    pub async fn delete_task(&self, account_id: String, task_id: i64) -> AppResult<()> {
-        self.execute(move |database| database.delete_task(&account_id, task_id))
-            .await
-    }
-
-    pub async fn save_schedule(&self, schedule: GroupSchedule) -> AppResult<i64> {
-        self.execute(move |database| database.save_schedule(&schedule))
-            .await
-    }
-
-    pub async fn delete_schedule(&self, account_id: String, schedule_id: i64) -> AppResult<()> {
-        self.execute(move |database| database.delete_schedule(&account_id, schedule_id))
-            .await
-    }
-
-    pub async fn list_schedule_runs(
-        &self,
-        account_id: String,
-        schedule_id: Option<i64>,
-        limit: usize,
-    ) -> AppResult<Vec<ScheduleRun>> {
-        self.execute(move |database| database.list_schedule_runs(&account_id, schedule_id, limit))
-            .await
-    }
-
-    pub async fn list_audit(&self, account_id: String, limit: usize) -> AppResult<Vec<AuditEvent>> {
-        self.execute(move |database| database.list_audit(&account_id, limit))
-            .await
-    }
-
-    pub async fn list_support_audit(&self, limit: usize) -> AppResult<Vec<AuditEvent>> {
-        self.execute(move |database| database.list_support_audit(limit))
-            .await
-    }
-
-    pub(crate) async fn query_audit(&self, query: crate::AuditQuery) -> AppResult<Vec<AuditEvent>> {
-        self.execute(move |database| database.query_audit(&query))
-            .await
-    }
+fn activity_run_from_row(row: &Row<'_>) -> rusqlite::Result<ActivityRun> {
+    Ok(ActivityRun {
+        id: row.get(0)?,
+        activity_id: row.get(1)?,
+        account_id: row.get(2)?,
+        group_id: row.get(3)?,
+        scheduled_for: parse_time(row.get(4)?),
+        run_key: row.get(5)?,
+        state: row.get(6)?,
+        text: row.get(7)?,
+        content_source: row.get(8)?,
+        attempts: row.get(9)?,
+        next_retry_at: optional_time(row.get(10)?),
+        last_error: row.get(11)?,
+        created_at: parse_time(row.get(12)?),
+        updated_at: parse_time(row.get(13)?),
+        completed_at: optional_time(row.get(14)?),
+    })
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
@@ -1934,6 +2023,98 @@ mod tests {
             .is_empty());
     }
 
+    fn activity(now: DateTime<Utc>, name: &str, due: DateTime<Utc>) -> Activity {
+        Activity {
+            id: 0,
+            account_id: "a".into(),
+            name: name.into(),
+            content: "活动原文 19:30".into(),
+            enabled: true,
+            ai_optimize: false,
+            ai_instructions: String::new(),
+            timezone: "UTC".into(),
+            start_date: now.format("%Y-%m-%d").to_string(),
+            end_date: now.format("%Y-%m-%d").to_string(),
+            weekdays: vec![1, 2, 3, 4, 5, 6, 7],
+            send_times: vec![due.format("%H:%M").to_string()],
+            group_ids: vec![1],
+            next_run_at: Some(due),
+            source_key: String::new(),
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn due_activity_is_claimed_once_and_enters_group_context() {
+        let database = database();
+        let now = Utc::now();
+        let mut value = activity(now, "晚间互动", now - chrono::Duration::minutes(5));
+        value.id = database.save_activity(&value).unwrap();
+
+        assert_eq!(
+            database
+                .generate_due_activity_runs("a", now, 10, 20)
+                .unwrap(),
+            1
+        );
+        let claimed = database.claim_activity_preparations("a", now, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(database
+            .claim_activity_preparations("a", now, 10)
+            .unwrap()
+            .is_empty());
+        database
+            .enqueue_activity_effect(
+                claimed[0].run.id,
+                "今晚 19:30 欢迎参加",
+                "ai",
+                &EffectOutboxRequest {
+                    account_id: "a".into(),
+                    group_id: 1,
+                    effect_type: "send_text".into(),
+                    payload_json: r#"{"text":"今晚 19:30 欢迎参加"}"#.into(),
+                    dedupe_key: claimed[0].run.run_key.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            database.claim_effect_outbox(Some("a"), 10).unwrap().len(),
+            1
+        );
+        database
+            .finish_activity_run(claimed[0].run.id, "succeeded", "")
+            .unwrap();
+
+        let (activities, runs) = database.activity_context("a", 1, 10).unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "今晚 19:30 欢迎参加");
+    }
+
+    #[test]
+    fn activity_outside_grace_window_is_recorded_without_send_claim() {
+        let database = database();
+        let now = Utc::now();
+        let value = activity(now, "已错过活动", now - chrono::Duration::minutes(11));
+        let id = database.save_activity(&value).unwrap();
+
+        assert_eq!(
+            database
+                .generate_due_activity_runs("a", now, 10, 20)
+                .unwrap(),
+            1
+        );
+        assert!(database
+            .claim_activity_preparations("a", now, 10)
+            .unwrap()
+            .is_empty());
+        let runs = database.list_activity_runs("a", Some(id), 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, "missed");
+    }
+
     #[test]
     fn ai_and_summary_runs_are_unique() {
         let database = database();
@@ -1945,6 +2126,15 @@ mod tests {
             "succeeded"
         );
         assert!(!database.claim_ai_run("a", 1, "message:1").unwrap());
+
+        assert!(database.claim_ai_run("a", 1, "message:failed").unwrap());
+        database
+            .fail_ai_run_terminal("a", "message:failed", "provider timeout")
+            .unwrap();
+        let failed = database.ai_run("a", "message:failed").unwrap().unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.last_error, "provider timeout");
+        assert!(!database.claim_ai_run("a", 1, "message:failed").unwrap());
 
         assert!(database.claim_summary_run("a", 1, "2026-07-21").unwrap());
         assert!(!database.claim_summary_run("a", 1, "2026-07-21").unwrap());

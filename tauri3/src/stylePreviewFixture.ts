@@ -26,6 +26,13 @@ export function installStylePreviewFixture() {
     status: 'pending', assigneeId: 10002, createdBy: 10001, dueAt: '2026-07-24T10:00:00Z', reminderAt: null,
     reminderSentAt: null, createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z',
   }]
+  let activities: PreviewRecord[] = [{
+    id: 1, accountId: 'ACCOUNT', name: '晚间互动', content: '今晚 19:30 开始互动，欢迎大家参加。',
+    enabled: true, aiOptimize: true, aiInstructions: '轻松自然', timezone: 'Asia/Shanghai',
+    startDate: '2026-08-01', endDate: '2026-08-31', weekdays: [1, 2, 3, 4, 5], sendTimes: ['19:30'],
+    groupIds: [101], nextRunAt: '2026-08-06T11:30:00Z', sourceKey: '', deletedAt: null,
+    createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-06T00:00:00Z',
+  }]
   let schedules: PreviewRecord[] = [{ id: 1, accountId: 'ACCOUNT', name: '日常开放时间', enabled: false, openTime: '08:00', closeTime: '22:00', timezone: 'Asia/Shanghai', groupIds: [101] }]
   const groups = [
     { accountId: 'ACCOUNT', groupId: 101, name: '16 人样式预览群', ownerUserId: 10001, enabled: true, aiEnabled: true, moderationEnabled: true, manualTakeover: false, welcomeMessage: '欢迎 @「[成员]」加入群聊，请先查看群规。' },
@@ -72,7 +79,7 @@ export function installStylePreviewFixture() {
       case 'plugin:window|minimize': return null
       case 'plugin:window|close': return null
       case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Style Preview', pageUrl: 'http://127.0.0.1:5173', nimAccount: 'ACCOUNT', detail: '样式预览数据已加载，修改 CSS 后会自动刷新。' }
-      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 6, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
+      case 'database_status': return { path: '样式预览内存数据', schemaVersion: 13, integrity: 'ok', accounts: 1, groups: groups.length, messages: messages.length }
       case 'get_ai_settings': return { base_url: '', webhook_url: '', api_backend: 'chat_completions', model: 'deepseek-v4-pro', api_key_configured: false }
       case 'list_ai_provider_endpoints': return [{ id: 1, accountId: 'ACCOUNT', name: '主连接', baseUrl: 'https://api.example.invalid/v1', webhookUrl: '', apiBackend: 'chat_completions', model: 'deepseek-v4-pro', priority: 0, enabled: true, apiKeyConfigured: true, healthStatus: 'healthy', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: '2026-07-22T08:00:00Z', createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }, { id: 2, accountId: 'ACCOUNT', name: '备用连接', baseUrl: 'https://backup.example.invalid/v1', webhookUrl: '', apiBackend: 'responses', model: 'deepseek-v4-pro', priority: 1, enabled: true, apiKeyConfigured: true, healthStatus: 'unchecked', failureCount: 0, cooldownUntil: null, lastError: '', lastCheckedAt: null, createdAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
       case 'test_ai_provider_endpoint': return { decision: { reply: '你好，我可以协助处理群规、FAQ 和群内任务。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 1280, model: 'deepseek-v4-pro' }
@@ -104,13 +111,19 @@ export function installStylePreviewFixture() {
       case 'list_knowledge_bases': return bases
       case 'list_knowledge_documents': return documents
       case 'list_knowledge_bindings': return [{ baseId: args.baseId, accountId: 'ACCOUNT', groupId: 101, enabled: true }]
-      case 'list_business_apps': return [{ accountId: 'ACCOUNT', appId: 'prediction', name: '预测', description: '读取已校准结果并生成统计参考', version: '1.0.0', enabled: true, status: 'ready', statusDetail: '1 个彩种数据可用', lastCheckedAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
-      case 'list_business_app_runs': return [{ id: 1, accountId: 'ACCOUNT', appId: 'prediction', groupId: 101, messageId: 3, runKey: 'message:3', status: 'succeeded', freshness: 'fresh', aiUsed: true, reply: 'PC28 第20260722001期\n最新结果：1 + 2 + 3\n趋势摘要：近期样本稳定。', error: '', elapsedMs: 420, createdAt: '2026-07-22T08:16:02Z', completedAt: '2026-07-22T08:16:02Z' }]
-      case 'get_business_app_health': return { appId: 'prediction', status: 'ready', detail: '1 个彩种数据可用', checkedAt: '2026-07-22T08:00:00Z', games: [{ id: 'pc28', name: 'PC28', status: 'ready', detail: '结果与历史数据可用' }, { id: 'jnd28', name: '加拿大28', status: 'unavailable', detail: '暂未发现可用结果' }] }
-      case 'test_business_app': return { appId: 'prediction', status: 'succeeded', freshness: 'fresh', reply: 'PC28 第20260722001期\n最新结果：1 + 2 + 3\n候选方向：4、7、9\n参考度：低，仅作信息参考。', aiUsed: true, error: '', elapsedMs: 420 }
+      case 'list_business_apps': return [{ accountId: 'ACCOUNT', appId: 'prediction', name: '预测', description: '读取公开开奖并生成统计参考', version: '1.0.0', enabled: true, status: 'ready', statusDetail: '2 个彩种数据可用', lastCheckedAt: '2026-07-22T08:00:00Z', updatedAt: '2026-07-22T08:00:00Z' }]
+      case 'list_business_app_runs': return [{ id: 1, accountId: 'ACCOUNT', appId: 'prediction', groupId: 101, messageId: 3, runKey: 'message:3', status: 'succeeded', freshness: 'fresh', aiUsed: true, reply: '【PC28】第2026202期\n开奖：9 + 0 + 1 = 10（小双）\n趋势：近期样本稳定。', error: '', elapsedMs: 420, createdAt: '2026-07-22T08:16:02Z', completedAt: '2026-07-22T08:16:02Z' }]
+      case 'get_business_app_health': return { appId: 'prediction', status: 'ready', detail: '2 个彩种数据可用', checkedAt: '2026-07-22T08:00:00Z', games: [{ id: 'pcdd', name: 'PC28', status: 'ready', detail: '中国福彩网官方快乐8开奖，DH 按公开规则派生 28 结果' }, { id: 'jnd', name: '加拿大28', status: 'ready', detail: 'BCLC 官方 Keno 原始开奖，DH 按公开规则派生 28 结果' }, { id: 'btc28', name: '比特币28', status: 'unavailable', detail: '公开区块数据存在，但28派生算法尚未核验' }, { id: 'tx28', name: '腾讯分分彩28', status: 'unavailable', detail: '没有可核验的官方公开数据源' }] }
+      case 'test_business_app': return { appId: 'prediction', status: 'succeeded', freshness: 'fresh', reply: '【PC28】第2026202期\n开奖：9 + 0 + 1 = 10（小双）\n时间：07-31 21:30\n趋势：根据近 30 期频率和遗漏计算候选方向\n参考方向：4、7、9\n参考度：中高\n说明：基于已核验历史数据统计，仅作信息参考。', aiUsed: true, error: '', elapsedMs: 420 }
       case 'update_knowledge_base': case 'bind_knowledge_base': case 'save_knowledge_document': return 1
       case 'list_tasks': return tasks
       case 'save_task': { const next = { ...args.task, id: args.task.id || tasks.length + 1 }; tasks = tasks.filter(task => task.id !== next.id).concat(next); return next.id }
+      case 'list_activities': return activities
+      case 'save_activity': { const next = { ...args.activity, id: args.activity.id || activities.length + 1 }; activities = activities.filter(activity => activity.id !== next.id).concat(next); return next.id }
+      case 'delete_activity': activities = activities.filter(activity => activity.id !== args.activityId); return null
+      case 'list_activity_runs': return [{ id: 1, activityId: 1, accountId: 'ACCOUNT', groupId: 101, scheduledFor: '2026-08-05T11:30:00Z', runKey: 'STYLE-ACTIVITY-1', state: 'succeeded', text: '今晚互动开始啦！', contentSource: 'ai', attempts: 1, nextRetryAt: null, lastError: '', createdAt: '2026-08-05T11:30:00Z', updatedAt: '2026-08-05T11:30:02Z', completedAt: '2026-08-05T11:30:02Z' }]
+      case 'preview_activity_text': return { text: args.activity.aiOptimize ? '今晚 19:30 互动准时开始，欢迎大家来参加！' : args.activity.content, source: args.activity.aiOptimize ? 'ai' : 'fixed' }
+      case 'publish_activity_now': return (activities.find(activity => activity.id === args.activityId)?.groupIds as number[] | undefined)?.length || 0
       case 'list_schedules': return schedules
       case 'save_schedule': { const next = { ...args.schedule, id: args.schedule.id || schedules.length + 1 }; schedules = schedules.filter(schedule => schedule.id !== next.id).concat(next); return next.id }
       case 'list_schedule_runs': return [{ id: 1, scheduleId: 1, accountId: 'ACCOUNT', groupId: 101, localDate: '2026-07-22', action: 'open', success: true, error: '', attempts: 1, createdAt: '2026-07-22T00:00:00Z' }]
@@ -118,6 +131,8 @@ export function installStylePreviewFixture() {
       case 'test_ai': return { decision: { reply: String(args.message || '').includes('群公告') ? '请文明交流。涉及资金、账号或验证码时，请先联系管理员核实。' : '你好，我可以协助处理群规、FAQ 和群内任务。当前资料不足时，我会建议联系管理员确认。', reason: '样式预览', confidence: 0.95 }, elapsedMs: 18, model: 'deepseek-v4-pro', knowledgeSource: args.includeBuiltInKnowledge ? 'DH 默认群规与 FAQ' : '空上下文' }
       case 'get_wang_profile_status': return { state: '样式预览', scriptHash: 'STYLE-PREVIEW-HASH', backupPath: null, requiresElevation: false, detail: '当前只用于页面样式调整。' }
       case 'get_gateway_capabilities': return { announcement: 'supported', sendText: 'supported', mute: 'supported', recall: 'supported', rename: 'supported', removeMember: 'supported', groupMute: 'supported', memberEvents: 'supported' }
+      case 'get_runtime_work_snapshot': return { active: { id: 'STYLE-TASK', kind: 'message', label: '处理群消息', scopeLabel: '测试群 A', state: 'running', percent: 42, queued: 3, startedAt: '2026-08-06T00:00:00Z', retryAt: null, completedAt: null, error: '' }, items: [{ id: 'STYLE-TASK', kind: 'message', label: '处理群消息', scopeLabel: '测试群 A', state: 'running', percent: 42, queued: 3, startedAt: '2026-08-06T00:00:00Z', retryAt: null, completedAt: null, error: '' }], counts: { running: 1, queued: 3, retrying: 0, failed: 0 }, updatedAt: '2026-08-06T00:00:00Z' }
+      case 'acknowledge_runtime_work_failures': return null
       case 'get_runtime_mode': return { mode: 'fixture', dataDir: '样式预览内存数据', restartRequired: false }
       case 'take_wang_startup_status': return null
       default:

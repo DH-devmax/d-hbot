@@ -12,12 +12,28 @@ use sha2::{Digest, Sha256};
 use crate::defaults;
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
-    Account, ActionRecord, AiProviderEndpoint, AuditEvent, BatchIngestResult, BusinessAppRecord,
-    BusinessAppRun, CardPlan, CardRenameJob, DailySummary, EffectOutboxItem, EffectOutboxRequest,
-    EnqueuedEffect, GatewayInboxEvent, GatewayInboxItem, Group, GroupAiPermissions, GroupSchedule,
-    KnowledgeBase, KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, TaskItem,
+    Account, ActionRecord, Activity, ActivityRun, AiProviderEndpoint, AuditEvent, BatchIngestResult,
+    BusinessAppRecord, BusinessAppRun, CardPlan, CardRenameJob, DailySummary, DueActivityRun,
+    EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect, GatewayInboxEvent, GatewayInboxItem,
+    Group, GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeChunk,
+    KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, ScheduleRun, TaskItem,
 };
 use crate::paths::AppPaths;
+
+pub struct MessageProcessingContext {
+    pub group: Group,
+    pub member: Option<Member>,
+    pub recent_messages: Vec<Message>,
+    pub rules: Vec<ModerationRule>,
+}
+
+pub struct RuntimeBacklog {
+    pub account_id: String,
+    pub group_id: i64,
+    pub lane: String,
+    pub detail: String,
+    pub count: usize,
+}
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -290,6 +306,61 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(account_id, group_id) REFERENCES groups(account_id, group_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS activities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  ai_optimize INTEGER NOT NULL DEFAULT 0,
+  ai_instructions TEXT NOT NULL DEFAULT '',
+  timezone TEXT NOT NULL,
+  start_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',
+  next_run_at TEXT,
+  source_key TEXT NOT NULL DEFAULT '',
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS activities_source_key_idx ON activities(account_id,source_key) WHERE source_key<>'';
+CREATE INDEX IF NOT EXISTS activities_due_idx ON activities(account_id,enabled,next_run_at) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS activity_groups (
+  activity_id INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  PRIMARY KEY(activity_id,account_id,group_id),
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+  FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS activity_times (
+  activity_id INTEGER NOT NULL,
+  local_time TEXT NOT NULL,
+  PRIMARY KEY(activity_id,local_time),
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS activity_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  activity_id INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  scheduled_for TEXT NOT NULL,
+  run_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL DEFAULT 'pending',
+  text TEXT NOT NULL DEFAULT '',
+  content_source TEXT NOT NULL DEFAULT 'fixed',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+  FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);
 CREATE TABLE IF NOT EXISTS group_ai_permissions (
   account_id TEXT NOT NULL,
   group_id INTEGER NOT NULL,
@@ -431,6 +502,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
   sensitive INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS expected_member_card_updates (
+  account_id TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  card_name TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(account_id, group_id, user_id, card_name)
+);
 CREATE TABLE IF NOT EXISTS ai_provider_endpoints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
@@ -501,6 +582,23 @@ CREATE TABLE IF NOT EXISTS gateway_capability_verifications (
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QueueDepthRow {
+    pub state: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionPolicyRow {
+    pub table_name: String,
+    pub max_days: i64,
+    pub max_rows: i64,
+    pub batch_size: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseStatus {
     pub path: String,
     pub schema_version: i64,
@@ -508,6 +606,12 @@ pub struct DatabaseStatus {
     pub accounts: i64,
     pub groups: i64,
     pub messages: i64,
+    /// Per-state row counts for `effect_outbox` (queued/retry/processing/failed/succeeded/unknown).
+    pub queue_depth: Vec<QueueDepthRow>,
+    /// Current rows from the `retention_policies` housekeeping table.
+    pub retention_policies: Vec<RetentionPolicyRow>,
+    /// Result of `PRAGMA integrity_check(16)` — "ok" when the database is healthy.
+    pub index_integrity: String,
 }
 
 pub struct Database {
@@ -676,6 +780,10 @@ impl DatabaseExecutor {
         self.execute(Database::status).await
     }
 
+    pub async fn runtime_backlog(&self) -> AppResult<Vec<RuntimeBacklog>> {
+        self.execute(Database::runtime_backlog).await
+    }
+
     pub async fn ingest_gateway_batch(
         &self,
         events: Vec<GatewayInboxEvent>,
@@ -749,6 +857,19 @@ impl DatabaseExecutor {
     pub async fn enqueue_effect(&self, request: EffectOutboxRequest) -> AppResult<EnqueuedEffect> {
         self.execute(move |database| database.enqueue_effect(&request))
             .await
+    }
+
+    pub async fn enqueue_activity_effect(
+        &self,
+        run_id: i64,
+        text: String,
+        source: String,
+        request: EffectOutboxRequest,
+    ) -> AppResult<EnqueuedEffect> {
+        self.execute(move |database| {
+            database.enqueue_activity_effect(run_id, &text, &source, &request)
+        })
+        .await
     }
 
     pub async fn claim_effect_outbox(
@@ -1059,6 +1180,39 @@ impl DatabaseExecutor {
         .await
     }
 
+    pub async fn expect_member_card_update(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        card_name: String,
+        source_key: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.expect_member_card_update(
+                &account_id,
+                group_id,
+                user_id,
+                &card_name,
+                &source_key,
+            )
+        })
+        .await
+    }
+
+    pub async fn consume_expected_member_card_update(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        card_name: String,
+    ) -> AppResult<bool> {
+        self.execute(move |database| {
+            database.consume_expected_member_card_update(&account_id, group_id, user_id, &card_name)
+        })
+        .await
+    }
+
     pub async fn mark_member_not_present(
         &self,
         account_id: String,
@@ -1191,6 +1345,33 @@ impl DatabaseExecutor {
             .await
     }
 
+    pub async fn message_processing_context(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<Option<MessageProcessingContext>> {
+        self.execute(move |database| {
+            let Some(group) = database.get_group(&account_id, group_id)? else {
+                return Ok(None);
+            };
+            let member = database.get_member(&account_id, group_id, user_id)?;
+            let recent_messages = database.recent_messages(&account_id, group_id, 20)?;
+            let rules = if group.machine_rules_enabled || group.ai_rules_enabled {
+                database.list_rules(&account_id, Some(group_id))?
+            } else {
+                Vec::new()
+            };
+            Ok(Some(MessageProcessingContext {
+                group,
+                member,
+                recent_messages,
+                rules,
+            }))
+        })
+        .await
+    }
+
     pub async fn rule_cooldown_allows(
         &self,
         rule_id: i64,
@@ -1269,14 +1450,6 @@ impl DatabaseExecutor {
             .await
     }
 
-    pub async fn claim_due_task_reminders(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> AppResult<Vec<TaskItem>> {
-        self.execute(move |database| database.claim_due_task_reminders(now, limit))
-            .await
-    }
 
     pub async fn finish_task_reminder(
         &self,
@@ -1325,6 +1498,16 @@ impl DatabaseExecutor {
         error: String,
     ) -> AppResult<()> {
         self.execute(move |database| database.finish_ai_run(&account_id, &run_key, success, &error))
+            .await
+    }
+
+    pub async fn fail_ai_run_terminal(
+        &self,
+        account_id: String,
+        run_key: String,
+        error: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.fail_ai_run_terminal(&account_id, &run_key, &error))
             .await
     }
 
@@ -1383,6 +1566,382 @@ impl DatabaseExecutor {
 
     pub async fn mark_schedule_run_unknown(&self, run_key: String, error: String) -> AppResult<()> {
         self.execute(move |database| database.mark_schedule_run_unknown(&run_key, &error))
+            .await
+    }
+
+    pub(crate) async fn query_messages(
+        &self,
+        query: crate::MessageQuery,
+    ) -> AppResult<Vec<Message>> {
+        self.execute(move |database| database.query_messages(&query))
+            .await
+    }
+
+    pub async fn archive_effect_dispatch(
+        &self,
+        outbox_id: i64,
+        status: String,
+        error: String,
+        receipt_json: String,
+        action: Option<ActionRecord>,
+        audit: AuditEvent,
+    ) -> AppResult<bool> {
+        self.execute(move |database| {
+            database.archive_effect_dispatch(
+                outbox_id,
+                &status,
+                &error,
+                &receipt_json,
+                action.as_ref(),
+                &audit,
+            )
+        })
+        .await
+    }
+
+    pub async fn set_setting(&self, key: String, value: String, sensitive: bool) -> AppResult<()> {
+        self.execute(move |database| database.set_setting(&key, &value, sensitive))
+            .await
+    }
+
+    pub async fn set_group_features(
+        &self,
+        account_id: String,
+        group_id: i64,
+        enabled: bool,
+        ai_enabled: bool,
+        moderation_enabled: bool,
+        manual_takeover: bool,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_features(
+                &account_id,
+                group_id,
+                enabled,
+                ai_enabled,
+                moderation_enabled,
+                manual_takeover,
+            )
+        })
+        .await
+    }
+
+    pub async fn set_group_rule_features(
+        &self,
+        account_id: String,
+        group_id: i64,
+        machine_enabled: bool,
+        ai_enabled: bool,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_rule_features(&account_id, group_id, machine_enabled, ai_enabled)
+        })
+        .await
+    }
+
+    pub async fn set_group_welcome(
+        &self,
+        account_id: String,
+        group_id: i64,
+        welcome_message: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.set_group_welcome(&account_id, group_id, &welcome_message)
+        })
+        .await
+    }
+
+    pub async fn save_group_ai_permissions(&self, value: GroupAiPermissions) -> AppResult<()> {
+        self.execute(move |database| database.save_group_ai_permissions(&value))
+            .await
+    }
+
+    pub async fn save_rule(&self, rule: ModerationRule) -> AppResult<i64> {
+        self.execute(move |database| database.save_rule(&rule))
+            .await
+    }
+
+    pub async fn delete_rule(&self, account_id: String, rule_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_rule(&account_id, rule_id))
+            .await
+    }
+
+    pub async fn import_rules(
+        &self,
+        account_id: String,
+        rules: Vec<ModerationRule>,
+    ) -> AppResult<usize> {
+        self.execute(move |database| database.import_rules(&account_id, &rules))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_rule_evaluation(
+        &self,
+        account_id: String,
+        group_id: i64,
+        user_id: i64,
+        message_id: i64,
+        rule_id: i64,
+        rule_type: String,
+        matched: bool,
+        confidence: Option<f64>,
+        mode: String,
+        decision: String,
+        reason: String,
+        elapsed_ms: i64,
+    ) -> AppResult<()> {
+        self.execute(move |database| {
+            database.record_rule_evaluation(
+                &account_id,
+                group_id,
+                user_id,
+                message_id,
+                rule_id,
+                &rule_type,
+                matched,
+                confidence,
+                &mode,
+                &decision,
+                &reason,
+                elapsed_ms,
+            )
+        })
+        .await
+    }
+
+    pub async fn list_knowledge_bases(&self, account_id: String) -> AppResult<Vec<KnowledgeBase>> {
+        self.execute(move |database| database.list_knowledge_bases(&account_id))
+            .await
+    }
+
+    pub async fn create_knowledge_base(&self, base: KnowledgeBase) -> AppResult<i64> {
+        self.execute(move |database| database.create_knowledge_base(&base))
+            .await
+    }
+
+    pub async fn update_knowledge_base(&self, base: KnowledgeBase) -> AppResult<()> {
+        self.execute(move |database| database.update_knowledge_base(&base))
+            .await
+    }
+
+    pub async fn clone_knowledge_base(
+        &self,
+        account_id: String,
+        base_id: i64,
+        name: String,
+    ) -> AppResult<i64> {
+        self.execute(move |database| database.clone_knowledge_base(&account_id, base_id, &name))
+            .await
+    }
+
+    pub async fn delete_knowledge_base(&self, account_id: String, base_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_knowledge_base(&account_id, base_id))
+            .await
+    }
+
+    pub async fn knowledge_base_account(&self, base_id: i64) -> AppResult<String> {
+        self.execute(move |database| database.knowledge_base_account(base_id))
+            .await
+    }
+
+    pub async fn list_knowledge_documents(
+        &self,
+        base_id: i64,
+    ) -> AppResult<Vec<KnowledgeDocument>> {
+        self.execute(move |database| database.list_knowledge_documents(base_id))
+            .await
+    }
+
+    pub async fn upsert_knowledge_document(&self, document: KnowledgeDocument) -> AppResult<i64> {
+        self.execute(move |database| database.upsert_knowledge_document(&document))
+            .await
+    }
+
+    pub async fn delete_knowledge_document(&self, base_id: i64, document_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_knowledge_document(base_id, document_id))
+            .await
+    }
+
+    pub async fn replace_knowledge_chunks(
+        &self,
+        document_id: i64,
+        chunks: Vec<KnowledgeChunk>,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.replace_knowledge_chunks(document_id, &chunks))
+            .await
+    }
+
+    pub async fn bind_knowledge_base(
+        &self,
+        account_id: String,
+        base_id: i64,
+        group_ids: Vec<i64>,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.bind_knowledge_base(base_id, &account_id, &group_ids))
+            .await
+    }
+
+    pub async fn list_knowledge_bindings(
+        &self,
+        account_id: String,
+        base_id: Option<i64>,
+    ) -> AppResult<Vec<KnowledgeBinding>> {
+        self.execute(move |database| database.list_knowledge_bindings(&account_id, base_id))
+            .await
+    }
+
+    pub async fn list_tasks(
+        &self,
+        account_id: String,
+        group_id: Option<i64>,
+    ) -> AppResult<Vec<TaskItem>> {
+        self.execute(move |database| database.list_tasks(&account_id, group_id))
+            .await
+    }
+
+    pub async fn save_task(&self, task: TaskItem) -> AppResult<i64> {
+        self.execute(move |database| database.save_task(&task))
+            .await
+    }
+
+    pub async fn delete_task(&self, account_id: String, task_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_task(&account_id, task_id))
+            .await
+    }
+
+    pub async fn list_activities(
+        &self,
+        account_id: String,
+        include_deleted: bool,
+    ) -> AppResult<Vec<Activity>> {
+        self.execute(move |database| database.list_activities(&account_id, include_deleted))
+            .await
+    }
+
+    pub async fn activity(
+        &self,
+        account_id: String,
+        activity_id: i64,
+    ) -> AppResult<Option<Activity>> {
+        self.execute(move |database| database.activity(&account_id, activity_id))
+            .await
+    }
+
+    pub async fn save_activity(&self, activity: Activity) -> AppResult<i64> {
+        self.execute(move |database| database.save_activity(&activity))
+            .await
+    }
+
+    pub async fn save_activity_once(
+        &self,
+        activity: Activity,
+        source_key: String,
+    ) -> AppResult<i64> {
+        self.execute(move |database| database.save_activity_once(&activity, &source_key))
+            .await
+    }
+
+    pub async fn delete_activity(&self, account_id: String, activity_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_activity(&account_id, activity_id))
+            .await
+    }
+
+    pub async fn list_activity_runs(
+        &self,
+        account_id: String,
+        activity_id: Option<i64>,
+        limit: usize,
+    ) -> AppResult<Vec<ActivityRun>> {
+        self.execute(move |database| database.list_activity_runs(&account_id, activity_id, limit))
+            .await
+    }
+
+    pub async fn generate_due_activity_runs(
+        &self,
+        account_id: String,
+        now: DateTime<Utc>,
+        grace_minutes: i64,
+        limit: usize,
+    ) -> AppResult<usize> {
+        self.execute(move |database| {
+            database.generate_due_activity_runs(&account_id, now, grace_minutes, limit)
+        })
+        .await
+    }
+
+    pub async fn claim_activity_preparations(
+        &self,
+        account_id: String,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> AppResult<Vec<DueActivityRun>> {
+        self.execute(move |database| database.claim_activity_preparations(&account_id, now, limit))
+            .await
+    }
+
+    pub async fn create_activity_runs_now(
+        &self,
+        activity: Activity,
+        now: DateTime<Utc>,
+        token: String,
+    ) -> AppResult<usize> {
+        self.execute(move |database| database.create_activity_runs_now(&activity, now, &token))
+            .await
+    }
+
+    pub async fn finish_activity_run(
+        &self,
+        run_id: i64,
+        state: String,
+        error: String,
+    ) -> AppResult<()> {
+        self.execute(move |database| database.finish_activity_run(run_id, &state, &error))
+            .await
+    }
+
+    pub async fn activity_context(
+        &self,
+        account_id: String,
+        group_id: i64,
+        limit: usize,
+    ) -> AppResult<(Vec<Activity>, Vec<ActivityRun>)> {
+        self.execute(move |database| database.activity_context(&account_id, group_id, limit))
+            .await
+    }
+
+    pub async fn save_schedule(&self, schedule: GroupSchedule) -> AppResult<i64> {
+        self.execute(move |database| database.save_schedule(&schedule))
+            .await
+    }
+
+    pub async fn delete_schedule(&self, account_id: String, schedule_id: i64) -> AppResult<()> {
+        self.execute(move |database| database.delete_schedule(&account_id, schedule_id))
+            .await
+    }
+
+    pub async fn list_schedule_runs(
+        &self,
+        account_id: String,
+        schedule_id: Option<i64>,
+        limit: usize,
+    ) -> AppResult<Vec<ScheduleRun>> {
+        self.execute(move |database| database.list_schedule_runs(&account_id, schedule_id, limit))
+            .await
+    }
+
+    pub async fn list_audit(&self, account_id: String, limit: usize) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.list_audit(&account_id, limit))
+            .await
+    }
+
+    pub async fn list_support_audit(&self, limit: usize) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.list_support_audit(limit))
+            .await
+    }
+
+    pub(crate) async fn query_audit(&self, query: crate::AuditQuery) -> AppResult<Vec<AuditEvent>> {
+        self.execute(move |database| database.query_audit(&query))
             .await
     }
 }
@@ -1503,10 +2062,10 @@ fn quick_check_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()> {
-    if old_version > 11 {
+    if old_version > 14 {
         return Err(AppError::new(
             "database_version",
-            format!("数据库版本 {old_version} 高于当前程序支持的 v11"),
+            format!("数据库版本 {old_version} 高于当前程序支持的 v14"),
         ));
     }
     let transaction = connection
@@ -1632,8 +2191,59 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
     transaction
         .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS tasks_source_key_idx ON tasks(account_id,source_key) WHERE source_key<>''")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    let migration_timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into());
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',enabled INTEGER NOT NULL DEFAULT 0,ai_optimize INTEGER NOT NULL DEFAULT 0,ai_instructions TEXT NOT NULL DEFAULT '',timezone TEXT NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,weekdays_json TEXT NOT NULL DEFAULT '[1,2,3,4,5,6,7]',next_run_at TEXT,source_key TEXT NOT NULL DEFAULT '',deleted_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE);
+             CREATE UNIQUE INDEX IF NOT EXISTS activities_source_key_idx ON activities(account_id,source_key) WHERE source_key<>'';
+             CREATE INDEX IF NOT EXISTS activities_due_idx ON activities(account_id,enabled,next_run_at) WHERE deleted_at IS NULL;
+             CREATE TABLE IF NOT EXISTS activity_groups (activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,PRIMARY KEY(activity_id,account_id,group_id),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS activity_times (activity_id INTEGER NOT NULL,local_time TEXT NOT NULL,PRIMARY KEY(activity_id,local_time),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS activity_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,scheduled_for TEXT NOT NULL,run_key TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'pending',text TEXT NOT NULL DEFAULT '',content_source TEXT NOT NULL DEFAULT 'fixed',attempts INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,last_error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute(
+            // 旧任务的 reminder_at 是 RFC3339（UTC）。活动表的 start_date/local_time 是
+            // timezone 列所指时区的本地墙上时间，所以必须先转成 localtime 再截取，
+            // 否则会整体偏移一个 UTC offset。content 截断到 1000 字符、title 必须非空，
+            // 保证迁移出来的活动一定能通过 activities::validate。
+            "INSERT OR IGNORE INTO activities(account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,created_at,updated_at) SELECT account_id,TRIM(title),substr(CASE WHEN TRIM(description)='' THEN TRIM(title) ELSE TRIM(description) END,1,1000),0,0,'',?,COALESCE(date(COALESCE(reminder_at,due_at,created_at),'localtime'),substr(COALESCE(reminder_at,due_at,created_at),1,10)),COALESCE(date(COALESCE(reminder_at,due_at,created_at),'localtime'),substr(COALESCE(reminder_at,due_at,created_at),1,10)),'[1,2,3,4,5,6,7]',NULL,'legacy-task:'||id,created_at,updated_at FROM tasks WHERE TRIM(title)<>''",
+            params![migration_timezone],
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch(
+            "INSERT OR IGNORE INTO activity_groups(activity_id,account_id,group_id) SELECT activities.id,tasks.account_id,tasks.group_id FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;
+             INSERT OR IGNORE INTO activity_times(activity_id,local_time) SELECT activities.id,COALESCE(strftime('%H:%M',tasks.reminder_at,'localtime'),'09:00') FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    // 旧的 reminder_loop 已经被 activity_loop 取代，任何仍然挂着的任务提醒如果只迁移成
+    // 停用草稿就会静默失效。这里把「未发送且未结束」的提醒启用，让它继续按原定时刻发出；
+    // 已经过期的那些会在 generate_due_activity_runs 里落一条 missed 历史后自然转为不再触发。
+    //
+    // 只在真正从 <13 升级时执行一次：这个迁移每次启动都会跑，不加版本闸会反复覆盖用户
+    // 后来手工停用的活动。
+    if old_version < 13 {
+        transaction
+            .execute(
+                "UPDATE activities SET enabled=1,next_run_at=(SELECT tasks.reminder_at FROM tasks WHERE 'legacy-task:'||tasks.id=activities.source_key AND tasks.account_id=activities.account_id),updated_at=? \
+                 WHERE activities.source_key LIKE 'legacy-task:%' AND activities.deleted_at IS NULL AND activities.enabled=0 \
+                   AND EXISTS (SELECT 1 FROM activity_groups WHERE activity_groups.activity_id=activities.id) \
+                   AND EXISTS (SELECT 1 FROM activity_times WHERE activity_times.activity_id=activities.id) \
+                   AND EXISTS (SELECT 1 FROM tasks WHERE 'legacy-task:'||tasks.id=activities.source_key AND tasks.account_id=activities.account_id \
+                     AND tasks.reminder_at IS NOT NULL AND tasks.reminder_sent_at IS NULL \
+                     AND tasks.reminder_state IN ('pending','retry') AND tasks.status<>'done')",
+                params![Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    }
     transaction
         .execute_batch("CREATE TABLE IF NOT EXISTS gateway_capability_verifications (fingerprint TEXT NOT NULL,capability TEXT NOT NULL,source TEXT NOT NULL,status TEXT NOT NULL,automatic_allowed INTEGER NOT NULL DEFAULT 0,evidence_hash TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',verified_at TEXT NOT NULL,PRIMARY KEY(fingerprint,capability)); CREATE TABLE IF NOT EXISTS ai_provider_endpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',api_backend TEXT NOT NULL DEFAULT 'chat_completions',model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',secret_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,health_status TEXT NOT NULL DEFAULT 'unchecked',failure_count INTEGER NOT NULL DEFAULT 0,cooldown_until TEXT,last_error TEXT NOT NULL DEFAULT '',last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx ON ai_provider_endpoints(account_id,enabled DESC,priority,id);")
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch("CREATE TABLE IF NOT EXISTS expected_member_card_updates (account_id TEXT NOT NULL,group_id INTEGER NOT NULL,user_id INTEGER NOT NULL,card_name TEXT NOT NULL,source_key TEXT NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(account_id,group_id,user_id,card_name)); CREATE INDEX IF NOT EXISTS expected_member_card_updates_expiry_idx ON expected_member_card_updates(expires_at);")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     add_column_if_missing(
         &transaction,
@@ -1665,8 +2275,49 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
             [],
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    // ── v14：effect_outbox 扩展列 + 索引 + 保留策略表 ──────────────────────────
+    // 所有变更均为纯增量，零行为改动；已有行从列默认值获得对应值。
+    for (table, column, definition) in [
+        ("effect_outbox", "priority",       "INTEGER NOT NULL DEFAULT 100"),
+        ("effect_outbox", "lane",           "TEXT NOT NULL DEFAULT 'default'"),
+        ("effect_outbox", "order_key",      "TEXT"),
+        ("effect_outbox", "correlation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("effect_outbox", "origin",         "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("effect_outbox", "expires_at",     "TEXT"),
+    ] {
+        add_column_if_missing(&transaction, table, column, definition).map_err(|error| {
+            AppError::new(
+                "database_migration",
+                format!("补齐 {table}.{column} 失败：{error}"),
+            )
+        })?;
+    }
     transaction
-        .execute_batch("PRAGMA user_version = 11;")
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS retention_policies (
+               table_name  TEXT    NOT NULL PRIMARY KEY,
+               max_days    INTEGER NOT NULL DEFAULT 90,
+               max_rows    INTEGER NOT NULL DEFAULT 100000,
+               batch_size  INTEGER NOT NULL DEFAULT 500,
+               enabled     INTEGER NOT NULL DEFAULT 1,
+               updated_at  TEXT    NOT NULL
+             );
+             INSERT OR IGNORE INTO retention_policies(table_name,max_days,max_rows,batch_size,enabled,updated_at) VALUES
+               ('messages',        90,  200000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('audit_events',   180,  100000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('effect_outbox',   30,   50000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('gateway_inbox',   14,   50000, 500, 1, '2026-01-01T00:00:00Z'),
+               ('rule_evaluations',60,  100000, 500, 1, '2026-01-01T00:00:00Z');
+             CREATE INDEX IF NOT EXISTS audit_events_account_time_idx ON audit_events(account_id, created_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS effect_outbox_claim_idx ON effect_outbox(state, priority, created_at, id);
+             CREATE INDEX IF NOT EXISTS effect_outbox_order_key_idx ON effect_outbox(order_key, state) WHERE order_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS messages_account_group_time_idx ON messages(account_id, group_id, received_at DESC);
+             CREATE INDEX IF NOT EXISTS gateway_inbox_account_time_idx ON gateway_inbox(account_id, received_at);
+             CREATE INDEX IF NOT EXISTS rule_evaluations_account_time_idx ON rule_evaluations(account_id, created_at);",
+        )
+        .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    transaction
+        .execute_batch("PRAGMA user_version = 14;")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .commit()
@@ -1748,6 +2399,62 @@ fn recover_processing_effects(
 }
 
 impl Database {
+    fn runtime_backlog(&self) -> AppResult<Vec<RuntimeBacklog>> {
+        self.with_connection(|connection| {
+            let mut backlog = Vec::new();
+            let mut messages = connection.prepare(
+                "SELECT account_id,group_id,COUNT(*) FROM messages WHERE acknowledged_at IS NOT NULL AND processed_at IS NULL AND processing_state IN ('pending','queued','retry','processing') GROUP BY account_id,group_id",
+            )?;
+            backlog.extend(
+                messages
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "message".into(),
+                            detail: String::new(),
+                            count: row.get::<_, i64>(2)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut effects = connection.prepare(
+                "SELECT account_id,group_id,effect_type,COUNT(*) FROM effect_outbox WHERE state IN ('queued','retry','processing') GROUP BY account_id,group_id,effect_type",
+            )?;
+            backlog.extend(
+                effects
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "write".into(),
+                            detail: row.get(2)?,
+                            count: row.get::<_, i64>(3)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut cards = connection.prepare(
+                "SELECT account_id,group_id,COUNT(*) FROM card_rename_jobs WHERE state IN ('queued','retry','processing') GROUP BY account_id,group_id",
+            )?;
+            backlog.extend(
+                cards
+                    .query_map([], |row| {
+                        Ok(RuntimeBacklog {
+                            account_id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            lane: "cardRename".into(),
+                            detail: String::new(),
+                            count: row.get::<_, i64>(2)?.max(0) as usize,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(backlog)
+        })
+        .map_err(|error| AppError::new("runtime_backlog", error.to_string()))
+    }
+
     pub fn open(paths: &AppPaths) -> AppResult<Self> {
         if let Some(parent) = paths.database.parent() {
             std::fs::create_dir_all(parent)
@@ -1824,6 +2531,10 @@ impl Database {
                 [],
             )?;
             connection.execute(
+                "UPDATE activity_runs SET state='retry',next_retry_at=NULL,last_error='DH BOT 重启后已恢复活动处理',updated_at=? WHERE state='preparing'",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            connection.execute(
                 "UPDATE ai_runs SET state='retry',next_retry_at=NULL,last_error='DH BOT 重启后已恢复执行',updated_at=? WHERE state='processing'",
                 params![Utc::now().to_rfc3339()],
             )?;
@@ -1885,6 +2596,46 @@ impl Database {
                     connection.query_row("SELECT COUNT(*) FROM groups", [], |row| row.get(0))?;
                 let messages: i64 =
                     connection.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+
+                // Queue depth per state
+                let mut stmt = connection.prepare(
+                    "SELECT state, COUNT(*) FROM effect_outbox GROUP BY state ORDER BY state",
+                )?;
+                let queue_depth: Vec<QueueDepthRow> = stmt
+                    .query_map([], |row| {
+                        Ok(QueueDepthRow { state: row.get(0)?, count: row.get(1)? })
+                    })?
+                    .filter_map(Result::ok)
+                    .collect();
+
+                // Retention policy rows (may not exist in pre-v14 schemas)
+                let retention_policies: Vec<RetentionPolicyRow> = connection
+                    .prepare(
+                        "SELECT table_name,max_days,max_rows,batch_size,enabled FROM retention_policies ORDER BY table_name",
+                    )
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map([], |row| {
+                                let enabled: i64 = row.get(4)?;
+                                Ok(RetentionPolicyRow {
+                                    table_name: row.get(0)?,
+                                    max_days: row.get(1)?,
+                                    max_rows: row.get(2)?,
+                                    batch_size: row.get(3)?,
+                                    enabled: enabled != 0,
+                                })
+                            })?
+                            .filter_map(Result::ok)
+                            .collect();
+                        Ok(rows)
+                    })
+                    .unwrap_or_default();
+
+                // Integrity check capped at 16 errors so the report stays compact
+                let index_integrity: String = connection
+                    .query_row("PRAGMA integrity_check(16)", [], |row| row.get(0))
+                    .unwrap_or_else(|_| "error".into());
+
                 Ok(DatabaseStatus {
                     path: self.path.display().to_string(),
                     schema_version: version,
@@ -1892,6 +2643,9 @@ impl Database {
                     accounts,
                     groups,
                     messages,
+                    queue_depth,
+                    retention_policies,
+                    index_integrity,
                 })
             })
             .map_err(InternalError::from)?;
@@ -1952,7 +2706,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let now = Utc::now().to_rfc3339();
             transaction.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, now],
             )?;
             if transaction
@@ -2052,7 +2806,7 @@ impl Database {
     pub fn ensure_business_apps(&self, account_id: &str) -> AppResult<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, Utc::now().to_rfc3339()],
             )?;
             Ok(())
@@ -2426,6 +3180,19 @@ impl Database {
         }).map_err(|error| AppError::new("groups_read", error.to_string()))
     }
 
+    fn get_group(&self, account_id: &str, group_id: i64) -> AppResult<Option<Group>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT account_id,group_id,name,owner_user_id,enabled,ai_enabled,moderation_enabled,machine_rules_enabled,ai_rules_enabled,manual_takeover,welcome_message,updated_at FROM groups WHERE account_id=? AND group_id=?",
+                    params![account_id, group_id],
+                    group_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("group_read", error.to_string()))
+    }
+
     pub fn upsert_member(&self, member: &Member) -> AppResult<i64> {
         self.upsert_member_from_wire(member)
     }
@@ -2468,6 +3235,24 @@ impl Database {
             let rows = statement.query_map(params![account_id, group_id], member_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(|error| AppError::new("members_read", error.to_string()))
+    }
+
+    fn get_member(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+    ) -> AppResult<Option<Member>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT account_id,group_id,user_id,nim_id,nickname,card_name,original_card_name,managed_card_name,card_suffix,role,account_state,blacklisted,present,join_source,prompt_read,locked_card_name,violation_count,discovered_at,joined_at,last_seen_at,updated_at FROM members WHERE account_id=? AND group_id=? AND user_id=?",
+                    params![account_id, group_id, user_id],
+                    member_from_row,
+                )
+                .optional()
+        })
+        .map_err(|error| AppError::new("member_read", error.to_string()))
     }
 
     pub fn mark_members_not_present(
@@ -2523,6 +3308,53 @@ impl Database {
             connection.execute("UPDATE members SET violation_count=violation_count+1,updated_at=? WHERE account_id=? AND group_id=? AND user_id=?", params![Utc::now().to_rfc3339(),account_id,group_id,user_id])?;
             connection.query_row("SELECT violation_count FROM members WHERE account_id=? AND group_id=? AND user_id=?", params![account_id,group_id,user_id], |row| row.get(0))
         }).map_err(|error| AppError::new("member_violation", error.to_string()))
+    }
+
+    pub fn expect_member_card_update(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        card_name: &str,
+        source_key: &str,
+    ) -> AppResult<()> {
+        let now = Utc::now();
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM expected_member_card_updates WHERE expires_at<?",
+                params![now.to_rfc3339()],
+            )?;
+            connection.execute(
+                "INSERT INTO expected_member_card_updates(account_id,group_id,user_id,card_name,source_key,expires_at,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,group_id,user_id,card_name) DO UPDATE SET source_key=excluded.source_key,expires_at=excluded.expires_at,created_at=excluded.created_at",
+                params![account_id,group_id,user_id,card_name,source_key,(now + ChronoDuration::minutes(2)).to_rfc3339(),now.to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| AppError::new("member_card_expectation", error.to_string()))
+    }
+
+    pub fn consume_expected_member_card_update(
+        &self,
+        account_id: &str,
+        group_id: i64,
+        user_id: i64,
+        card_name: &str,
+    ) -> AppResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM expected_member_card_updates WHERE expires_at<?",
+                params![now],
+            )?;
+            let consumed = transaction.execute(
+                "DELETE FROM expected_member_card_updates WHERE account_id=? AND group_id=? AND user_id=? AND card_name=? AND expires_at>=?",
+                params![account_id,group_id,user_id,card_name,now],
+            )? > 0;
+            transaction.commit()?;
+            Ok(consumed)
+        })
+        .map_err(|error| AppError::new("member_card_expectation", error.to_string()))
     }
 
     pub fn set_member_blacklisted(
@@ -2951,6 +3783,52 @@ impl Database {
         .map_err(|error| AppError::new("effect_outbox_enqueue", error.to_string()))
     }
 
+    pub fn enqueue_activity_effect(
+        &self,
+        run_id: i64,
+        text: &str,
+        source: &str,
+        request: &EffectOutboxRequest,
+    ) -> AppResult<EnqueuedEffect> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "INSERT OR IGNORE INTO effect_outbox(account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,created_at,claimed_at,completed_at) VALUES(?,?,?,?,?,'queued',0,NULL,'',?,NULL,NULL)",
+                params![request.account_id,request.group_id,request.effect_type,request.payload_json,request.dedupe_key,now],
+            )?;
+            let (id, state) = if changed == 1 || request.dedupe_key.is_empty() {
+                transaction.query_row(
+                    "SELECT id,state FROM effect_outbox WHERE id=last_insert_rowid()",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            } else {
+                transaction.query_row(
+                    "SELECT id,state FROM effect_outbox WHERE account_id=? AND dedupe_key=?",
+                    params![request.account_id, request.dedupe_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            };
+            let run_changed = transaction.execute(
+                "UPDATE activity_runs SET state='queued',text=?,content_source=?,updated_at=? WHERE id=? AND state='preparing'",
+                params![text,source,now,run_id],
+            )?;
+            if run_changed != 1 {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "activity run is not preparing".into(),
+                ));
+            }
+            transaction.commit()?;
+            Ok(EnqueuedEffect {
+                id,
+                inserted: changed == 1,
+                state,
+            })
+        })
+        .map_err(|error| AppError::new("activity_effect_enqueue", error.to_string()))
+    }
+
     pub fn claim_effect_outbox(
         &self,
         account_id: Option<&str>,
@@ -2961,7 +3839,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let ids = {
                 let mut statement = transaction.prepare(
-                    "SELECT id FROM effect_outbox WHERE (?1 IS NULL OR account_id=?1) AND state IN ('queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?2) ORDER BY created_at,id LIMIT ?3",
+                    "SELECT id FROM effect_outbox WHERE (?1 IS NULL OR account_id=?1) AND state IN ('queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?2) ORDER BY priority,created_at,id LIMIT ?3",
                 )?;
                 let result = statement
                     .query_map(
@@ -2979,7 +3857,7 @@ impl Database {
                 )?;
                 if changed == 1 {
                     claimed.push(transaction.query_row(
-                        "SELECT id,account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,receipt_json,created_at,claimed_at,completed_at FROM effect_outbox WHERE id=?",
+                    "SELECT id,account_id,group_id,effect_type,payload_json,dedupe_key,state,attempts,next_attempt_at,last_error,receipt_json,created_at,claimed_at,completed_at,priority,lane,order_key,correlation_id,origin,expires_at FROM effect_outbox WHERE id=?",
                         params![id],
                         effect_outbox_from_row,
                     )?);
@@ -3567,6 +4445,12 @@ fn effect_outbox_from_row(row: &Row<'_>) -> rusqlite::Result<EffectOutboxItem> {
         created_at: parse_time(row.get(11)?),
         claimed_at: optional_time(row.get(12)?),
         completed_at: optional_time(row.get(13)?),
+        priority: row.get(14)?,
+        lane: row.get(15)?,
+        order_key: row.get(16)?,
+        correlation_id: row.get(17)?,
+        origin: row.get(18)?,
+        expires_at: optional_time(row.get(19)?),
     })
 }
 
@@ -3654,12 +4538,29 @@ mod tests {
         };
         let database = Database::open(&paths).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 11);
+        assert_eq!(status.schema_version, 14);
         assert_eq!(status.groups, 0);
         assert_eq!(
             database.get_setting("ai.model").unwrap().as_deref(),
             Some("deepseek-v4-pro")
         );
+    }
+
+    #[test]
+    fn expected_member_card_updates_are_exact_and_single_use() {
+        let database = populated_database();
+        database
+            .expect_member_card_update("a", 1, 9, "DH群员0009", "test:rename")
+            .unwrap();
+        assert!(!database
+            .consume_expected_member_card_update("a", 1, 9, "其他名称")
+            .unwrap());
+        assert!(database
+            .consume_expected_member_card_update("a", 1, 9, "DH群员0009")
+            .unwrap());
+        assert!(!database
+            .consume_expected_member_card_update("a", 1, 9, "DH群员0009")
+            .unwrap());
     }
 
     #[test]
@@ -3994,7 +4895,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 11);
+        assert_eq!(database.status().unwrap().schema_version, 14);
         let columns = database
             .with_connection(|connection| {
                 let mut statement = connection.prepare("PRAGMA table_info(members)")?;
@@ -4022,7 +4923,7 @@ mod tests {
         );
         drop(database);
         let reopened = Database::open(&paths).unwrap();
-        assert_eq!(reopened.status().unwrap().schema_version, 11);
+        assert_eq!(reopened.status().unwrap().schema_version, 14);
         assert_eq!(
             std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
             1
@@ -4054,7 +4955,7 @@ mod tests {
         drop(legacy);
 
         let database = Database::open(&paths).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 11);
+        assert_eq!(database.status().unwrap().schema_version, 14);
         for table in ["actions", "effect_outbox"] {
             assert!(database
                 .with_connection(|connection| table_has_column(connection, table, "receipt_json"))
@@ -4068,7 +4969,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_and_v3_to_v11_idempotently() {
+    fn migrates_v2_and_v3_to_v13_idempotently() {
         for version in [2_i64, 3_i64] {
             let directory = tempdir().unwrap();
             let paths = AppPaths {
@@ -4093,7 +4994,7 @@ mod tests {
             drop(legacy);
 
             let database = Database::open(&paths).unwrap();
-            assert_eq!(database.status().unwrap().schema_version, 11);
+            assert_eq!(database.status().unwrap().schema_version, 14);
             for table in ["actions", "effect_outbox"] {
                 assert!(database
                     .with_connection(|connection| {
@@ -4107,12 +5008,101 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 11);
-            assert_eq!(
+            assert_eq!(reopened.status().unwrap().schema_version, 14);            assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1
             );
         }
+    }
+
+    #[test]
+    fn outstanding_task_reminders_keep_firing_after_activity_migration() {
+        let directory = tempdir().unwrap();
+        let paths = AppPaths {
+            root: directory.path().to_path_buf(),
+            v3: directory.path().join("3.0"),
+            database: directory.path().join("3.0/dh.db"),
+            secrets: directory.path().join("3.0/secrets.dat"),
+            logs: directory.path().join("3.0/logs"),
+            legacy_backups: directory.path().join("legacy-backups"),
+            runtime_mode_file: directory.path().join("runtime-mode"),
+        };
+        std::fs::create_dir_all(&paths.v3).unwrap();
+
+        // 造一个 v11 库：一条还没发出的未来提醒，一条已经发过的提醒。
+        let pending_at = "2031-09-15T10:00:00+00:00";
+        let legacy = Connection::open(&paths.database).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        legacy
+            .execute_batch(&format!(
+                "INSERT INTO accounts(id,display_name,role,discovered_at,updated_at) VALUES('acct','','unknown','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 INSERT INTO groups(account_id,group_id,name,updated_at) VALUES('acct',77,'测试群','2026-01-01T00:00:00+00:00');
+                 INSERT INTO tasks(id,account_id,group_id,title,description,status,reminder_at,reminder_state,created_at,updated_at)
+                   VALUES(1,'acct',77,'待发提醒','记得开播','pending','{pending_at}','pending','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 INSERT INTO tasks(id,account_id,group_id,title,description,status,reminder_at,reminder_sent_at,reminder_state,created_at,updated_at)
+                   VALUES(2,'acct',77,'已发提醒','历史','done','2026-02-01T10:00:00+00:00','2026-02-01T10:00:05+00:00','sent','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 PRAGMA user_version=11;"
+            ))
+            .unwrap();
+        drop(legacy);
+
+        let database = Database::open(&paths).unwrap();
+        assert_eq!(database.status().unwrap().schema_version, 14);
+        let (enabled, next_run_at, local_time): (i64, Option<String>, String) = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT activities.enabled,activities.next_run_at,activity_times.local_time \
+                     FROM activities JOIN activity_times ON activity_times.activity_id=activities.id \
+                     WHERE activities.source_key='legacy-task:1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(enabled, 1);
+        assert_eq!(next_run_at.as_deref(), Some(pending_at));
+
+        // local_time 是 timezone 列所指时区的墙上时间，不能是原始 UTC 的 10:00。
+        let expected_local = DateTime::parse_from_rfc3339(pending_at)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(local_time, expected_local);
+
+        // 已经发出的提醒保持停用草稿，不重复轰炸群。
+        let sent_enabled: i64 = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT enabled FROM activities WHERE source_key='legacy-task:2'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(sent_enabled, 0);
+
+        // 版本闸：迁移每次启动都会跑，但不能反复覆盖用户后来手工停用的活动。
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE activities SET enabled=0 WHERE source_key='legacy-task:1'",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(database);
+        let reopened = Database::open(&paths).unwrap();
+        let still_disabled: i64 = reopened
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT enabled FROM activities WHERE source_key='legacy-task:1'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(still_disabled, 0);
     }
 
     #[test]

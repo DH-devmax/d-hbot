@@ -30,7 +30,7 @@
 - API 后端：Responses
 - 思考深度：`xhigh`（输入 `xhight` 时规范为 `xhigh`）
 - 单次 AI 超时：60 秒
-- 主备总预算：65 秒
+- 单连接生成上限：15 秒；主备总预算：20 秒
 - AI 群权限：回复、撤回开启；任务、禁言、移出关闭
 - 规则：测试前由管理员明确启用；交接包不携带真实群规则状态
 - 默认动作：仅撤回
@@ -61,8 +61,8 @@
 - React UI：58 项通过
 - Contract v2：34 项通过
 - 生产隔离：10 个场景通过
-- Rust 生产：186 项通过，1 项外部密钥 live 测试按设计忽略
-- Rust Fixture：192 项通过，1 项外部密钥 live 测试按设计忽略
+- Rust 生产：202 项通过，1 项外部密钥 live 测试按设计忽略
+- Rust Fixture：208 项通过，1 项外部密钥 live 测试按设计忽略；两个浏览器 CDP/Runtime 集成测试通过
 - CDP Fixture：1 项通过
 - Headless Runtime + SQLite：1 项通过
 - Playwright Fixture：主流程通过，手册截图按配置跳过

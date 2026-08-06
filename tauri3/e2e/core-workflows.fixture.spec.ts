@@ -5,10 +5,11 @@ import path from 'node:path'
 type FixtureState = {
   rules: Array<Record<string, unknown>>
   tasks: Array<Record<string, unknown>>
+  activities: Array<Record<string, unknown>>
   schedules: Array<Record<string, unknown>>
 }
 
-const fixtureState: FixtureState = { rules: [], tasks: [], schedules: [] }
+const fixtureState: FixtureState = { rules: [], tasks: [], activities: [], schedules: [] }
 
 async function installDeveloperFixture(page: Page) {
   await page.addInitScript(({ initialState }) => {
@@ -32,7 +33,7 @@ async function installDeveloperFixture(page: Page) {
         case 'plugin:event|listen': return callbackId++
         case 'plugin:event|unlisten': return null
         case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Fixture', pageUrl: 'http://127.0.0.1:51300', nimAccount: 'ACCOUNT', detail: '开发 Fixture 已就绪' }
-        case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 5, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
+        case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 13, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
         case 'get_ai_settings': return { base_url: 'http://127.0.0.1:51300/v1', webhook_url: '', model: 'fixture-model', api_key_configured: true }
         case 'get_wang_startup_settings': return { path: '', autoStart: true }
         case 'save_wang_startup_settings': return null
@@ -65,6 +66,15 @@ async function installDeveloperFixture(page: Page) {
           state.tasks = state.tasks.filter((task: any) => task.id !== next.id).concat(next)
           return next.id
         }
+        case 'list_activities': return state.activities
+        case 'save_activity': {
+          const next = { ...args.activity, id: args.activity.id || state.activities.length + 1 }
+          state.activities = state.activities.filter((activity: any) => activity.id !== next.id).concat(next)
+          return next.id
+        }
+        case 'list_activity_runs': return []
+        case 'preview_activity_text': return { text: args.activity.aiOptimize ? '今晚活动开始啦，欢迎大家参加！' : args.activity.content, source: args.activity.aiOptimize ? 'ai' : 'fixed' }
+        case 'publish_activity_now': return args.activityId ? 1 : 0
         case 'list_schedules': return state.schedules
         case 'save_schedule': {
           const next = { ...args.schedule, id: args.schedule.id || state.schedules.length + 1 }
@@ -141,10 +151,14 @@ test('developer fixture covers navigation, data and management workflows', async
   await page.getByRole('button', { name: '保存绑定' }).click()
   await expect.poll(() => page.evaluate(() => (window as any).__DH_E2E_ACTIONS__.map((item: any) => item.command))).toEqual(expect.arrayContaining(['save_knowledge_document', 'bind_knowledge_base']))
 
-  await page.getByRole('button', { name: '任务与计划' }).click()
-  await page.getByLabel('任务标题').fill('跟进群内问题')
-  await page.getByRole('button', { name: '保存任务' }).click()
-  await expect(page.getByText('跟进群内问题').first()).toBeVisible()
+  await page.getByRole('button', { name: '活动与计划' }).click()
+  await page.getByLabel('活动名称').fill('晚间互动')
+  await page.getByLabel('活动原文').fill('今晚活动开始，欢迎参加。')
+  await page.getByRole('button', { name: '保存活动' }).click()
+  await expect(page.getByText('晚间互动').first()).toBeVisible()
+  await page.getByText('使用 AI 优化').click()
+  await page.getByRole('button', { name: '预览文案' }).click()
+  await expect(page.getByText('今晚活动开始啦，欢迎大家参加！')).toBeVisible()
   await page.getByRole('button', { name: '开关群计划' }).click()
   await page.locator('label.check-chip').filter({ hasText: '16 人开发测试群' }).click()
   await page.getByRole('button', { name: '保存计划' }).click()
@@ -167,7 +181,7 @@ test('developer fixture covers navigation, data and management workflows', async
   await expect(page.getByText('FIXTURE-HASH')).toBeVisible()
 
   const commands = await page.evaluate(() => (window as any).__DH_E2E_ACTIONS__.map((item: any) => item.command))
-  expect(commands).toEqual(expect.arrayContaining(['send_text_batch', 'save_rule', 'save_knowledge_document', 'bind_knowledge_base', 'save_task', 'save_schedule']))
+  expect(commands).toEqual(expect.arrayContaining(['send_text_batch', 'save_rule', 'save_knowledge_document', 'bind_knowledge_base', 'save_activity', 'preview_activity_text', 'save_schedule']))
   expect(await page.locator('body').innerText()).not.toContain('127.0.0.1:9222')
 })
 
@@ -189,7 +203,7 @@ test('captures current Tauri pages for the manual', async ({ page }) => {
   await capture('消息台', 'messages.png')
   await capture('规则', 'rules.png')
   await capture('知识与 AI', 'knowledge.png')
-  await capture('任务与计划', 'tasks.png')
+  await capture('活动与计划', 'activities.png')
   await capture('审计', 'audit.png')
   await capture('设置', 'settings.png')
   await page.getByRole('button', { name: '知识与 AI' }).click()

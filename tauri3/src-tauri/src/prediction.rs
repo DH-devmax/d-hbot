@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::{America::Vancouver, Asia::Shanghai};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use zip::ZipArchive;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{PredictionResult, PredictionSnapshot};
@@ -199,6 +202,10 @@ pub trait PredictionSource: Send + Sync {
     }
 }
 
+const BCLC_KENO_CURRENT_YEAR_URL: &str =
+    "https://auth.playnow.com/resources/documents/downloadable-numbers/KenoCurrentYear.zip";
+const PUBLIC_KENO_FALLBACK_URL: &str = "https://pc28.help/api/keno.json";
+const CWL_KL8_URL: &str = "https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice";
 const DYNAMIC_CONFIG_URL: &str =
     "https://hao123wc.obs.ap-southeast-1.myhuaweicloud.com/zcs/duoduo_2.txt";
 const FALLBACK_BASES: &[&str] = &[
@@ -207,6 +214,38 @@ const FALLBACK_BASES: &[&str] = &[
     "https://api1.mbf52.com",
     "https://api2.mbf52.com",
 ];
+/// 公开开奖源响应体上限。这些都是第三方/公网地址，必须在读取过程中就设上限。
+const PUBLIC_RESPONSE_LIMIT: usize = 20 * 1024 * 1024;
+
+/// 边读边限长地取回响应体。
+///
+/// 先 `bytes().await` 再检查长度等于已经把整个响应收进内存，上限就形同虚设；
+/// 这里按 chunk 累加，一超限立刻断开连接。
+async fn read_capped_body(
+    response: reqwest::Response,
+    limit: usize,
+    source_label: &str,
+) -> AppResult<Vec<u8>> {
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|_| {
+            AppError::new(
+                "prediction_public_response",
+                format!("{source_label}读取失败"),
+            )
+        })?;
+        let Some(chunk) = chunk else { break };
+        if body.len() + chunk.len() > limit {
+            return Err(AppError::new(
+                "prediction_public_response",
+                format!("{source_label}超过大小限制"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Clone)]
 struct CachedPrediction {
@@ -216,35 +255,49 @@ struct CachedPrediction {
 
 type SourceBaseCache = Option<(Instant, Vec<String>)>;
 
-pub struct ZcgLotterySource {
+/// Public-first source. The legacy ZCG endpoint is retained only as an explicit
+/// compatibility fallback when a caller supplies DH_PREDICTION_TOKEN.
+pub struct PublicLotterySource {
     client: reqwest::Client,
+    request_timeout: Duration,
     stale_after: Duration,
     token: String,
     live_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedPrediction>>>,
     history_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedPrediction>>>,
     base_cache: Arc<tokio::sync::Mutex<SourceBaseCache>>,
-    request_lock: Arc<tokio::sync::Mutex<()>>,
+    request_gate: Arc<tokio::sync::Semaphore>,
+    request_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     test_bases: Vec<String>,
 }
 
-impl ZcgLotterySource {
+impl PublicLotterySource {
     pub fn new(timeout: Duration) -> AppResult<Self> {
+        let timeout = if timeout.is_zero() {
+            Duration::from_secs(8)
+        } else {
+            timeout
+        };
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(timeout.min(Duration::from_secs(8)))
+            // BCLC's archive endpoint intermittently resets HTTP/2 streams while
+            // serving the ZIP; HTTP/1.1 is stable for both public providers.
+            .http1_only()
+            .connect_timeout(timeout.min(Duration::from_secs(5)))
+            .timeout(timeout)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
             .build()
             .map_err(|_| AppError::new("prediction_client", "开奖数据客户端初始化失败"))?;
         Ok(Self {
             client,
+            request_timeout: timeout,
             stale_after: Duration::from_secs(15 * 60),
             token: std::env::var("DH_PREDICTION_TOKEN").unwrap_or_default(),
             live_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             history_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             base_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            request_lock: Arc::new(tokio::sync::Mutex::new(())),
+            request_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            request_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_bases: Vec::new(),
         })
@@ -267,11 +320,15 @@ impl ZcgLotterySource {
         if !self.test_bases.is_empty() {
             return self.test_bases.clone();
         }
-        let mut cache = self.base_cache.lock().await;
-        if let Some((stored_at, bases)) = cache.as_ref() {
-            if stored_at.elapsed() < Duration::from_secs(10 * 60) {
-                return bases.clone();
-            }
+        if let Some(bases) = self
+            .base_cache
+            .lock()
+            .await
+            .as_ref()
+            .filter(|(stored_at, _)| stored_at.elapsed() < Duration::from_secs(10 * 60))
+            .map(|(_, bases)| bases.clone())
+        {
+            return bases;
         }
         let mut bases = Vec::new();
         if let Ok(response) = self.client.get(DYNAMIC_CONFIG_URL).send().await {
@@ -294,11 +351,143 @@ impl ZcgLotterySource {
         bases.extend(FALLBACK_BASES.iter().map(|value| (*value).to_string()));
         let mut seen = HashSet::new();
         bases.retain(|value| seen.insert(value.clone()));
-        *cache = Some((Instant::now(), bases.clone()));
+        *self.base_cache.lock().await = Some((Instant::now(), bases.clone()));
         bases
     }
 
+    async fn request_lock_for(&self, game_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.request_locks
+            .lock()
+            .await
+            .entry(game_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     async fn fetch_network(&self, game: &Game) -> AppResult<PredictionSourceResult> {
+        match game.id {
+            "jnd" => match self.fetch_bclc(game).await {
+                Ok(result) => Ok(result),
+                Err(_) => self.fetch_public_keno(game).await,
+            },
+            "pcdd" | "bj28" => self.fetch_cwl(game).await,
+            "btc28" if self.token.trim().is_empty() => Err(AppError::new(
+                "prediction_algorithm_unverified",
+                "公开区块数据存在，但比特币28没有统一可核验的官方派生算法",
+            )),
+            "tx28" if self.token.trim().is_empty() => Err(AppError::new(
+                "prediction_no_official_source",
+                "未发现可核验的腾讯分分彩28官方开奖源",
+            )),
+            _ => self.fetch_legacy_network(game).await,
+        }
+    }
+
+    async fn fetch_bclc(&self, game: &Game) -> AppResult<PredictionSourceResult> {
+        let response = self
+            .client
+            .get(BCLC_KENO_CURRENT_YEAR_URL)
+            .header("Accept", "application/zip")
+            .timeout(self.request_timeout.min(Duration::from_secs(6)))
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new("prediction_public_request", "BCLC 官方 Keno 数据连接失败")
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "prediction_public_http",
+                format!("BCLC 官方 Keno 返回 HTTP {}", response.status()),
+            ));
+        }
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "BCLC 官方 Keno 文件").await?;
+        let snapshot = parse_bclc_zip(game, &bytes).ok_or_else(|| {
+            AppError::new(
+                "prediction_public_contract",
+                "BCLC 官方 Keno 文件格式无法识别",
+            )
+        })?;
+        Ok(PredictionSourceResult::from_snapshot(
+            snapshot,
+            Utc::now(),
+            self.stale_after,
+        ))
+    }
+
+    async fn fetch_cwl(&self, game: &Game) -> AppResult<PredictionSourceResult> {
+        let response = self
+            .client
+            .get(CWL_KL8_URL)
+            .header("Accept", "application/json")
+            .header("Referer", "https://www.cwl.gov.cn/")
+            .timeout(self.request_timeout.min(Duration::from_secs(12)))
+            .query(&[
+                ("name", "kl8"),
+                ("issueCount", "30"),
+                ("pageNo", "1"),
+                ("pageSize", "30"),
+            ])
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new("prediction_public_request", "中国福彩网公开数据连接失败")
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "prediction_public_http",
+                format!("中国福彩网公开数据返回 HTTP {}", response.status()),
+            ));
+        }
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "中国福彩网公开数据").await?;
+        let snapshot = parse_cwl_snapshot(game, &bytes).ok_or_else(|| {
+            AppError::new(
+                "prediction_public_contract",
+                "中国福彩网快乐8返回结构无法识别",
+            )
+        })?;
+        Ok(PredictionSourceResult::from_snapshot(
+            snapshot,
+            Utc::now(),
+            Duration::from_secs(36 * 60 * 60),
+        ))
+    }
+
+    async fn fetch_public_keno(&self, game: &Game) -> AppResult<PredictionSourceResult> {
+        let response = self
+            .client
+            .get(PUBLIC_KENO_FALLBACK_URL)
+            .header("Accept", "application/json")
+            .timeout(self.request_timeout.min(Duration::from_secs(12)))
+            .query(&[("nbr", "60")])
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    "prediction_public_request",
+                    "BCLC 官方文件和公开 Keno 回退源都无法连接",
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                "prediction_public_http",
+                format!("公开 Keno 回退源返回 HTTP {}", response.status()),
+            ));
+        }
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "公开 Keno 回退源").await?;
+        let snapshot = parse_public_keno_snapshot(game, &bytes).ok_or_else(|| {
+            AppError::new("prediction_public_contract", "公开 Keno 回退源格式无法识别")
+        })?;
+        Ok(PredictionSourceResult::from_snapshot(
+            snapshot,
+            Utc::now(),
+            self.stale_after,
+        ))
+    }
+
+    async fn fetch_legacy_network(&self, game: &Game) -> AppResult<PredictionSourceResult> {
         if self.token.trim().is_empty() {
             return Err(AppError::new(
                 "prediction_not_configured",
@@ -360,19 +549,23 @@ impl ZcgLotterySource {
 }
 
 #[async_trait]
-impl PredictionSource for ZcgLotterySource {
+impl PredictionSource for PublicLotterySource {
     async fn fetch_live(&self, game: &Game) -> AppResult<PredictionSourceResult> {
         if let Some(cached) = self.live_cache.lock().await.get(game.id).cloned() {
-            if cached.stored_at.elapsed() < Duration::from_secs(10) {
+            if cached.stored_at.elapsed() < live_cache_ttl(game.id) {
                 return Ok(cached.result);
             }
         }
-        let _request = self.request_lock.lock().await;
+        let request_lock = self.request_lock_for(game.id).await;
+        let _game_request = request_lock.lock().await;
         if let Some(cached) = self.live_cache.lock().await.get(game.id).cloned() {
-            if cached.stored_at.elapsed() < Duration::from_secs(10) {
+            if cached.stored_at.elapsed() < live_cache_ttl(game.id) {
                 return Ok(cached.result);
             }
         }
+        let _request_permit = self.request_gate.acquire().await.map_err(|_| {
+            AppError::new("prediction_shutdown", "开奖数据请求队列已关闭").retryable()
+        })?;
         let result = self.fetch_network(game).await?;
         let cached = CachedPrediction {
             stored_at: Instant::now(),
@@ -391,7 +584,7 @@ impl PredictionSource for ZcgLotterySource {
 
     async fn fetch_history(&self, game: &Game, limit: usize) -> AppResult<Vec<Vec<i64>>> {
         if let Some(cached) = self.history_cache.lock().await.get(game.id).cloned() {
-            if cached.stored_at.elapsed() < Duration::from_secs(60) {
+            if cached.stored_at.elapsed() < history_cache_ttl(game.id) {
                 return Ok(cached
                     .result
                     .snapshot
@@ -405,6 +598,26 @@ impl PredictionSource for ZcgLotterySource {
             .snapshot
             .map(|snapshot| snapshot.history.into_iter().take(limit).collect())
             .unwrap_or_default())
+    }
+}
+
+fn live_cache_ttl(game_id: &str) -> Duration {
+    match game_id {
+        // The official BCLC archive is substantially larger than the JSON feeds and
+        // Keno draws are several minutes apart, so a one-minute cache is sufficient.
+        "jnd" => Duration::from_secs(60),
+        // China Welfare Lottery Keno is a daily draw. A short background refresh is
+        // still useful around draw time without repeatedly loading the public API.
+        "pcdd" | "bj28" => Duration::from_secs(30 * 60),
+        _ => Duration::from_secs(10),
+    }
+}
+
+fn history_cache_ttl(game_id: &str) -> Duration {
+    match game_id {
+        "jnd" => Duration::from_secs(3 * 60),
+        "pcdd" | "bj28" => Duration::from_secs(60 * 60),
+        _ => Duration::from_secs(60),
     }
 }
 
@@ -491,7 +704,55 @@ pub async fn fetch_status<S: PredictionSource + ?Sized>(
 }
 
 pub fn format_reply(result: &PredictionResult) -> String {
-    format!("{} 第{}期\n最新结果：{}\n更新时间：{}\n趋势摘要：{}\n候选方向：{}\n参考度：{}，仅作信息参考。", result.game, result.period, join(&result.latest_result, " + "), result.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"), result.trend, if result.candidates.is_empty() { "暂无".into() } else { join(&result.candidates, "、") }, confidence_text(result.confidence))
+    let total = result.latest_result.iter().sum::<i64>();
+    format!(
+        "【{}】第{}期\n开奖：{} = {}（{}）\n时间：{}\n趋势：{}\n参考方向：{}\n参考度：{}\n说明：基于已核验历史数据统计，仅作信息参考。",
+        result.game,
+        result.period,
+        join(&result.latest_result, " + "),
+        total,
+        result_shape(total, &result.latest_result),
+        result.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+        result.trend,
+        if result.candidates.is_empty() {
+            "暂无".into()
+        } else {
+            join(&result.candidates, "、")
+        },
+        confidence_text(result.confidence),
+    )
+}
+
+pub fn format_stale_reply(snapshot: &PredictionSnapshot) -> String {
+    let total = snapshot.result.iter().sum::<i64>();
+    format!(
+        "【{}】第{}期\n最后结果：{} = {}（{}）\n时间：{}\n数据状态：结果已过期，仅展示最后一次已核验记录，不生成参考方向。",
+        snapshot.game,
+        snapshot.period,
+        join(&snapshot.result, " + "),
+        total,
+        result_shape(total, &snapshot.result),
+        snapshot.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+    )
+}
+
+fn result_shape(total: i64, balls: &[i64]) -> String {
+    let size = if total >= 14 { "大" } else { "小" };
+    let parity = if total.rem_euclid(2) == 0 {
+        "双"
+    } else {
+        "单"
+    };
+    let extra = if balls.len() == 3 && balls.iter().all(|value| *value == balls[0]) {
+        " · 豹子"
+    } else if total <= 5 {
+        " · 极小"
+    } else if total >= 22 {
+        " · 极大"
+    } else {
+        ""
+    };
+    format!("{size}{parity}{extra}")
 }
 
 #[cfg(test)]
@@ -550,6 +811,229 @@ struct ZcgDraw {
     opened_at: DateTime<Utc>,
 }
 
+/// Human-readable source description used by the health page and reply formatter.
+pub fn public_source_label(game_id: &str) -> &'static str {
+    match game_id {
+        "jnd" => "BCLC 官方 Keno 原始开奖；失败时用公开 Keno 回退，DH 派生 28 结果",
+        "pcdd" | "bj28" => "中国福彩网官方快乐8开奖，DH 按公开规则派生 28 结果",
+        "btc28" => "公开区块数据，但28派生算法未核验",
+        "tx28" => "没有可核验的官方公开数据源",
+        _ => "兼容数据源",
+    }
+}
+
+fn three_ball_sum(numbers: &[i64], indexes: &[&[usize]]) -> Option<Vec<i64>> {
+    if numbers.len() < 19 {
+        return None;
+    }
+    Some(
+        indexes
+            .iter()
+            .map(|positions| {
+                positions
+                    .iter()
+                    .filter_map(|position| numbers.get(*position))
+                    .sum::<i64>()
+                    .rem_euclid(10)
+            })
+            .collect(),
+    )
+}
+
+/// Canada 28: sorted BCLC Keno positions 2/5/8..., 3/6/9..., 4/7/10...
+fn derive_canada28(numbers: &[i64]) -> Option<Vec<i64>> {
+    three_ball_sum(
+        numbers,
+        &[
+            &[1, 4, 7, 10, 13, 16],
+            &[2, 5, 8, 11, 14, 17],
+            &[3, 6, 9, 12, 15, 18],
+        ],
+    )
+}
+
+/// PC28/Beijing 28: sorted 快乐8 positions 1-6, 7-12, 13-18.
+fn derive_welfare28(numbers: &[i64]) -> Option<Vec<i64>> {
+    three_ball_sum(
+        numbers,
+        &[
+            &[0, 1, 2, 3, 4, 5],
+            &[6, 7, 8, 9, 10, 11],
+            &[12, 13, 14, 15, 16, 17],
+        ],
+    )
+}
+
+fn snapshot_from_draws(game: &Game, mut draws: Vec<ZcgDraw>) -> Option<PredictionSnapshot> {
+    draws.retain(|draw| !draw.period.is_empty() && draw.result.len() == 3);
+    draws.sort_by(|left, right| period_cmp(&right.period, &left.period));
+    let mut periods = HashSet::new();
+    draws.retain(|draw| periods.insert(draw.period.clone()));
+    let latest = draws.first()?.clone();
+    Some(PredictionSnapshot {
+        game: game.name.into(),
+        period: latest.period,
+        result: latest.result,
+        updated_at: latest.opened_at,
+        history: draws.into_iter().take(60).map(|draw| draw.result).collect(),
+        freshness: PredictionFreshness::Fresh.as_str().into(),
+    })
+}
+
+fn parse_bclc_zip(game: &Game, body: &[u8]) -> Option<PredictionSnapshot> {
+    let mut archive = ZipArchive::new(Cursor::new(body)).ok()?;
+    let mut csv = String::new();
+    archive
+        .by_name("KenoCurrentYear.csv")
+        .ok()?
+        .read_to_string(&mut csv)
+        .ok()?;
+    parse_bclc_csv(game, &csv)
+}
+
+fn parse_bclc_csv(game: &Game, csv: &str) -> Option<PredictionSnapshot> {
+    let mut draws = Vec::new();
+    for line in csv.lines().skip(1) {
+        let fields = line
+            .split(',')
+            .map(|field| field.trim().trim_matches('"'))
+            .collect::<Vec<_>>();
+        if fields.len() < 24 || fields.first().copied() != Some("KENO") {
+            continue;
+        }
+        let period = fields[1].to_string();
+        let Ok(local) = NaiveDateTime::parse_from_str(fields[2], "%Y-%m-%d %H:%M:%S") else {
+            continue;
+        };
+        let opened_at = Vancouver
+            .from_local_datetime(&local)
+            .single()
+            .or_else(|| Vancouver.from_local_datetime(&local).earliest());
+        let Some(opened_at) = opened_at else {
+            continue;
+        };
+        let opened_at = opened_at.with_timezone(&Utc);
+        let mut numbers = fields[4..24]
+            .iter()
+            .filter_map(|value| value.parse::<i64>().ok())
+            .collect::<Vec<_>>();
+        if numbers.len() != 20 {
+            continue;
+        }
+        numbers.sort_unstable();
+        let Some(result) = derive_canada28(&numbers) else {
+            continue;
+        };
+        draws.push(ZcgDraw {
+            period,
+            result,
+            opened_at,
+        });
+    }
+    snapshot_from_draws(game, draws)
+}
+
+fn parse_cwl_snapshot(game: &Game, body: &[u8]) -> Option<PredictionSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let rows = value.get("result")?.as_array()?;
+    let mut draws = Vec::new();
+    for row in rows {
+        let Some(period) = row.get("code").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(date) = row
+            .get("date")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.get(..10))
+        else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+            continue;
+        };
+        let Some(local) = date.and_hms_opt(21, 30, 0) else {
+            continue;
+        };
+        let opened_at = Shanghai
+            .from_local_datetime(&local)
+            .single()
+            .or_else(|| Shanghai.from_local_datetime(&local).earliest());
+        let Some(opened_at) = opened_at else {
+            continue;
+        };
+        let opened_at = opened_at.with_timezone(&Utc);
+        let Some(red) = row.get("red").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut numbers = red
+            .split(',')
+            .filter_map(|value| value.trim().parse::<i64>().ok())
+            .collect::<Vec<_>>();
+        if numbers.len() != 20 {
+            continue;
+        }
+        numbers.sort_unstable();
+        let Some(result) = derive_welfare28(&numbers) else {
+            continue;
+        };
+        draws.push(ZcgDraw {
+            period: period.to_string(),
+            result,
+            opened_at,
+        });
+    }
+    snapshot_from_draws(game, draws)
+}
+
+fn parse_public_keno_snapshot(game: &Game, body: &[u8]) -> Option<PredictionSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let rows = value.get("data")?.as_array()?;
+    let mut draws = Vec::new();
+    for row in rows {
+        // 单行字段缺失只跳过该行，不能让整个回退载荷失败——与 parse_bclc_csv /
+        // parse_cwl_snapshot 的行级容错保持一致。
+        let (Some(period), Some(date), Some(time), Some(raw_numbers)) = (
+            row.get("nbr").and_then(|value| value.as_str()),
+            row.get("date").and_then(|value| value.as_str()),
+            row.get("time").and_then(|value| value.as_str()),
+            row.get("nbrs").and_then(|value| value.as_str()),
+        ) else {
+            continue;
+        };
+        let Ok(local) =
+            NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M:%S")
+        else {
+            continue;
+        };
+        // The public mirror normalizes its date/time fields to Beijing time.
+        let Some(opened_at) = Shanghai
+            .from_local_datetime(&local)
+            .single()
+            .or_else(|| Shanghai.from_local_datetime(&local).earliest())
+            .map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let mut numbers = raw_numbers
+            .split(',')
+            .filter_map(|value| value.trim().parse::<i64>().ok())
+            .collect::<Vec<_>>();
+        if numbers.len() != 20 {
+            continue;
+        }
+        numbers.sort_unstable();
+        let Some(result) = derive_canada28(&numbers) else {
+            continue;
+        };
+        draws.push(ZcgDraw {
+            period: period.to_string(),
+            result,
+            opened_at,
+        });
+    }
+    snapshot_from_draws(game, draws)
+}
+
 fn token_rejected(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_lowercase();
     (text.contains("token") || text.contains("令牌"))
@@ -564,19 +1048,7 @@ fn parse_zcg_snapshot(game: &Game, body: &[u8]) -> Option<PredictionSnapshot> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let mut draws = Vec::new();
     collect_zcg_draws(&value, &mut draws);
-    draws.retain(|draw| !draw.period.is_empty() && draw.result.len() == 3);
-    draws.sort_by(|left, right| period_cmp(&right.period, &left.period));
-    let mut periods = HashSet::new();
-    draws.retain(|draw| periods.insert(draw.period.clone()));
-    let latest = draws.first()?.clone();
-    Some(PredictionSnapshot {
-        game: game.name.into(),
-        period: latest.period,
-        result: latest.result,
-        updated_at: latest.opened_at,
-        history: draws.into_iter().take(60).map(|draw| draw.result).collect(),
-        freshness: PredictionFreshness::Fresh.as_str().into(),
-    })
+    snapshot_from_draws(game, draws)
 }
 
 fn collect_zcg_draws(value: &serde_json::Value, output: &mut Vec<ZcgDraw>) {
@@ -837,7 +1309,7 @@ mod tests {
         )
         .is_none());
         assert!(token_rejected("token验证错误".as_bytes()));
-        let source = ZcgLotterySource::new(Duration::from_secs(1))
+        let source = PublicLotterySource::new(Duration::from_secs(1))
             .unwrap()
             .with_token("TEST_TOKEN");
         assert_eq!(source.token, "TEST_TOKEN");
@@ -869,11 +1341,11 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).unwrap();
         });
-        let source = ZcgLotterySource::new(Duration::from_secs(1))
+        let source = PublicLotterySource::new(Duration::from_secs(1))
             .unwrap()
             .with_token("TEST_TOKEN")
             .with_test_base(format!("http://{address}"));
-        let game = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        let game = GAMES.iter().find(|game| game.id == "btc28").unwrap();
         let (first, second) = tokio::join!(source.fetch_live(game), source.fetch_live(game));
         assert_eq!(first.unwrap().status, PredictionFreshness::Fresh);
         assert_eq!(second.unwrap().status, PredictionFreshness::Fresh);
@@ -883,5 +1355,79 @@ mod tests {
         );
         worker.join().unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn derives_canada_28_from_sorted_bclc_keno_numbers() {
+        let values = vec![
+            5, 11, 12, 14, 15, 16, 17, 18, 22, 23, 29, 30, 37, 44, 47, 48, 51, 76, 78, 79,
+        ];
+        assert_eq!(derive_canada28(&values), Some(vec![8, 3, 7]));
+    }
+
+    #[test]
+    fn derives_welfare_28_from_official_kl8_numbers() {
+        let values = vec![
+            1, 4, 7, 10, 12, 15, 16, 17, 26, 29, 32, 40, 42, 44, 49, 65, 68, 73, 77, 78,
+        ];
+        assert_eq!(derive_welfare28(&values), Some(vec![9, 0, 1]));
+    }
+
+    #[test]
+    fn parses_bclc_csv_and_preserves_official_draw_time() {
+        let game = GAMES.iter().find(|game| game.id == "jnd").unwrap();
+        let csv = concat!(
+            "\"PRODUCT\",\"DRAW NUMBER\",\"DRAW DATE\",\"BONUS MULTIPLIER\",\"NUMBER DRAWN 1\"\n",
+            "\"KENO\",3463830,\"2026-07-31 03:56:30\",1,5,11,12,14,15,16,17,18,22,23,29,30,37,44,47,48,51,76,78,79\n",
+        );
+        let snapshot = parse_bclc_csv(game, csv).unwrap();
+        assert_eq!(snapshot.period, "3463830");
+        assert_eq!(snapshot.result, vec![8, 3, 7]);
+        assert_eq!(
+            snapshot.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-31 10:56:30"
+        );
+    }
+
+    #[test]
+    fn parses_cwl_kl8_json_and_derives_public_result() {
+        let game = GAMES.iter().find(|game| game.id == "pcdd").unwrap();
+        let body = r#"{
+          "result": [{
+            "code": "2026202",
+            "date": "2026-07-31(五)",
+            "red": "01,04,07,10,12,15,16,17,26,29,32,40,42,44,49,65,68,73,77,78"
+          }]
+        }"#;
+        let snapshot = parse_cwl_snapshot(game, body.as_bytes()).unwrap();
+        assert_eq!(snapshot.period, "2026202");
+        assert_eq!(snapshot.result, vec![9, 0, 1]);
+        assert_eq!(
+            snapshot.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-31 13:30:00"
+        );
+    }
+
+    #[test]
+    fn parses_public_keno_fallback_without_exposing_provider_fields() {
+        let game = GAMES.iter().find(|game| game.id == "jnd").unwrap();
+        let body = br#"{
+          "countdown":"00:35",
+          "data":[{
+            "nbr":"3464041",
+            "date":"2026-08-01",
+            "time":"07:48:00",
+            "nbrs":"3,5,6,9,10,18,23,26,27,28,31,39,42,53,56,59,62,63,68,70",
+            "bonus":"1"
+          }],
+          "message":"success"
+        }"#;
+        let snapshot = parse_public_keno_snapshot(game, body).unwrap();
+        assert_eq!(snapshot.period, "3464041");
+        assert_eq!(snapshot.result, vec![7, 9, 9]);
+        assert_eq!(
+            snapshot.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-31 23:48:00"
+        );
     }
 }

@@ -10,8 +10,8 @@ const mocks = vi.hoisted(() => ({
   listKnowledgeBases: vi.fn(), listKnowledgeDocuments: vi.fn(), listKnowledgeBindings: vi.fn(),
   updateKnowledgeBase: vi.fn(), saveKnowledgeDocument: vi.fn(),
   queryAudit: vi.fn(), exportAudit: vi.fn(),
-  listTasks: vi.fn(), listSchedules: vi.fn(), listSummaries: vi.fn(), getSummarySettings: vi.fn(),
-  listScheduleRuns: vi.fn(),
+  listActivities: vi.fn(), listSchedules: vi.fn(), listSummaries: vi.fn(), getSummarySettings: vi.fn(),
+  listActivityRuns: vi.fn(), listScheduleRuns: vi.fn(),
 }))
 
 vi.mock('../api/client', () => ({
@@ -31,11 +31,12 @@ describe('production pages retain scoped cached data', () => {
     mocks.saveKnowledgeDocument.mockResolvedValue(11)
     mocks.queryAudit.mockResolvedValue({ items: [{ id: 1, accountId: 'ACCOUNT', groupId: 101, userId: 0, actor: 'DH BOT', event: 'daily_summary', level: 'info', details: '已生成', createdAt: '2026-07-21T00:00:00Z' }], nextCursor: null })
     mocks.exportAudit.mockResolvedValue('')
-    mocks.listTasks.mockResolvedValue([{ id: 9, accountId: 'ACCOUNT', groupId: 101, title: '联系群员', description: '', status: 'pending', createdAt: '2026-07-21T00:00:00Z', updatedAt: '2026-07-21T00:00:00Z' }])
+    mocks.listActivities.mockResolvedValue([{ id: 9, accountId: 'ACCOUNT', name: '每日互动', content: '今晚 19:30 开始互动', enabled: true, aiOptimize: true, aiInstructions: '', timezone: 'Asia/Shanghai', startDate: '2026-07-21', endDate: '2026-07-31', weekdays: [1, 2, 3, 4, 5], sendTimes: ['19:30'], groupIds: [101], nextRunAt: '2026-07-21T11:30:00Z', sourceKey: '', deletedAt: null, createdAt: '2026-07-21T00:00:00Z', updatedAt: '2026-07-21T00:00:00Z' }])
     mocks.listSchedules.mockResolvedValue([])
     mocks.listSummaries.mockResolvedValue([])
     mocks.getSummarySettings.mockResolvedValue({ accountId: 'ACCOUNT', enabled: false, time: '23:00', groupIds: [], timezone: 'Asia/Shanghai' })
     mocks.listScheduleRuns.mockResolvedValue([])
+    mocks.listActivityRuns.mockResolvedValue([])
   })
 
   it('keeps knowledge bases visible when a refresh goes offline', async () => {
@@ -111,22 +112,19 @@ describe('production pages retain scoped cached data', () => {
     })))
   })
 
-  it('keeps tasks visible when one combined refresh fails', async () => {
+  it('keeps activities visible when one combined refresh fails', async () => {
     render(<PlansPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
-    await screen.findAllByText('联系群员')
-    mocks.listTasks.mockRejectedValueOnce(new Error('连接断开'))
+    await screen.findAllByText('每日互动')
+    mocks.listActivities.mockRejectedValueOnce(new Error('连接断开'))
     await userEvent.click(screen.getByRole('button', { name: '刷新' }))
     await waitFor(() => expect(screen.getByText(/当前展示本地缓存/)).toBeInTheDocument())
-    expect(screen.getAllByText('联系群员').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('每日互动').length).toBeGreaterThan(0)
   })
 
-  it('uses consistent application menus for task group and status', async () => {
+  it('shows the persisted activity group and send time', async () => {
     render(<PlansPage accountId="ACCOUNT" groups={groups} onError={vi.fn()} />)
-    await screen.findAllByText('联系群员')
-
-    expect(screen.getByRole('combobox', { name: '所属群' })).toHaveTextContent('测试群')
-    await userEvent.click(screen.getByRole('combobox', { name: '状态' }))
-    await userEvent.click(screen.getByRole('option', { name: '已完成' }))
-    expect(screen.getByRole('combobox', { name: '状态' })).toHaveTextContent('已完成')
+    await screen.findAllByText('每日互动')
+    expect(screen.getByRole('checkbox', { name: '测试群' })).toBeChecked()
+    expect(screen.getByLabelText('发送时刻 1')).toHaveValue('19:30')
   })
 })

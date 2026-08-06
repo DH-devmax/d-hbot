@@ -21,6 +21,7 @@ use crate::error::{AppError, AppResult};
 use crate::gateway::{DiagnosticSnapshot, GatewayCapabilities};
 use crate::models::AuditEvent;
 use crate::paths::AppPaths;
+use crate::runtime_work::DispatchStatsSnapshot;
 
 const LOG_RETENTION_DAYS: u64 = 30;
 const MAX_LOG_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -260,11 +261,12 @@ pub fn create_support_bundle(
     audits: Vec<AuditEvent>,
     diagnostic: DiagnosticSnapshot,
     capabilities: GatewayCapabilities,
+    dispatch_stats: DispatchStatsSnapshot,
 ) -> AppResult<SupportBundleResult> {
     let generated_at = Utc::now().to_rfc3339();
     let aliases = SupportAliases::from_audits(&audits);
     let diagnostic_document =
-        support_diagnostic_document(paths, database, diagnostic, capabilities, &generated_at)?;
+        support_diagnostic_document(paths, database, diagnostic, capabilities, &generated_at, &dispatch_stats)?;
     let audit_document = serde_json::to_vec_pretty(
         &audits
             .iter()
@@ -432,6 +434,7 @@ fn support_diagnostic_document(
     diagnostic: DiagnosticSnapshot,
     capabilities: GatewayCapabilities,
     generated_at: &str,
+    dispatch_stats: &DispatchStatsSnapshot,
 ) -> AppResult<Vec<u8>> {
     let mut capabilities = serde_json::to_value(capabilities)
         .map_err(|error| AppError::new("support_bundle", format!("序列化协议能力失败：{error}")))?;
@@ -450,10 +453,20 @@ fn support_diagnostic_document(
         "database": {
             "schemaVersion": database.schema_version,
             "integrity": database.integrity,
+            "indexIntegrity": database.index_integrity,
             "accounts": database.accounts,
             "groups": database.groups,
             "messages": database.messages,
             "databaseIncluded": false,
+        },
+        "queueDepth": database.queue_depth,
+        "retentionPolicies": database.retention_policies,
+        "memoryCaps": {
+            "maxMemberEventCache": 500,
+            "maxReportedSet": 500,
+            "maxMemberCacheGroups": 100,
+            "maxTrackedWorkItems": 200,
+            "note": "in-memory caps; actual values reflect compile-time constants",
         },
         "connection": {
             "status": diagnostic.status,
@@ -462,6 +475,14 @@ fn support_diagnostic_document(
             "pageUrl": "<local-page-omitted>",
             "nimAccount": "<account-omitted>",
             "detail": redact(&diagnostic.detail),
+            "rateLimitHits": diagnostic.rate_limit_hits,
+        },
+        "dispatchStats": {
+            "dispatched": dispatch_stats.dispatched,
+            "proceeded": dispatch_stats.proceeded,
+            "skipped": dispatch_stats.skipped,
+            "rejected": dispatch_stats.rejected,
+            "chainMicros": dispatch_stats.chain_micros,
         },
         "capabilities": capabilities,
         "privacy": {
@@ -893,6 +914,9 @@ mod tests {
                 accounts: 1,
                 groups: 1,
                 messages: 1,
+                queue_depth: vec![],
+                retention_policies: vec![],
+                index_integrity: "ok".into(),
             },
             vec![audit.clone()],
             DiagnosticSnapshot {
@@ -902,8 +926,10 @@ mod tests {
                 page_url: "app://wang?token=top-secret".into(),
                 nim_account: "998877".into(),
                 detail: "ok".into(),
+                rate_limit_hits: 0,
             },
             capabilities(),
+            DispatchStatsSnapshot { dispatched: 0, proceeded: 0, skipped: 0, rejected: 0, chain_micros: 0 },
         )
         .unwrap();
         let mut archive = zip::ZipArchive::new(File::open(&result.path).unwrap()).unwrap();
@@ -952,6 +978,9 @@ mod tests {
                 accounts: 1,
                 groups: 1,
                 messages: 1,
+                queue_depth: vec![],
+                retention_policies: vec![],
+                index_integrity: "ok".into(),
             },
             vec![audit],
             DiagnosticSnapshot {
@@ -961,8 +990,10 @@ mod tests {
                 page_url: "app://wang".into(),
                 nim_account: "998877".into(),
                 detail: "ok".into(),
+                rate_limit_hits: 0,
             },
             capabilities(),
+            DispatchStatsSnapshot { dispatched: 0, proceeded: 0, skipped: 0, rejected: 0, chain_micros: 0 },
         )
         .unwrap();
         assert_ne!(result.path, repeated.path);

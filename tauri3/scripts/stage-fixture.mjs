@@ -2,7 +2,8 @@ import { copyFile, mkdir, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 
 const root = path.resolve(import.meta.dirname, '..')
-const target = path.join(root, 'src-tauri', 'target', 'release')
+const profile = process.argv[2] === 'debug' ? 'debug' : 'release'
+const target = path.join(root, 'src-tauri', 'target', profile)
 const resources = path.join(root, 'src-tauri', 'resources', 'tools')
 const windows = process.platform === 'win32'
 const source = path.join(target, windows ? 'dh-fixture.exe' : 'dh-fixture')

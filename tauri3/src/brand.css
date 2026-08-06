@@ -1,3 +1,8 @@
+.sidebar > .brand { order: 0; }
+.sidebar > nav { order: 1; }
+.sidebar > .runtime-work-summary { order: 2; }
+.sidebar > .sidebar-foot { order: 3; margin-top: 0; }
+
 .brand-logo {
   display: block;
   width: 88px;

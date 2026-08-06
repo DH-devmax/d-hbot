@@ -115,18 +115,7 @@ impl PredictionApp {
             app_id: PREDICTION_APP_ID.into(),
             status: "stale".into(),
             freshness: "stale".into(),
-            fallback_reply: format!(
-                "{} 第{}期\n最新结果：{}\n更新时间：{}\n数据状态：数据已过期，当前仅展示最后一次已核验结果。",
-                snapshot.game,
-                snapshot.period,
-                snapshot
-                    .result
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" + "),
-                snapshot.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
-            ),
+            fallback_reply: prediction::format_stale_reply(snapshot),
             narration: None,
         }
     }
@@ -159,7 +148,7 @@ impl BusinessApp for PredictionApp {
         BusinessAppManifest {
             id: PREDICTION_APP_ID,
             name: "预测",
-            description: "读取已校准结果并生成统计参考",
+            description: "读取公开或官方开奖并生成统计参考",
             version: PREDICTION_APP_VERSION,
             trigger_hint: "@DH 预测 彩种名称",
             scope: "所有已启用管理且开启 AI 回复的群",
@@ -185,7 +174,7 @@ impl BusinessApp for PredictionApp {
                         id: game.id.into(),
                         name: game.name.into(),
                         status: "ready".into(),
-                        detail: "结果与历史数据可用".into(),
+                        detail: prediction::public_source_label(game.id).into(),
                     },
                     PredictionFreshness::Stale => BusinessAppGameHealth {
                         id: game.id.into(),
@@ -205,10 +194,22 @@ impl BusinessApp for PredictionApp {
                     name: game.name.into(),
                     status: "unavailable".into(),
                     detail: match error.code.as_str() {
-                        "prediction_not_configured" => "数据源凭据尚未配置".into(),
+                        "prediction_not_configured" => {
+                            "公开源不可用，兼容数据源未配置独立凭据".into()
+                        }
                         "prediction_auth" => "数据源凭据无效或已过期".into(),
                         "prediction_contract" => "数据结构变化，等待适配".into(),
                         "prediction_http" => "数据源返回异常，请稍后重试".into(),
+                        "prediction_algorithm_unverified" => {
+                            "公开原始数据可用，但28派生算法尚未核验".into()
+                        }
+                        "prediction_no_official_source" => "未发现可核验的官方公开数据源".into(),
+                        "prediction_public_contract" => "官方公开数据格式变化，等待适配".into(),
+                        "prediction_public_http"
+                        | "prediction_public_request"
+                        | "prediction_public_response" => {
+                            "官方公开数据暂时不可用，请稍后重试".into()
+                        }
                         _ => "数据源连接失败，请稍后重试".into(),
                     },
                 },
@@ -284,6 +285,57 @@ pub fn prediction_narration_prompt(data: &Value) -> String {
     )
 }
 
+pub fn validate_prediction_narration(reply: &str, data: &Value) -> bool {
+    let reply = reply.trim();
+    if reply.is_empty()
+        || !(reply.contains("开奖") || reply.contains("最新结果"))
+        || !(reply.contains("时间") || reply.contains("更新"))
+        || !reply.contains("趋势")
+        || !(reply.contains("候选方向") || reply.contains("参考方向"))
+        || !reply.contains("参考度")
+        || reply.contains("保证结果")
+        || reply.contains("承诺结果")
+    {
+        return false;
+    }
+    let normalized_reply = reply.to_lowercase().replace(char::is_whitespace, "");
+    for key in ["game", "period", "trend"] {
+        let Some(value) = data.get(key).and_then(Value::as_str) else {
+            return false;
+        };
+        if value.trim().is_empty()
+            || !normalized_reply.contains(&value.to_lowercase().replace(char::is_whitespace, ""))
+        {
+            return false;
+        }
+    }
+    let Some(updated_at) = data.get("updatedAt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(month_day) = updated_at.get(5..10) else {
+        return false;
+    };
+    if !reply.contains(month_day) {
+        return false;
+    }
+    for key in ["latestResult", "candidates"] {
+        let Some(values) = data.get(key).and_then(Value::as_array) else {
+            return false;
+        };
+        if values.is_empty()
+            || values.iter().any(|value| {
+                value
+                    .as_i64()
+                    .map(|number| !reply.contains(&number.to_string()))
+                    .unwrap_or(true)
+            })
+        {
+            return false;
+        }
+    }
+    data.get("confidence").and_then(Value::as_f64).is_some()
+}
+
 pub fn app_not_available(app_id: &str) -> AppError {
     AppError::new("business_app_missing", format!("业务应用 {app_id} 未注册"))
 }
@@ -317,6 +369,25 @@ mod tests {
         let prompt = prediction_narration_prompt(&serde_json::json!({"game":"PC28","period":"1"}));
         assert!(prompt.contains("PC28"));
         assert!(!prompt.contains("http"));
+    }
+
+    #[test]
+    fn prediction_narration_requires_normalized_fields() {
+        let data = serde_json::json!({
+            "game": "PC28",
+            "period": "20260806001",
+            "latestResult": [1, 2, 3],
+            "updatedAt": "2026-08-06T12:30:00Z",
+            "trend": "和值走高",
+            "candidates": [8, 9],
+            "confidence": 0.62,
+        });
+        let complete = "【PC28】第20260806001期\n开奖：1 + 2 + 3\n更新时间：08-06 12:30\n趋势：和值走高\n参考方向：8、9\n参考度：中\n仅作统计参考。";
+        assert!(validate_prediction_narration(complete, &data));
+        assert!(!validate_prediction_narration(
+            "【PC28】第20260806001期 开奖1、2、3 更新时间08-06 参考方向8、9 参考度中",
+            &data
+        ));
     }
 
     #[test]

@@ -33,4 +33,49 @@
 .member-search-state{grid-column:1/-1;padding:20px 12px;color:#888;text-align:center}.member-search-state.error{color:#a33}
 .message-recall-preview{margin:0;padding:14px 16px;border:1px solid #ddd;border-radius:6px;background:#fafafa;color:#222;line-height:1.65;overflow-wrap:anywhere}
 .provider-workspace{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:14px}.provider-list{min-width:0;border:1px solid #e5e5e5;border-radius:8px;background:#fafafa;overflow:hidden}.provider-list .list-head{padding:14px;border-bottom:1px solid #e5e5e5}.provider-list .list-head>div{display:grid;gap:4px}.provider-item{display:flex;width:100%;align-items:center;justify-content:space-between;gap:10px;padding:13px 14px;border:0;border-bottom:1px solid #e8e8e8;border-radius:0;background:transparent;text-align:left}.provider-item:hover{background:#f1f1f1}.provider-item.selected{background:#111;color:#fff}.provider-item>span{display:grid;min-width:0;gap:4px}.provider-item strong,.provider-item small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-item small{color:#888}.provider-item.selected small{color:#bbb}.provider-item em{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#eee;color:#888;font-size:10px;font-style:normal}.provider-item.selected em{background:#333;color:#ddd}.provider-add{margin:12px}.provider-editor{padding:18px}.provider-editor .editor-title{align-items:flex-start}.provider-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.4fr);gap:0 12px}.provider-fields label.wide{grid-column:1/-1}.provider-editor>.button-row{justify-content:space-between;margin-top:12px;padding-top:14px;border-top:1px solid #eee}@media(max-width:780px){.provider-workspace{grid-template-columns:1fr}.provider-list{max-height:260px}.provider-fields{grid-template-columns:1fr}.provider-fields label.wide{grid-column:auto}}
+
+.activity-layout{grid-template-columns:minmax(250px,310px) minmax(0,1fr)}
+.activity-list{max-height:760px}
+.activity-editor{display:grid;gap:18px}
+.activity-editor .editor-title{margin-bottom:0;padding-bottom:16px;border-bottom:1px solid #dedede}
+.activity-switches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.activity-toggle{display:flex;align-items:center;gap:12px;min-width:0;min-height:58px;padding:10px 12px;border:1px solid #dedede;border-radius:6px;background:#fff;cursor:pointer}
+.activity-toggle input{position:absolute;opacity:0;pointer-events:none}
+.activity-toggle span{display:grid;min-width:0;flex:1;gap:3px}
+.activity-toggle strong,.activity-toggle small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.activity-toggle small{color:#888;font-size:11px}
+.activity-toggle i{position:relative;flex:0 0 36px;width:36px;height:20px;border-radius:10px;background:#c8c8c8}
+.activity-toggle i b{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .16s ease}
+.activity-toggle.checked{border-color:#171717}
+.activity-toggle.checked i{background:#171717}
+.activity-toggle.checked i b{transform:translateX(16px)}
+.activity-form{padding-top:2px}
+.activity-form textarea{min-height:120px;line-height:1.6}
+.activity-fieldset{min-width:0;margin:0;padding:11px 12px 12px;border:1px solid #dedede;border-radius:6px}
+.activity-fieldset legend{padding:0 5px;color:#666;font-size:12px}
+.weekday-picker{display:grid;grid-template-columns:repeat(7,minmax(40px,1fr));gap:6px}
+.weekday-picker label{display:grid;place-items:center;min-height:34px;border:1px solid #dedede;border-radius:5px;background:#fff;color:#666;font-size:12px;cursor:pointer}
+.weekday-picker label.selected{border-color:#171717;background:#171717;color:#fff}
+.weekday-picker input{position:absolute;opacity:0;pointer-events:none}
+.activity-time-list{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.activity-time-list>div{display:flex;align-items:center;gap:6px;min-height:38px;padding:0 5px 0 9px;border:1px solid #dedede;border-radius:6px;background:#fff;color:#777}
+.activity-time-list input{width:100px;height:34px;padding:0;border:0;box-shadow:none}
+.activity-time-list .icon-button{width:28px;height:28px;border:0}
+.activity-group-picker{padding:0}
+.activity-preview{display:grid;gap:10px;padding:14px;border-left:3px solid #276b52;background:#f5faf7}
+.activity-preview>div{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.activity-preview em{color:#276b52;font-size:11px;font-style:normal}
+.activity-preview p{margin:0;color:#333;line-height:1.7;white-space:pre-wrap}
+.activity-history{display:grid;gap:8px;padding-top:16px;border-top:1px solid #dedede}
+.activity-run-table{display:grid}
+.activity-run-table>div{display:grid;grid-template-columns:160px minmax(120px,1fr) 72px 70px;gap:10px;align-items:center;min-height:38px;padding:0 8px;border-bottom:1px solid #ededed;color:#555;font-size:11px}
+.activity-run-table time,.activity-run-table small{color:#888}
+.activity-run-table em{justify-self:end;color:#777;font-style:normal}
+.activity-run-table em.enabled{color:#18783a}
+.activity-run-table em.failed{color:#a33}
+@media(max-width:1050px){.activity-layout{grid-template-columns:230px minmax(0,1fr)}.activity-switches{grid-template-columns:1fr}.weekday-picker{grid-template-columns:repeat(4,minmax(44px,1fr))}.activity-run-table>div{grid-template-columns:140px minmax(100px,1fr) 62px 58px}}
+@media(max-width:780px){.activity-layout{grid-template-columns:1fr}.activity-list{max-height:260px}.activity-editor{padding:14px}.activity-editor .editor-title{display:grid}.activity-run-table>div{grid-template-columns:1fr auto}.activity-run-table time,.activity-run-table small{display:none}}
 .support-bundle-section .muted{max-width:760px;line-height:1.7}.support-bundle-result{display:grid;gap:5px;margin-top:14px;padding:12px;border:1px solid #d9d9d9;border-radius:6px;background:#fafafa;color:#555}.support-bundle-result strong{color:#111}.support-bundle-result span,.support-bundle-result small{overflow-wrap:anywhere}.support-bundle-result small{color:#777}
+/* Prediction source descriptions may be longer than a single status label. */
+.business-app-toolbar p{max-width:760px;line-height:1.55}
+.health-grid small{display:-webkit-box;overflow:hidden;color:#777;line-height:1.5;white-space:normal;-webkit-box-orient:vertical;-webkit-line-clamp:3}

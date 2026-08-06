@@ -1,6 +1,6 @@
 # DH BOT 3.0 数据模型
 
-当前数据库版本为 **schema v11**。数据库只保存 DH BOT 的运行状态；旺商聊的 Cookie、
+当前数据库版本为 **schema v14**。数据库只保存 DH BOT 的运行状态；旺商聊的 Cookie、
 Token、Local Storage 和登录分区由旺商聊自己管理，不进入 `dh.db`。
 
 首次启动默认创建空运行状态：规则模板全部停用，内置知识库启用但不绑定群，预测应用和
@@ -28,9 +28,43 @@ Token、Local Storage 和登录分区由旺商聊自己管理，不进入 `dh.db
 | `member_identity_aliases` | NIM 临时身份到稳定 userId 的合并 | `account_id + group_id + nim_id` |
 | `messages` | 群消息、处理状态、提及和来源 | `account_id + group_id + server_message_id` |
 | `gateway_inbox` | 有序桥接事件、ACK 和恢复队列 | `account_id + event_id`；桥接序号另有唯一约束 |
-| `effect_outbox` | 所有外部副作用的持久队列 | `account_id + dedupe_key`（非空时） |
+| `effect_outbox` | 所有外部副作用的持久队列（schema v14 扩展列见下节） | `account_id + dedupe_key`（非空时） |
 | `actions` | 动作意图、执行结果和脱敏回执 | 由 dedupe key/消息/规则关联 |
 | `audit_events` | 可读的来源、事件、级别和详情 | 自增 ID，按时间查询 |
+| `retention_policies` | 每张表的保留窗口和按 account_id 分区清理策略 | `table_name + account_id` |
+
+## effect_outbox — schema v14 扩展列
+
+schema v14 在原有基础列（`id / account_id / kind / payload / state / dedupe_key / created_at / updated_at`）之上新增6列，用于支持 QueueKernel 调度和到期清理：
+
+| 列 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `priority` | `INTEGER` | `0` | 优先级；数值越小越先被 Dispatcher claim；目前仅用于扩展，未参与排序 |
+| `lane` | `TEXT` | `'default'` | 并发泳道标识；`LaneConcurrencyGate` 按此字段限制同泳道最多4并发 |
+| `order_key` | `TEXT` | `NULL` | 非空时 `OrderKeyLock` 保证同 key 串行执行，防止同账号重入 |
+| `correlation_id` | `TEXT` | `NULL` | 关联 ID，用于在审计日志中串联同一业务意图的多个副作用 |
+| `origin` | `TEXT` | `NULL` | 入队来源标记（如 `bridge`、`dispatcher`、`runtime`），诊断用 |
+| `expires_at` | `INTEGER` | `NULL` | Unix ms 时间戳；非空时 `ExpiryGuard` 在到期后跳过该项并标记 `expired` |
+
+对应6个索引加速 claim 和清理查询：`idx_effect_outbox_priority_state`、`idx_effect_outbox_lane`、`idx_effect_outbox_order_key`、`idx_effect_outbox_correlation_id`、`idx_effect_outbox_origin`、`idx_effect_outbox_expires_at`。
+
+## retention_policies — 保留策略表
+
+```sql
+CREATE TABLE retention_policies (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name      TEXT    NOT NULL,
+    account_id      TEXT    NOT NULL,
+    retention_days  INTEGER NOT NULL DEFAULT 30,
+    enabled         INTEGER NOT NULL DEFAULT 1,   -- 0=disabled, 1=enabled
+    last_cleaned_at INTEGER,                       -- Unix ms
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE(table_name, account_id)
+);
+```
+
+每张表针对每个 `account_id` 独立配置保留窗口（`retention_days`）。清理作业（scheduled effect）执行时读取该表，删除 `created_at < now - retention_days * 86400000` 的行，并更新 `last_cleaned_at`。当前配置保留策略的表：`audit_events`、`messages`、`actions`、`effect_outbox`（已完成项）。
 
 ## 规则和知识
 

@@ -689,18 +689,6 @@ impl FixtureGateway {
         Ok(())
     }
 
-    pub async fn wire_batch(&self) -> Value {
-        let state = self.state.read().await;
-        let records = state.queue.values().take(100).cloned().collect::<Vec<_>>();
-        json!({
-            "ok": true,
-            "session": FIXTURE_SESSION,
-            "records": records,
-            "remaining": state.queue.len(),
-            "dropped": 0,
-        })
-    }
-
     pub async fn wire_group_list(&self) -> Value {
         let snapshot = self.snapshot().await;
         let owner = snapshot
@@ -757,10 +745,6 @@ impl FixtureGateway {
             .actions
             .push(Self::action("group_announcement", group_id, 0, text, 0));
         Ok(())
-    }
-
-    pub async fn wire_group_members(&self, group_id: i64) -> Value {
-        self.wire_group_members_page(group_id, None).await
     }
 
     pub async fn wire_group_members_page(&self, group_id: i64, cursor: Option<&str>) -> Value {
@@ -1459,6 +1443,7 @@ impl RuntimeGateway for FixtureGateway {
                 page_url: metadata.page_url.clone(),
                 nim_account: String::new(),
                 detail: "Fixture DevTools 已断开".into(),
+                rate_limit_hits: 0,
             };
         }
         DiagnosticSnapshot {
@@ -1480,6 +1465,7 @@ impl RuntimeGateway for FixtureGateway {
             } else {
                 "Fixture NIM 尚未初始化".into()
             },
+            rate_limit_hits: 0,
         }
     }
 

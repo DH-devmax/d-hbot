@@ -1,6 +1,29 @@
-export type PageName = '总览' | '群组与成员' | '消息台' | '规则' | '知识与 AI' | '任务与计划' | '审计' | '设置' | '调试'
+export type PageName = '总览' | '群组与成员' | '消息台' | '规则' | '知识与 AI' | '活动与计划' | '审计' | '设置' | '调试'
 
 export type LoadState = 'idle' | 'loading' | 'empty' | 'ready' | 'error' | 'offlineCached'
+
+export type RuntimeWorkState = 'running' | 'queued' | 'retrying' | 'succeeded' | 'failed' | 'unknown'
+
+export type RuntimeWorkItem = {
+  id: string
+  kind: string
+  label: string
+  scopeLabel: string
+  state: RuntimeWorkState
+  percent?: number | null
+  queued: number
+  startedAt?: string | null
+  retryAt?: string | null
+  completedAt?: string | null
+  error: string
+}
+
+export type RuntimeWorkSnapshot = {
+  active?: RuntimeWorkItem | null
+  items: RuntimeWorkItem[]
+  counts: { running: number; queued: number; retrying: number; failed: number }
+  updatedAt: string
+}
 
 export type Group = {
   accountId: string
@@ -121,6 +144,50 @@ export type TaskItem = {
   reminderSentAt?: string | null
   createdAt: string
   updatedAt: string
+}
+
+export type Activity = {
+  id: number
+  accountId: string
+  name: string
+  content: string
+  enabled: boolean
+  aiOptimize: boolean
+  aiInstructions: string
+  timezone: string
+  startDate: string
+  endDate: string
+  weekdays: number[]
+  sendTimes: string[]
+  groupIds: number[]
+  nextRunAt?: string | null
+  sourceKey: string
+  deletedAt?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type ActivityRun = {
+  id: number
+  activityId: number
+  accountId: string
+  groupId: number
+  scheduledFor: string
+  runKey: string
+  state: string
+  text: string
+  contentSource: string
+  attempts: number
+  nextRetryAt?: string | null
+  lastError: string
+  createdAt: string
+  updatedAt: string
+  completedAt?: string | null
+}
+
+export type ActivityPreview = {
+  text: string
+  source: string
 }
 
 export type Schedule = {

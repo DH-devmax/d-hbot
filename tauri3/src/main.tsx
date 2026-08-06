@@ -6,6 +6,7 @@ import { Activity, BookOpen, Bug, CalendarClock, LayoutDashboard, LoaderCircle, 
 import './styles.css'
 import './window-titlebar.css'
 import './brand.css'
+import './runtime-work.css'
 import './runtime.css'
 import './pages.css'
 import './close-dialog.css'
@@ -26,9 +27,10 @@ import CloseDialog from './components/CloseDialog'
 import ButtonHelp from './components/ButtonHelp'
 import AboutDialog from './components/AboutDialog'
 import WindowTitlebar from './components/WindowTitlebar'
+import RuntimeWorkIndicator from './components/RuntimeWorkIndicator'
 import ErrorBanner from './components/ErrorBanner'
 import type { Diagnostic } from './runtimeTypes'
-import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName } from './types'
+import type { AiSettings, Audit, DailySummary, DatabaseStatus, Group, PageName, RuntimeWorkSnapshot } from './types'
 import { api, readableError } from './api/client'
 
 class AppErrorBoundary extends React.Component<{ children: ReactNode }, { message: string }> {
@@ -39,7 +41,7 @@ class AppErrorBoundary extends React.Component<{ children: ReactNode }, { messag
 
 const nav: [PageName, typeof Activity][] = [
   ['总览', LayoutDashboard], ['群组与成员', Users], ['消息台', MessagesSquare], ['规则', ShieldCheck],
-  ['知识与 AI', BookOpen], ['任务与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
+  ['知识与 AI', BookOpen], ['活动与计划', CalendarClock], ['审计', Activity], ['设置', Settings2], ['调试', Bug],
 ]
 
 function isTauriRuntime() { return typeof window !== 'undefined' && Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) }
@@ -50,6 +52,7 @@ type MaintenanceResult = { success: boolean; errorCode: string; message: string 
 
 const wangInformationalStatuses = new Set(['discovering', 'validating', 'starting', 'started-waiting', 'ready', 'devtools-ready', 'nim-not-ready'])
 const wangTransientStatuses = new Set(['discovering', 'validating', 'starting', 'started-waiting'])
+const emptyWorkSnapshot: RuntimeWorkSnapshot = { active: null, items: [], counts: { running: 0, queued: 0, retrying: 0, failed: 0 }, updatedAt: '' }
 
 function WangStatusBanner({ diagnostic, startup }: { diagnostic: Diagnostic | null; startup: WangStartupEvent | null }) {
   if (diagnostic?.status === 'ready') return null
@@ -117,8 +120,10 @@ function App() {
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [wangStartupError, setWangStartupError] = useState('')
   const [automationPaused, setAutomationPaused] = useState(false)
-  const [pageEpoch, setPageEpoch] = useState(0)
+  const [workSnapshot, setWorkSnapshot] = useState<RuntimeWorkSnapshot>(emptyWorkSnapshot)
+  const [workDrawerOpen, setWorkDrawerOpen] = useState(false)
   const [closePrompt, setClosePrompt] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
@@ -167,7 +172,6 @@ function App() {
     setOverviewAudits([])
     setSummaries([])
     setSelectedGroup(null)
-    setPageEpoch(value => value + 1)
     return true
   }
 
@@ -197,13 +201,13 @@ function App() {
           devtoolsUrl: 'http://127.0.0.1:9222',
           confirmRestart: false,
         })
-        if (result.status && !wangInformationalStatuses.has(result.status) && !result.needsConfirmation && result.detail) setError(result.detail)
+        if (result.status && !wangInformationalStatuses.has(result.status) && !result.needsConfirmation && result.detail) setWangStartupError(result.detail)
         diagnosticResult = await Promise.resolve(invoke<Diagnostic>('diagnose')).then(
           value => ({ status: 'fulfilled', value } as PromiseFulfilledResult<Diagnostic>),
           reason => ({ status: 'rejected', reason } as PromiseRejectedResult),
         )
       } catch (reason) {
-        setError(readableError(reason))
+        setWangStartupError(readableError(reason))
       }
     }
     if (refreshSequence !== refreshSequenceRef.current) return
@@ -236,6 +240,7 @@ function App() {
       if (payload.eventId) handledWangStartupRef.current.add(payload.eventId)
       setWangStartup(payload)
       if (payload.status === 'nim-not-ready' || payload.status === 'devtools-ready') requestWangLoginFocus()
+      if (wangInformationalStatuses.has(payload.status)) setWangStartupError('')
       if (wangTransientStatuses.has(payload.status)) return
       void (async () => {
         if (payload.needsConfirmation && window.confirm('检测到旺商聊已运行，但没有开启 9222 DevTools。需要结束该旺商聊进程并重新启动，是否继续？')) {
@@ -247,12 +252,12 @@ function App() {
               confirmRestart: true,
             })
             const result = await finishConfirmedWangRestart(start, await start())
-            if (result.status && !wangInformationalStatuses.has(result.status) && result.detail) setError(result.detail)
+            if (result.status && !wangInformationalStatuses.has(result.status) && result.detail) setWangStartupError(result.detail)
           } catch (reason) {
-            setError(readableError(reason))
+            setWangStartupError(readableError(reason))
           }
         } else if (payload.status && !wangInformationalStatuses.has(payload.status) && payload.detail) {
-          setError(payload.detail)
+          setWangStartupError(payload.detail)
         }
         await refresh()
       })()
@@ -261,10 +266,12 @@ function App() {
       setDiagnostic(event.payload)
       updateWangLoginFocus(event.payload)
       if (event.payload.status === 'ready') setWangStartup(null)
+      if (wangInformationalStatuses.has(event.payload.status)) setWangStartupError('')
       const nextAccount = event.payload.nimAccount || ''
       if (nextAccount && switchAccount(nextAccount)) void refresh()
     }))
-    for (const eventName of ['sync-progress', 'message-received', 'task-progress', 'schedule-updated', 'gateway-capabilities']) listeners.push(listen(eventName, () => setPageEpoch(value => value + 1)))
+    listeners.push(listen<RuntimeWorkSnapshot>('runtime-work-updated', event => setWorkSnapshot(event.payload)))
+    void invoke<RuntimeWorkSnapshot>('get_runtime_work_snapshot').then(setWorkSnapshot).catch(() => undefined)
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
     listeners.push(listen<WangStartupEvent>('wangshangliao-status', event => handleWangStartup(event.payload)))
     void invoke<WangStartupEvent | null>('take_wang_startup_status').then(payload => {
@@ -278,6 +285,7 @@ function App() {
         setDiagnostic(next)
         updateWangLoginFocus(next)
         if (next.status === 'ready') setWangStartup(null)
+        if (wangInformationalStatuses.has(next.status)) setWangStartupError('')
         const nextAccount = next.nimAccount || ''
         if (nextAccount && switchAccount(nextAccount)) void refresh()
       } catch {
@@ -311,20 +319,33 @@ function App() {
 
   const activeGroup = useMemo(() => groups.find(group => group.groupId === selectedGroup), [groups, selectedGroup])
   const connectionLabel = diagnostic ? statusText(diagnostic.status) : '检查中'
+  const closeWorkDrawer = () => {
+    setWorkDrawerOpen(false)
+    const failedIds = workSnapshot.items.filter(item => item.state === 'failed' || item.state === 'unknown').map(item => item.id)
+    if (!failedIds.length) return
+    const acknowledged = new Set(failedIds)
+    setWorkSnapshot(current => {
+      const items = current.items.filter(item => !acknowledged.has(item.id) || (item.state !== 'failed' && item.state !== 'unknown'))
+      return { ...current, items, counts: { ...current.counts, failed: items.filter(item => item.state === 'failed' || item.state === 'unknown').length } }
+    })
+    void invoke('acknowledge_runtime_work_failures', { ids: failedIds }).catch(() => undefined)
+  }
+  const toggleWorkDrawer = () => workDrawerOpen ? closeWorkDrawer() : setWorkDrawerOpen(true)
 
   return <div className="app-window"><WindowTitlebar /><main className="shell">
-    <aside className="sidebar"><div className="brand"><img className="brand-logo" src="/logo.png" alt="DH BOT" /></div><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => setPage(label)} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
+    <aside className="sidebar"><RuntimeWorkIndicator snapshot={workSnapshot} open={workDrawerOpen} onToggle={toggleWorkDrawer} onClose={closeWorkDrawer} onNavigate={setPage} /><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => { setPage(label); if (workDrawerOpen) closeWorkDrawer() }} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
     <section className="workspace">
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}
       <WangStatusBanner diagnostic={diagnostic} startup={wangStartup} />
+      {wangStartupError && <ErrorBanner message={wangStartupError} onClose={() => setWangStartupError('')} />}
       {error && <ErrorBanner message={error} onClose={() => setError('')} />}
       {page === '总览' && <OverviewPage diagnostic={diagnostic} database={database} groups={groups} audits={overviewAudits} summaries={summaries} loading={loading} refresh={() => void refresh(true)} />}
       {page === '群组与成员' && <GroupMembersPage groups={groups} selectedGroup={selectedGroup} setSelectedGroup={setSelectedGroup} activeGroup={activeGroup} onError={setError} refresh={refresh} />}
       {page === '消息台' && <MessagesPage key={`messages-${accountId}`} groups={groups} accountId={accountId} onError={setError} />}
       {page === '规则' && <RulesPage key={`rules-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '知识与 AI' && <KnowledgePage key={`knowledge-${accountId}`} accountId={accountId} groups={groups} aiSettings={aiSettings} setAiSettings={setAiSettings} refresh={refresh} onError={setError} />}
-      {page === '任务与计划' && <PlansPage key={`plans-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
+      {page === '活动与计划' && <PlansPage key={`plans-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '审计' && <AuditPage key={`audit-${accountId}`} accountId={accountId} groups={groups} onError={setError} />}
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}

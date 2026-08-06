@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { AiProviderEndpoint, Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, RuleMember, Schedule, ScheduleRun, SendResult, SummarySettings, SupportBundleResult, TaskItem } from '../types'
+import type { Activity, ActivityPreview, ActivityRun, AiProviderEndpoint, Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, RuleMember, Schedule, ScheduleRun, SendResult, SummarySettings, SupportBundleResult, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {
   const raw = typeof reason === 'string'
@@ -105,6 +105,12 @@ export const api = {
   listTasks: (accountId: string, groupId?: number) => invoke<TaskItem[]>('list_tasks', { accountId, groupId: groupId ?? null }),
   saveTask: (task: TaskItem) => invoke<number>('save_task', { task }),
   deleteTask: (accountId: string, taskId: number) => invoke<void>('delete_task', { accountId, taskId }),
+  listActivities: (accountId: string, includeDeleted = false) => invoke<Activity[]>('list_activities', { accountId, includeDeleted }),
+  saveActivity: (activity: Activity) => invoke<number>('save_activity', { activity }),
+  deleteActivity: (accountId: string, activityId: number) => invoke<void>('delete_activity', { accountId, activityId }),
+  listActivityRuns: (accountId: string, activityId?: number, limit = 100) => invoke<ActivityRun[]>('list_activity_runs', { accountId, activityId: activityId ?? null, limit }),
+  previewActivityText: (activity: Activity, groupId: number) => invoke<ActivityPreview>('preview_activity_text', { activity, groupId }),
+  publishActivityNow: (accountId: string, activityId: number) => invoke<number>('publish_activity_now', { accountId, activityId }),
   listSchedules: (accountId: string) => invoke<Schedule[]>('list_schedules', { accountId }),
   saveSchedule: (schedule: Schedule) => invoke<number>('save_schedule', { schedule }),
   deleteSchedule: (accountId: string, scheduleId: number) => invoke<void>('delete_schedule', { accountId, scheduleId }),

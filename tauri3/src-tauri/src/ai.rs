@@ -190,9 +190,9 @@ pub struct ConfiguredProvider {
     responses_route_unavailable: AtomicBool,
 }
 
-pub const AI_PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
-pub const AI_TOTAL_BUDGET: Duration = Duration::from_secs(65);
-const RESPONSES_ROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+pub const AI_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+pub const AI_TOTAL_BUDGET: Duration = Duration::from_secs(20);
+const RESPONSES_ROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn ai_transport_error(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
@@ -719,6 +719,15 @@ impl AiReplyCache {
             true
         } else {
             false
+        }
+    }
+
+    pub fn remove_scoped(&self, namespace: &str, key: &str) {
+        if let Ok(mut namespaces) = self.inner.lock() {
+            if let Some(state) = namespaces.get_mut(namespace) {
+                state.entries.remove(key);
+                state.order.retain(|item| item != key);
+            }
         }
     }
 }
