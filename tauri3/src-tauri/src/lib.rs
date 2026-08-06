@@ -4873,6 +4873,7 @@ pub fn run() {
             .spawn(app_handle.clone());
             runtime_tasks.push(bridge::spawn(
                 app.state::<AppState>().gateway.clone(),
+                app.state::<AppState>().database_executor.clone(),
                 app.state::<AppState>().shutdown.clone(),
                 app.state::<AppState>().logger.clone(),
             ));

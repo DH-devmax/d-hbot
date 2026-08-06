@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::database::DatabaseExecutor;
 use crate::diagnostics::Logger;
 use crate::error::AppError;
 use crate::gateway::RuntimeGateway;
-use crate::models::MemberRef;
+use crate::models::EffectOutboxRequest;
 use crate::shutdown::ShutdownSignal;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -11,12 +12,20 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
+
+struct BridgeState {
+    gateway: Arc<dyn RuntimeGateway>,
+    database: DatabaseExecutor,
+}
 
 pub fn spawn(
     gateway: Arc<dyn RuntimeGateway>,
+    database: DatabaseExecutor,
     shutdown: Arc<ShutdownSignal>,
     logger: Logger,
 ) -> tauri::async_runtime::JoinHandle<()> {
+    let state = Arc::new(BridgeState { gateway, database });
     tauri::async_runtime::spawn(async move {
         let router = Router::new()
             .route("/ping", get(ping))
@@ -29,7 +38,7 @@ pub fn spawn(
             .route("/v1/group/set-member-nickname", post(rename))
             .route("/v1/group/remove-group-member", post(remove_member))
             .route("/v1/group/set-group-mute", post(set_group_mute))
-            .with_state(gateway);
+            .with_state(state);
         let listener = loop {
             let bind = tokio::net::TcpListener::bind("127.0.0.1:51235");
             match tokio::select! {
@@ -57,15 +66,18 @@ pub fn spawn(
 
 type BridgeResponse = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-async fn ping(State(gateway): State<Arc<dyn RuntimeGateway>>) -> BridgeResponse {
-    let snapshot = gateway.diagnose().await;
+// -- read routes (direct gateway) --------------------------------------------
+
+async fn ping(State(state): State<Arc<BridgeState>>) -> BridgeResponse {
+    let snapshot = state.gateway.diagnose().await;
     Ok(success(
         json!({"bridge":"rust","status":snapshot.status,"detail":snapshot.detail,"nimAccount":snapshot.nim_account}),
     ))
 }
 
-async fn list_groups(State(gateway): State<Arc<dyn RuntimeGateway>>) -> BridgeResponse {
-    gateway
+async fn list_groups(State(state): State<Arc<BridgeState>>) -> BridgeResponse {
+    state
+        .gateway
         .list_groups()
         .await
         .map(|value| success(json!(value)))
@@ -78,15 +90,44 @@ struct GroupID {
     group_id: i64,
 }
 async fn list_members(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<GroupID>,
 ) -> BridgeResponse {
-    gateway
+    state
+        .gateway
         .list_members(input.group_id)
         .await
         .map(|value| success(json!(value)))
         .map_err(failure)
 }
+
+// -- helpers for write routes ------------------------------------------------
+
+async fn get_account_id(state: &BridgeState) -> Result<String, (StatusCode, Json<Value>)> {
+    state
+        .gateway
+        .session_identity()
+        .await
+        .map(|(_, id)| id)
+        .map_err(failure)
+}
+
+fn enqueue_request(
+    account_id: String,
+    group_id: i64,
+    effect_type: &str,
+    payload: Value,
+) -> EffectOutboxRequest {
+    EffectOutboxRequest {
+        account_id,
+        group_id,
+        effect_type: effect_type.into(),
+        payload_json: payload.to_string(),
+        dedupe_key: Uuid::new_v4().to_string(),
+    }
+}
+
+// -- write routes (enqueued via outbox) --------------------------------------
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,13 +136,20 @@ struct SendText {
     text: String,
 }
 async fn send_text(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<SendText>,
 ) -> BridgeResponse {
-    gateway
-        .send_text(input.group_id, &input.text)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "send_text",
+            json!({"text": input.text, "purpose": "bridge"}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
@@ -113,13 +161,20 @@ struct Recall {
     message_id: String,
 }
 async fn recall(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<Recall>,
 ) -> BridgeResponse {
-    gateway
-        .recall(input.group_id, input.user_id, &input.message_id)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "recall",
+            json!({"userId": input.user_id, "serverMessageId": input.message_id}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
@@ -131,13 +186,20 @@ struct Mute {
     duration_seconds: i64,
 }
 async fn mute(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<Mute>,
 ) -> BridgeResponse {
-    gateway
-        .mute(input.group_id, input.user_id, input.duration_seconds)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "mute",
+            json!({"userId": input.user_id, "durationSeconds": input.duration_seconds}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
@@ -148,23 +210,37 @@ struct MemberID {
     user_id: i64,
 }
 async fn unmute(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<MemberID>,
 ) -> BridgeResponse {
-    gateway
-        .unmute(input.group_id, input.user_id)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "unmute",
+            json!({"userId": input.user_id}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 async fn remove_member(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<MemberID>,
 ) -> BridgeResponse {
-    gateway
-        .remove_member(input.group_id, input.user_id)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "remove",
+            json!({"userId": input.user_id}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
@@ -177,20 +253,24 @@ struct Rename {
     nickname: String,
 }
 async fn rename(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<Rename>,
 ) -> BridgeResponse {
-    gateway
-        .rename(
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
             input.group_id,
-            &MemberRef {
-                user_id: input.user_id,
-                nim_id: input.nim_id,
-            },
-            &input.nickname,
-        )
+            "rename",
+            json!({
+                "userId": input.user_id.unwrap_or(0),
+                "nimId": input.nim_id,
+                "nickname": input.nickname,
+            }),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
@@ -201,13 +281,20 @@ struct GroupMute {
     muted: bool,
 }
 async fn set_group_mute(
-    State(gateway): State<Arc<dyn RuntimeGateway>>,
+    State(state): State<Arc<BridgeState>>,
     Json(input): Json<GroupMute>,
 ) -> BridgeResponse {
-    gateway
-        .set_group_mute(input.group_id, input.muted)
+    let account_id = get_account_id(&state).await?;
+    state
+        .database
+        .enqueue_effect(enqueue_request(
+            account_id,
+            input.group_id,
+            "group_mute",
+            json!({"muted": input.muted}),
+        ))
         .await
-        .map(|receipt| success(json!(receipt)))
+        .map(|enqueued| success(json!(enqueued)))
         .map_err(failure)
 }
 
