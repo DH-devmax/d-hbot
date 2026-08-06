@@ -1,6 +1,6 @@
 # DH BOT 3.0 beta.1 状态
 
-技术快照（2026-08-06）：应用版本 `3.0.0-beta.1`，SQLite schema v12，生产构建
+技术快照（2026-08-06）：应用版本 `3.0.0-beta.1`，SQLite schema v13，生产构建
 `--no-default-features`，生产端点 `127.0.0.1:9222`。本文件中的测试数量是该源码快照的
 本地结果；Windows 新产物必须重新生成 SHA-256，不能复用历史包哈希。
 
@@ -17,6 +17,7 @@
 ## 已完成
 
 - schema v12 幂等迁移：在既有消息、outbox、知识、任务和业务应用结构上增加账号级 `ai_provider_endpoints`、Responses 思考深度和短期群名片预期回调表，并增加机器/AI 规则类型、多群绑定、稳定成员白名单、独立群开关、规则评估记录和业务能力校验记录。
+- schema v13 幂等迁移：修正活动时间计算为数据库本地时区（`date(...,'localtime')` / `strftime('%H:%M',...,'localtime')`），版本门控启用存量 `legacy-task:*` 活动（需有活动组与活动时间、关联任务未发送提醒且状态为 pending/retry）；`activity_runs` 外键补 `ON DELETE CASCADE`。
 - `DatabaseExecutor` 独占 `Database::open` 交付的唯一 SQLite 连接，使用 `dh-sqlite` 线程、256 有界队列、FIFO 排空和 `Shutdown` 回执。Tauri/runtime 生产路径不再持有可直接调用的同步数据库。
 - 连接、消息、名片、规则、提醒、摘要、计划和诊断桥 worker 统一监督；退出最多等待 5 秒，未确认副作归档为 `unknown`，再排空 SQLite。
 - 消息链路固定为“批量持久化 → 连续 ACK → 按群串行派发”；重复、乱序、重试、重启恢复、解码失败和未知回执可追踪。
@@ -51,7 +52,7 @@
 
 ## 当前验证
 
-- `cargo test --no-default-features`：核心库 202 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v12、多 Provider 与思考深度迁移、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、single-flight 与缓存校验。
+- `cargo test --no-default-features`：核心库 214 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v13、多 Provider 与思考深度迁移、活动本地时区修正、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、AI 文案事实双向校验、single-flight 与缓存校验。
 - `cargo test --features fixture`：核心库 208 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
 - 群公告发布语义已固定为 `add-notice → 按新 noticeId 回读 → NIM 广播`，每次明确发布都会新增历史；`notice-opt` 仅保留给明确选择旧公告后的编辑流程。
 - 两套 `cargo clippy --all-targets -- -D warnings` 通过。

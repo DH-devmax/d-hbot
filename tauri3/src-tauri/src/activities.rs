@@ -154,21 +154,47 @@ pub fn validate_generated_text(
             "AI 活动文案与近期发布重复",
         ));
     }
-    for required in factual_tokens(original) {
-        if !candidate.contains(&required) {
-            return Err(AppError::new(
-                "activity_ai_facts",
-                format!("AI 活动文案遗漏关键事实：{required}"),
-            ));
+    // 事实校验分两个方向，缺任何一个都不够：
+    // 1) 原文的数字/金额/时间/链接必须按原顺序出现，避免「满 100 减 20」被改写成
+    //    「满 20 减 100」这种数值齐全但语义相反的文案通过。
+    // 2) 候选文案不得引入原文没有的数字或链接，否则模型可以凭空加「首充送 888 元」
+    //    或换一个链接，而 AGENTS.md 与提示词都明确要求不新增优惠、承诺或规则。
+    let required = factual_tokens(original);
+    let mut cursor = 0usize;
+    for token in &required {
+        match candidate[cursor..].find(token.as_str()) {
+            Some(offset) => cursor += offset + token.len(),
+            None => {
+                return Err(AppError::new(
+                    "activity_ai_facts",
+                    format!("AI 活动文案遗漏或调换了关键事实：{token}"),
+                ));
+            }
         }
+    }
+    let allowed = required
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(invented) = factual_tokens(candidate)
+        .into_iter()
+        .find(|token| !allowed.contains(token))
+    {
+        return Err(AppError::new(
+            "activity_ai_invented_facts",
+            format!("AI 活动文案新增了原文没有的数字或链接：{invented}"),
+        ));
     }
     Ok(candidate.to_string())
 }
 
+/// 按出现顺序抽取数字、时间、金额和链接，保留重复项，用于顺序敏感的事实校验。
 fn factual_tokens(value: &str) -> Vec<String> {
-    let matcher = regex::Regex::new(r"https?://[^\s]+|(?:\d[\d:./-]*\d|\d)")
+    // 链接只吃可打印 ASCII：`[^\s]+` 会把紧跟其后的中文一起吞进 token，
+    // 导致同一个链接在原文和候选里被切成不同字符串。
+    let matcher = regex::Regex::new(r"https?://[!-~]+|(?:\d[\d:./-]*\d|\d)")
         .expect("activity factual token regex");
-    let mut values = matcher
+    matcher
         .find_iter(value)
         .map(|matched| {
             matched
@@ -177,10 +203,7 @@ fn factual_tokens(value: &str) -> Vec<String> {
                 .to_string()
         })
         .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    values.sort();
-    values.dedup();
-    values
+        .collect()
 }
 
 fn normalize_for_comparison(value: &str) -> String {
@@ -274,5 +297,54 @@ mod tests {
     #[test]
     fn ai_text_rejects_recent_duplicate() {
         assert!(validate_generated_text("欢迎参加", "欢迎参加", &[" 欢迎参加 ".into()]).is_err());
+    }
+
+    #[test]
+    fn ai_text_rejects_swapped_amounts() {
+        // 数值齐全但顺序调换会改变语义，必须拦下来。
+        let original = "满 100 减 20";
+        assert!(validate_generated_text(original, "满 100 减 20，欢迎下单", &[]).is_ok());
+        let error = validate_generated_text(original, "满 20 减 100，欢迎下单", &[]).unwrap_err();
+        assert_eq!(error.code, "activity_ai_facts");
+    }
+
+    #[test]
+    fn ai_text_rejects_invented_amounts_and_links() {
+        let original = "8 月 12 日 19:30 开始，详情 https://example.com/a";
+        let error = validate_generated_text(
+            original,
+            "8 月 12 日 19:30 开始，首充送 888 元，详情 https://example.com/a",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "activity_ai_invented_facts");
+        // 换掉链接会先在「原文事实必须原样出现」这一步被拦下，
+        // 报的是遗漏而不是新增——对这种改写来说遗漏才是更准确的判断。
+        let swapped_link = validate_generated_text(
+            original,
+            "8 月 12 日 19:30 开始，详情 https://evil.example.com/b",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(swapped_link.code, "activity_ai_facts");
+    }
+
+    #[test]
+    fn ai_text_allows_wording_changes_without_new_facts() {
+        let original = "8 月 12 日 19:30 开始，详情 https://example.com/a";
+        assert!(validate_generated_text(
+            original,
+            "各位注意啦，8 月 12 日 19:30 我们准时开始，详情看 https://example.com/a，记得来～",
+            &[]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn factual_tokens_keep_order_and_stop_links_at_ascii() {
+        assert_eq!(
+            factual_tokens("8 月 12 日 19:30，详情 https://example.com/a。"),
+            vec!["8", "12", "19:30", "https://example.com/a"]
+        );
     }
 }

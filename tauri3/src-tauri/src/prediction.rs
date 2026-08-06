@@ -214,6 +214,38 @@ const FALLBACK_BASES: &[&str] = &[
     "https://api1.mbf52.com",
     "https://api2.mbf52.com",
 ];
+/// 公开开奖源响应体上限。这些都是第三方/公网地址，必须在读取过程中就设上限。
+const PUBLIC_RESPONSE_LIMIT: usize = 20 * 1024 * 1024;
+
+/// 边读边限长地取回响应体。
+///
+/// 先 `bytes().await` 再检查长度等于已经把整个响应收进内存，上限就形同虚设；
+/// 这里按 chunk 累加，一超限立刻断开连接。
+async fn read_capped_body(
+    response: reqwest::Response,
+    limit: usize,
+    source_label: &str,
+) -> AppResult<Vec<u8>> {
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|_| {
+            AppError::new(
+                "prediction_public_response",
+                format!("{source_label}读取失败"),
+            )
+        })?;
+        let Some(chunk) = chunk else { break };
+        if body.len() + chunk.len() > limit {
+            return Err(AppError::new(
+                "prediction_public_response",
+                format!("{source_label}超过大小限制"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Clone)]
 struct CachedPrediction {
@@ -368,15 +400,8 @@ impl PublicLotterySource {
                 format!("BCLC 官方 Keno 返回 HTTP {}", response.status()),
             ));
         }
-        let bytes = response.bytes().await.map_err(|_| {
-            AppError::new("prediction_public_response", "BCLC 官方 Keno 文件读取失败")
-        })?;
-        if bytes.len() > 20 * 1024 * 1024 {
-            return Err(AppError::new(
-                "prediction_public_response",
-                "BCLC 官方 Keno 文件超过大小限制",
-            ));
-        }
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "BCLC 官方 Keno 文件").await?;
         let snapshot = parse_bclc_zip(game, &bytes).ok_or_else(|| {
             AppError::new(
                 "prediction_public_contract",
@@ -414,15 +439,8 @@ impl PublicLotterySource {
                 format!("中国福彩网公开数据返回 HTTP {}", response.status()),
             ));
         }
-        let bytes = response.bytes().await.map_err(|_| {
-            AppError::new("prediction_public_response", "中国福彩网公开数据读取失败")
-        })?;
-        if bytes.len() > 20 * 1024 * 1024 {
-            return Err(AppError::new(
-                "prediction_public_response",
-                "中国福彩网公开数据超过大小限制",
-            ));
-        }
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "中国福彩网公开数据").await?;
         let snapshot = parse_cwl_snapshot(game, &bytes).ok_or_else(|| {
             AppError::new(
                 "prediction_public_contract",
@@ -457,10 +475,8 @@ impl PublicLotterySource {
                 format!("公开 Keno 回退源返回 HTTP {}", response.status()),
             ));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| AppError::new("prediction_public_response", "公开 Keno 回退源读取失败"))?;
+        let bytes =
+            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "公开 Keno 回退源").await?;
         let snapshot = parse_public_keno_snapshot(game, &bytes).ok_or_else(|| {
             AppError::new("prediction_public_contract", "公开 Keno 回退源格式无法识别")
         })?;
@@ -974,20 +990,31 @@ fn parse_public_keno_snapshot(game: &Game, body: &[u8]) -> Option<PredictionSnap
     let rows = value.get("data")?.as_array()?;
     let mut draws = Vec::new();
     for row in rows {
-        let period = row.get("nbr")?.as_str()?;
-        let date = row.get("date")?.as_str()?;
-        let time = row.get("time")?.as_str()?;
-        let local =
-            NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M:%S").ok()?;
+        // 单行字段缺失只跳过该行，不能让整个回退载荷失败——与 parse_bclc_csv /
+        // parse_cwl_snapshot 的行级容错保持一致。
+        let (Some(period), Some(date), Some(time), Some(raw_numbers)) = (
+            row.get("nbr").and_then(|value| value.as_str()),
+            row.get("date").and_then(|value| value.as_str()),
+            row.get("time").and_then(|value| value.as_str()),
+            row.get("nbrs").and_then(|value| value.as_str()),
+        ) else {
+            continue;
+        };
+        let Ok(local) =
+            NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M:%S")
+        else {
+            continue;
+        };
         // The public mirror normalizes its date/time fields to Beijing time.
-        let opened_at = Shanghai
+        let Some(opened_at) = Shanghai
             .from_local_datetime(&local)
             .single()
-            .or_else(|| Shanghai.from_local_datetime(&local).earliest())?
-            .with_timezone(&Utc);
-        let mut numbers = row
-            .get("nbrs")?
-            .as_str()?
+            .or_else(|| Shanghai.from_local_datetime(&local).earliest())
+            .map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let mut numbers = raw_numbers
             .split(',')
             .filter_map(|value| value.trim().parse::<i64>().ok())
             .collect::<Vec<_>>();

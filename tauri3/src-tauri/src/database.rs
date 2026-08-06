@@ -356,7 +356,7 @@ CREATE TABLE IF NOT EXISTS activity_runs (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT,
-  FOREIGN KEY(activity_id) REFERENCES activities(id),
+  FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,
   FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);
@@ -1807,22 +1807,46 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
              CREATE INDEX IF NOT EXISTS activities_due_idx ON activities(account_id,enabled,next_run_at) WHERE deleted_at IS NULL;
              CREATE TABLE IF NOT EXISTS activity_groups (activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,PRIMARY KEY(activity_id,account_id,group_id),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
              CREATE TABLE IF NOT EXISTS activity_times (activity_id INTEGER NOT NULL,local_time TEXT NOT NULL,PRIMARY KEY(activity_id,local_time),FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE);
-             CREATE TABLE IF NOT EXISTS activity_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,scheduled_for TEXT NOT NULL,run_key TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'pending',text TEXT NOT NULL DEFAULT '',content_source TEXT NOT NULL DEFAULT 'fixed',attempts INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,last_error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,FOREIGN KEY(activity_id) REFERENCES activities(id),FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS activity_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,activity_id INTEGER NOT NULL,account_id TEXT NOT NULL,group_id INTEGER NOT NULL,scheduled_for TEXT NOT NULL,run_key TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'pending',text TEXT NOT NULL DEFAULT '',content_source TEXT NOT NULL DEFAULT 'fixed',attempts INTEGER NOT NULL DEFAULT 0,next_retry_at TEXT,last_error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE,FOREIGN KEY(account_id,group_id) REFERENCES groups(account_id,group_id) ON DELETE CASCADE);
              CREATE INDEX IF NOT EXISTS activity_runs_history_idx ON activity_runs(account_id,activity_id,scheduled_for DESC,id DESC);",
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .execute(
-            "INSERT OR IGNORE INTO activities(account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,created_at,updated_at) SELECT account_id,title,CASE WHEN TRIM(description)='' THEN title ELSE description END,0,0,'',?,substr(COALESCE(reminder_at,due_at,created_at),1,10),substr(COALESCE(reminder_at,due_at,created_at),1,10),'[1,2,3,4,5,6,7]',NULL,'legacy-task:'||id,created_at,updated_at FROM tasks",
+            // 旧任务的 reminder_at 是 RFC3339（UTC）。活动表的 start_date/local_time 是
+            // timezone 列所指时区的本地墙上时间，所以必须先转成 localtime 再截取，
+            // 否则会整体偏移一个 UTC offset。content 截断到 1000 字符、title 必须非空，
+            // 保证迁移出来的活动一定能通过 activities::validate。
+            "INSERT OR IGNORE INTO activities(account_id,name,content,enabled,ai_optimize,ai_instructions,timezone,start_date,end_date,weekdays_json,next_run_at,source_key,created_at,updated_at) SELECT account_id,TRIM(title),substr(CASE WHEN TRIM(description)='' THEN TRIM(title) ELSE TRIM(description) END,1,1000),0,0,'',?,COALESCE(date(COALESCE(reminder_at,due_at,created_at),'localtime'),substr(COALESCE(reminder_at,due_at,created_at),1,10)),COALESCE(date(COALESCE(reminder_at,due_at,created_at),'localtime'),substr(COALESCE(reminder_at,due_at,created_at),1,10)),'[1,2,3,4,5,6,7]',NULL,'legacy-task:'||id,created_at,updated_at FROM tasks WHERE TRIM(title)<>''",
             params![migration_timezone],
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
     transaction
         .execute_batch(
             "INSERT OR IGNORE INTO activity_groups(activity_id,account_id,group_id) SELECT activities.id,tasks.account_id,tasks.group_id FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;
-             INSERT OR IGNORE INTO activity_times(activity_id,local_time) SELECT activities.id,CASE WHEN tasks.reminder_at IS NOT NULL THEN substr(tasks.reminder_at,12,5) ELSE '09:00' END FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;",
+             INSERT OR IGNORE INTO activity_times(activity_id,local_time) SELECT activities.id,COALESCE(strftime('%H:%M',tasks.reminder_at,'localtime'),'09:00') FROM tasks JOIN activities ON activities.account_id=tasks.account_id AND activities.source_key='legacy-task:'||tasks.id;",
         )
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    // 旧的 reminder_loop 已经被 activity_loop 取代，任何仍然挂着的任务提醒如果只迁移成
+    // 停用草稿就会静默失效。这里把「未发送且未结束」的提醒启用，让它继续按原定时刻发出；
+    // 已经过期的那些会在 generate_due_activity_runs 里落一条 missed 历史后自然转为不再触发。
+    //
+    // 只在真正从 <13 升级时执行一次：这个迁移每次启动都会跑，不加版本闸会反复覆盖用户
+    // 后来手工停用的活动。
+    if old_version < 13 {
+        transaction
+            .execute(
+                "UPDATE activities SET enabled=1,next_run_at=(SELECT tasks.reminder_at FROM tasks WHERE 'legacy-task:'||tasks.id=activities.source_key AND tasks.account_id=activities.account_id),updated_at=? \
+                 WHERE activities.source_key LIKE 'legacy-task:%' AND activities.deleted_at IS NULL AND activities.enabled=0 \
+                   AND EXISTS (SELECT 1 FROM activity_groups WHERE activity_groups.activity_id=activities.id) \
+                   AND EXISTS (SELECT 1 FROM activity_times WHERE activity_times.activity_id=activities.id) \
+                   AND EXISTS (SELECT 1 FROM tasks WHERE 'legacy-task:'||tasks.id=activities.source_key AND tasks.account_id=activities.account_id \
+                     AND tasks.reminder_at IS NOT NULL AND tasks.reminder_sent_at IS NULL \
+                     AND tasks.reminder_state IN ('pending','retry') AND tasks.status<>'done')",
+                params![Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| AppError::new("database_migration", error.to_string()))?;
+    }
     transaction
         .execute_batch("CREATE TABLE IF NOT EXISTS gateway_capability_verifications (fingerprint TEXT NOT NULL,capability TEXT NOT NULL,source TEXT NOT NULL,status TEXT NOT NULL,automatic_allowed INTEGER NOT NULL DEFAULT 0,evidence_hash TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',verified_at TEXT NOT NULL,PRIMARY KEY(fingerprint,capability)); CREATE TABLE IF NOT EXISTS ai_provider_endpoints (id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL DEFAULT '',webhook_url TEXT NOT NULL DEFAULT '',api_backend TEXT NOT NULL DEFAULT 'chat_completions',model TEXT NOT NULL DEFAULT 'deepseek-v4-pro',secret_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,health_status TEXT NOT NULL DEFAULT 'unchecked',failure_count INTEGER NOT NULL DEFAULT 0,cooldown_until TEXT,last_error TEXT NOT NULL DEFAULT '',last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS ai_provider_endpoints_account_priority_idx ON ai_provider_endpoints(account_id,enabled DESC,priority,id);")
         .map_err(|error| AppError::new("database_migration", error.to_string()))?;
@@ -4508,6 +4532,98 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn outstanding_task_reminders_keep_firing_after_activity_migration() {
+        let directory = tempdir().unwrap();
+        let paths = AppPaths {
+            root: directory.path().to_path_buf(),
+            v3: directory.path().join("3.0"),
+            database: directory.path().join("3.0/dh.db"),
+            secrets: directory.path().join("3.0/secrets.dat"),
+            logs: directory.path().join("3.0/logs"),
+            legacy_backups: directory.path().join("legacy-backups"),
+            runtime_mode_file: directory.path().join("runtime-mode"),
+        };
+        std::fs::create_dir_all(&paths.v3).unwrap();
+
+        // 造一个 v11 库：一条还没发出的未来提醒，一条已经发过的提醒。
+        let pending_at = "2031-09-15T10:00:00+00:00";
+        let legacy = Connection::open(&paths.database).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        legacy
+            .execute_batch(&format!(
+                "INSERT INTO accounts(id,display_name,role,discovered_at,updated_at) VALUES('acct','','unknown','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 INSERT INTO groups(account_id,group_id,name,updated_at) VALUES('acct',77,'测试群','2026-01-01T00:00:00+00:00');
+                 INSERT INTO tasks(id,account_id,group_id,title,description,status,reminder_at,reminder_state,created_at,updated_at)
+                   VALUES(1,'acct',77,'待发提醒','记得开播','pending','{pending_at}','pending','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 INSERT INTO tasks(id,account_id,group_id,title,description,status,reminder_at,reminder_sent_at,reminder_state,created_at,updated_at)
+                   VALUES(2,'acct',77,'已发提醒','历史','done','2026-02-01T10:00:00+00:00','2026-02-01T10:00:05+00:00','sent','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00');
+                 PRAGMA user_version=11;"
+            ))
+            .unwrap();
+        drop(legacy);
+
+        let database = Database::open(&paths).unwrap();
+        assert_eq!(database.status().unwrap().schema_version, 13);
+
+        // 未发出的提醒必须继续生效，否则升级后就静默失效了。
+        let (enabled, next_run_at, local_time): (i64, Option<String>, String) = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT activities.enabled,activities.next_run_at,activity_times.local_time \
+                     FROM activities JOIN activity_times ON activity_times.activity_id=activities.id \
+                     WHERE activities.source_key='legacy-task:1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(enabled, 1);
+        assert_eq!(next_run_at.as_deref(), Some(pending_at));
+
+        // local_time 是 timezone 列所指时区的墙上时间，不能是原始 UTC 的 10:00。
+        let expected_local = DateTime::parse_from_rfc3339(pending_at)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(local_time, expected_local);
+
+        // 已经发出的提醒保持停用草稿，不重复轰炸群。
+        let sent_enabled: i64 = database
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT enabled FROM activities WHERE source_key='legacy-task:2'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(sent_enabled, 0);
+
+        // 版本闸：迁移每次启动都会跑，但不能反复覆盖用户后来手工停用的活动。
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE activities SET enabled=0 WHERE source_key='legacy-task:1'",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(database);
+        let reopened = Database::open(&paths).unwrap();
+        let still_disabled: i64 = reopened
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT enabled FROM activities WHERE source_key='legacy-task:1'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(still_disabled, 0);
     }
 
     #[test]

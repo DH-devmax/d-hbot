@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::Serialize;
@@ -100,6 +100,10 @@ fn next_connection_retry(delay: Duration) -> Duration {
             .clamp(250, 2_000),
     )
 }
+
+/// 会话至少稳定运行这么久，才认为上一轮连接是健康的，可以把重连退避清零。
+/// 否则连续快速断开（监听会话切换、队列溢出、序列缺口）会一直以最短间隔重连。
+const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub(crate) fn runtime_lane_id(kind: &str, account_id: &str, group_id: i64) -> String {
     let mut hasher = Sha256::new();
@@ -1591,11 +1595,15 @@ impl BackendRuntime {
                 recent_context: Vec::new(),
                 knowledge: Vec::new(),
             };
+            // 事实类失败也给一次纠正机会：直接回退到管理员原文虽然安全，但只要提示
+            // 模型「别改数字、别加优惠」通常就能过，没必要浪费这一轮生成。
+            let base_prompt = request.message.clone();
+            let mut retry_hint = "";
+            let mut last_error =
+                AppError::new("activity_ai_text", "AI 活动文案未通过校验".to_string());
             for attempt in 0..2 {
                 if attempt > 0 {
-                    request
-                        .message
-                        .push_str("\n本次必须换一种不同的表达，不能复用近期文案。");
+                    request.message = format!("{base_prompt}{retry_hint}");
                 }
                 let decision = provider.decide(&request).await?;
                 match crate::activities::validate_generated_text(
@@ -1604,11 +1612,24 @@ impl BackendRuntime {
                     &recent_texts,
                 ) {
                     Ok(text) => return Ok(text),
-                    Err(error) if error.code == "activity_ai_duplicate" && attempt == 0 => continue,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        retry_hint = match error.code.as_str() {
+                            "activity_ai_duplicate" => {
+                                "\n本次必须换一种不同的表达，不能复用近期文案。"
+                            }
+                            "activity_ai_facts" => {
+                                "\n本次必须原样保留管理员原文里的每个日期、时间、金额、数字和链接，顺序也不能调换。"
+                            }
+                            "activity_ai_invented_facts" => {
+                                "\n本次不能出现管理员原文里没有的数字、金额或链接，只允许改写措辞。"
+                            }
+                            _ => return Err(error),
+                        };
+                        last_error = error;
+                    }
                 }
             }
-            Err(AppError::new("activity_ai_duplicate", "AI 活动文案重复"))
+            Err(last_error)
         }
         .await;
         match result {
@@ -2375,7 +2396,7 @@ impl BackendRuntime {
                     continue;
                 }
             };
-            connection_retry = Duration::from_millis(250);
+            let session_started = Instant::now();
             let gateway_epoch = self.gateway.session_epoch();
             if active_account != account_id || session_epoch != gateway_epoch {
                 workers.clear();
@@ -3190,6 +3211,11 @@ impl BackendRuntime {
             reported_member_event_mismatches.clear();
             reported_ignored_events.clear();
             last_retry_scan = Utc::now() - chrono::Duration::seconds(5);
+            // 只有真正稳定跑过一段时间的会话才清空退避，否则反复 break 的会话
+            // （队列溢出、序列号缺口）会一直以最短间隔重连，把网关打穿。
+            if session_started.elapsed() >= HEALTHY_SESSION_THRESHOLD {
+                connection_retry = Duration::from_millis(250);
+            }
             let delay = connection_retry;
             connection_retry = next_connection_retry(connection_retry);
             tokio::select! { _ = sleep(delay) => {}, _ = self.shutdown.cancelled() => break }
@@ -3328,6 +3354,7 @@ impl BackendRuntime {
                     .map(str::to_string);
                 let new_violation = is_external_member_card_update(
                     saved.is_some(),
+                    restore_name.is_some(),
                     &previous_card_name,
                     &incoming_card_name,
                     expected_update,
@@ -5231,13 +5258,18 @@ fn merge_managed_member_state(incoming: &mut Member, saved: &Member) {
     }
 }
 
+/// 只有 DH 锁定过群名片的成员，才会因为外部改名累计违规。
+/// `has_locked_card_name` 对应该成员存在生效中的 `locked_card_name`；
+/// 缺少这个前提会让从未纳入名片管理的普通成员被 `rename_count` 规则处罚。
 fn is_external_member_card_update(
     saved_exists: bool,
+    has_locked_card_name: bool,
     previous_card_name: &str,
     incoming_card_name: &str,
     expected_update: bool,
 ) -> bool {
     saved_exists
+        && has_locked_card_name
         && !expected_update
         && !incoming_card_name.trim().is_empty()
         && previous_card_name.trim() != incoming_card_name.trim()
@@ -5607,22 +5639,34 @@ mod tests {
     fn only_external_member_card_changes_increment_rename_violations() {
         assert!(is_external_member_card_update(
             true,
+            true,
             "原名",
             "外部改名",
             false
         ));
         assert!(!is_external_member_card_update(
-            true, "原名", "DH改名", true
+            true, true, "原名", "DH改名", true
         ));
-        assert!(!is_external_member_card_update(true, "原名", "", false));
+        assert!(!is_external_member_card_update(
+            true, true, "原名", "", false
+        ));
         assert!(!is_external_member_card_update(
             false,
+            true,
             "",
             "首次发现",
             false
         ));
         assert!(!is_external_member_card_update(
-            true, "相同", " 相同 ", false
+            true, true, "相同", " 相同 ", false
+        ));
+    }
+
+    #[test]
+    fn unlocked_members_never_accumulate_rename_violations() {
+        // 没有锁定群名片的成员自行改名不属于违规，避免 rename_count 规则误伤。
+        assert!(!is_external_member_card_update(
+            true, false, "原名", "自己改的名", false
         ));
     }
 
