@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use dh_bot_lib::fixture::FIXTURE_GROUP;
 use dh_bot_lib::gateway::{
-    CapabilityStatus, CdpClient, CdpGateway, ConnectionStatus, GroupGateway, RuntimeGateway,
+    CapabilityStatus, CdpClient, CdpGateway, ConnectionStatus, GatewayRecord, GatewayRecordKind,
+    GroupGateway, RuntimeGateway,
 };
 use serde_json::json;
 
@@ -95,14 +96,20 @@ impl Drop for FixtureProcess {
     }
 }
 
+/// 等待批次中出现满足 `predicate` 的记录。
+///
+/// `read_batch` 只做 `state.queue.slice(0,100)`——它不消费队列，未 ACK 的记录会
+/// 一直留在队列里被重复读到。所以"批次非空"并不代表调用方等的那条记录已经到达：
+/// 之前遗留的记录足以让等待立刻返回。调用方必须说明自己等的是什么。
 async fn wait_for_records(
     gateway: &CdpGateway,
     timeout: Duration,
+    predicate: impl Fn(&GatewayRecord) -> bool,
 ) -> dh_bot_lib::gateway::GatewayBatch {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let batch = gateway.read_batch().await.unwrap();
-        if !batch.records.is_empty() {
+        if batch.records.iter().any(&predicate) {
             return batch;
         }
         assert!(
@@ -358,17 +365,10 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let recall_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let batch = gateway.read_batch().await.unwrap();
-        if batch.records.iter().any(|record| {
-            record.payload["idServer"].as_str() == Some("fixture-other-member-recall")
-        }) {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < recall_deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_records(&gateway, Duration::from_secs(5), |record| {
+        record.payload["idServer"].as_str() == Some("fixture-other-member-recall")
+    })
+    .await;
     let recall_receipt = gateway
         .recall(FIXTURE_GROUP, 10006, "fixture-other-member-recall")
         .await
@@ -400,7 +400,10 @@ async fn cdp_fixture_exercises_real_gateway_contract() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let member_batch = wait_for_records(&gateway, Duration::from_secs(5)).await;
+    let member_batch = wait_for_records(&gateway, Duration::from_secs(5), |record| {
+        record.kind == GatewayRecordKind::TeamMemberJoined
+    })
+    .await;
     assert_eq!(
         gateway
             .member_events(member_batch.records.clone())
