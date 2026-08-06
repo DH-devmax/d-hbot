@@ -155,13 +155,6 @@ impl Database {
         .map_err(|error| AppError::new("messages_query", error.to_string()))
     }
 
-    pub fn mark_message_processed(&self, id: i64, acknowledged: bool) -> AppResult<()> {
-        if acknowledged {
-            self.mark_message_acknowledged(id)?;
-        }
-        self.finish_message_processing(id, true, "")
-    }
-
     pub fn recent_messages(
         &self,
         account_id: &str,

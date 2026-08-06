@@ -37,7 +37,9 @@ pub struct DispatchContext {
 
 /// Middleware decision: how to proceed with this item.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fail/Retry returned by ExpiryGuard; exhaustive match expected by external middleware
+// 内置中间件目前只返回 Continue/Skip；Fail/Retry 是 EffectMiddleware 契约的一部分，
+// run_chain 已把它们翻译成对应的 ChainOutcome，供后续中间件表达永久失败与重试。
+#[allow(dead_code)]
 pub enum DispatchDecision {
     /// Continue to next middleware.
     Continue,
