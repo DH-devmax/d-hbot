@@ -16,7 +16,7 @@ graph TB
     UI["群组 · 消息 · 规则 · AI · 业务应用 · 审计 · 调试"]
   end
 
-  subgraph TAURI["Tauri IPC — lib.rs"]
+  subgraph TAURI["Tauri IPC — commands/ + lib.rs"]
     CMD["Commands<br/>参数校验 / 权限 / 编排"]
     APPSTATE["AppState<br/>gateway · db_executor<br/>runtime_coord · paths"]
   end
@@ -90,8 +90,8 @@ graph TB
 | 层 | 主要代码 | 职责 |
 |---|---|---|
 | React | `tauri3/src` | 页面、表单、批量选择、逐项结果和离线状态 |
-| Tauri command | `lib.rs` | 强类型参数校验、权限检查、服务编排 |
-| BackendRuntime | `runtime.rs`、`runtime_work.rs` | 消息流水线、Dispatcher、规则、AI、任务、计划 |
+| Tauri command | `commands/`（按域分文件）、`lib.rs`（AppState 与注册表） | 强类型参数校验、权限检查、服务编排 |
+| BackendRuntime | `runtime/`、`runtime_work.rs` | 消息流水线、Dispatcher、规则、AI、任务、计划 |
 | 业务逻辑 | `moderation.rs`、`ai.rs`、`business_apps.rs`、`prediction.rs` | 规则判断、AI 决策、预测数据源 |
 | 协议 | `gateway.rs` | CDP、Electron xclient IPC、NIM、成员缓存、能力 |
 | 数据 | `database.rs`、`repository.rs` | `DatabaseExecutor` 单线程事务、幂等和审计 |
@@ -248,7 +248,7 @@ GET  /status   →  BridgeState.gateway.diagnose() → DiagnosticSnapshot
 | `MAX_GATEWAY_BATCH` | 100 | `gateway.rs` | 单次 CDP 轮询最大事件数 |
 | `MAX_MEMBER_CACHE_GROUPS` | 100 | `gateway.rs` | 成员名单缓存上限，超出驱逐最旧群 |
 | `MAX_MEMBER_EVENT_CACHE` | 500 | `gateway.rs` | 单次成员事件合并上限 |
-| `MAX_REPORTED_SET` | 500 | `runtime.rs` | 已报告运行项去重集合上限 |
+| `MAX_REPORTED_SET` | 500 | `runtime/mod.rs` | 已报告运行项去重集合上限 |
 | `MAX_TRACKED_ITEMS` | 200 | `runtime_work.rs` | RuntimeWorkTracker 活跃项上限 |
 | `AI_PROVIDER_TIMEOUT` | 15 s | `ai.rs` | 单 AI 连接生成上限 |
 

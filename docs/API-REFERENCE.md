@@ -1,7 +1,8 @@
 # DH BOT Tauri 命令参考
 
 本文记录生产版前端可以调用的强类型 Tauri command。唯一代码事实来源是
-`tauri3/src-tauri/src/lib.rs` 中的 `dh_handlers!`；前端不得绕过这些命令访问 SQLite、
+`tauri3/src-tauri/src/lib.rs` 中的 `dh_handlers!` 注册表；命令实现按域拆分在
+`tauri3/src-tauri/src/commands/` 下。前端不得绕过这些命令访问 SQLite、
 密钥、任意协议路由、任意 JavaScript 或远程 DevTools。
 
 ## 运行、诊断与窗口

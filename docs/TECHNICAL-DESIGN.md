@@ -24,8 +24,14 @@ Fixture 命令和 Fixture 资源也在生产构建时移除。旧 Go 2.7 代码�
 ```text
 tauri3/src/                         React 页面和 typed client
     | invoke() / 事件
-tauri3/src-tauri/src/lib.rs         Tauri command、权限、服务编排；AppState
-    |-- runtime.rs                  消息流水线、Dispatcher(outbox)、规则、AI、任务
+tauri3/src-tauri/src/lib.rs         AppState、共享校验辅助、dh_handlers! 注册表
+    |-- commands/                   Tauri command 按域分文件（14 个）
+    |     ai · audit · bizapps · cards · groups · knowledge · messaging
+    |     moderation · rules · summaries · system · tasks · wang
+    |     developer（仅 fixture feature）
+    |-- runtime/                    BackendRuntime；mod.rs 保存字段与消息流水线
+    |     mod.rs                    消息 worker、Dispatcher(outbox)、连接与事件循环
+    |     summary · activity · card · roster · narration  各 worker 循环
     |-- runtime_work.rs             RuntimeWorkTracker · DispatchStats · RuntimeCoordination
     |-- queue_kernel.rs             QueueKernel — ExpiryGuard / OrderKeyLock / LaneConcurrencyGate
     |-- gateway.rs                  RuntimeGateway、CDP、Electron IPC、NIM、成员缓存
@@ -219,7 +225,7 @@ pnpm verify:docs
 | `MAX_GATEWAY_BATCH` | 100 | `gateway.rs` | 单次 CDP 轮询最大事件数 |
 | `MAX_MEMBER_CACHE_GROUPS` | 100 | `gateway.rs` | 成员名单 LRU 缓存上限；超出按 `checked_at` 驱逐最旧群 |
 | `MAX_MEMBER_EVENT_CACHE` | 500 | `gateway.rs` | 单次成员事件合并上限 |
-| `MAX_REPORTED_SET` | 500 | `runtime.rs` | 已报告运行项去重集合上限 |
+| `MAX_REPORTED_SET` | 500 | `runtime/mod.rs` | 已报告运行项去重集合上限 |
 | `MAX_TRACKED_ITEMS` | 200 | `runtime_work.rs` | `RuntimeWorkTracker` 活跃项上限 |
 | `AI_PROVIDER_TIMEOUT` | 15 s | `ai.rs` | 单 AI 连接生成上限（另有 2s 连接超时、20s 总预算） |
 
