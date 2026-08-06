@@ -1,9 +1,5 @@
 //! Queue kernel: middleware-based effect dispatch pipeline.
 //!
-//! Phase 2 infrastructure. The old effect_loop remains intact until Phase 3
-//! wires this module in as the live Dispatcher. All public items here are
-//! intentionally unused at the crate level until that phase.
-//!
 //! Architecture:
 //! - `DispatchContext`: carries the item + metadata through the chain
 //! - `DispatchDecision`: what the middleware decided (Continue/Skip/Retry/Fail)
@@ -11,9 +7,6 @@
 //! - `MiddlewareChain`: executes middleware in order
 //! - Built-in middleware: ExpiryGuard, OrderKeyLock, LaneConcurrencyGate
 //! - `QueueKernel`: top-level coordinator (chain + per-lane gate + order-key lock)
-
-// Phase 2: infrastructure only. Phase 3 will consume these types from runtime.rs.
-#![allow(dead_code)]
 
 use crate::error::AppError;
 use crate::models::EffectOutboxItem;
@@ -25,6 +18,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 
 /// Metadata attached to a dispatch context.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by custom middleware implementations
 pub struct DispatchMetadata {
     pub claimed_at: DateTime<Utc>,
     pub correlation_id: String,
@@ -35,12 +29,15 @@ pub struct DispatchMetadata {
 #[derive(Debug, Clone)]
 pub struct DispatchContext {
     pub item: EffectOutboxItem,
+    #[allow(dead_code)] // available to custom middleware
     pub account_id: String,
+    #[allow(dead_code)] // available to custom middleware
     pub metadata: DispatchMetadata,
 }
 
 /// Middleware decision: how to proceed with this item.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fail/Retry returned by ExpiryGuard; exhaustive match expected by external middleware
 pub enum DispatchDecision {
     /// Continue to next middleware.
     Continue,
@@ -233,13 +230,6 @@ pub trait ClockSource: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-pub struct UtcClock;
-
-impl ClockSource for UtcClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // QueueKernel: top-level coordinator
@@ -281,18 +271,6 @@ impl QueueKernel {
             chain,
             order_lock: Arc::new(OrderKeyLock::new()),
             lane_gate: Arc::new(LaneConcurrencyGate::new(4)),
-        }
-    }
-
-    pub fn with_chain(
-        chain: MiddlewareChain,
-        order_lock: Arc<OrderKeyLock>,
-        lane_gate: Arc<LaneConcurrencyGate>,
-    ) -> Self {
-        Self {
-            chain,
-            order_lock,
-            lane_gate,
         }
     }
 
