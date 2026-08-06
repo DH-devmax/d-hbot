@@ -24,23 +24,26 @@ Fixture 命令和 Fixture 资源也在生产构建时移除。旧 Go 2.7 代码�
 ```text
 tauri3/src/                         React 页面和 typed client
     | invoke() / 事件
-tauri3/src-tauri/src/lib.rs         Tauri command、权限和服务编排
-    |-- runtime.rs                  消息/事件流水线、规则、AI、任务和 outbox worker
-    |-- runtime_work.rs             脱敏运行任务快照、进度、队列聚合和事件合并
-    |-- gateway.rs                  RuntimeGateway、CDP、Electron IPC、NIM 和回执
-    |-- database.rs                 schema、迁移、DatabaseExecutor
+tauri3/src-tauri/src/lib.rs         Tauri command、权限、服务编排；AppState
+    |-- runtime.rs                  消息流水线、Dispatcher(outbox)、规则、AI、任务
+    |-- runtime_work.rs             RuntimeWorkTracker · DispatchStats · RuntimeCoordination
+    |-- queue_kernel.rs             QueueKernel — ExpiryGuard / OrderKeyLock / LaneConcurrencyGate
+    |-- gateway.rs                  RuntimeGateway、CDP、Electron IPC、NIM、成员缓存
+    |-- bridge.rs                   axum 127.0.0.1:51235；BridgeState{gateway, database}
+    |-- database.rs                 schema v14、迁移、DatabaseExecutor(256 FIFO)
     |-- repository.rs               事务查询、分页、claim 和审计写入
     |-- moderation.rs               机器规则与 AI 控制规则
     |-- cardnames.rs                建议名片、改名验证、欢迎队列
-    |-- knowledge.rs / ai.rs        文档检索、Provider Pool、AI 决策校验
-    |-- business_apps.rs / prediction.rs
-    |                                业务应用注册表和预测应用
+    |-- knowledge.rs / ai.rs        文档检索、AiProviderPool、AI 决策校验
+    |-- business_apps.rs            BusinessAppRegistry
+    |-- prediction.rs               PublicLotterySource — BCLC/CWL/pc28.help
     |-- scheduler.rs                摘要、任务提醒、每日开关群计划
-    |-- diagnostics.rs              JSONL 日志和支持包
-    |-- secrets.rs / platform.rs    DPAPI、进程、托盘和 Windows 维护
+    |-- diagnostics.rs              JSONL 日志轮转和支持包 ZIP
+    |-- secrets.rs / platform.rs    DPAPI、进程身份、托盘和 Windows 维护
     |-- fixture.rs                  仅 fixture feature 的内存/浏览器测试网关
-SQLite (dh-sqlite thread)           唯一持久化连接
-旺商聊 9222                          CDP -> Electron xclient IPC -> NIM
+SQLite WAL (dh-sqlite thread)       唯一持久化连接；schema v14
+旺商聊 9222                          CDP → Electron xclient IPC → NIM
+axum :51235                         本地桥；入队 effect_outbox / 查诊断状态
 ```
 
 前端不能直接读 SQLite、密钥或 DevTools。所有写入命令必须使用固定的 Rust 请求类型，
@@ -114,16 +117,39 @@ AI 输入只包含当前群、当前消息之前的上下文和已绑定知识�
 纯 FAQ 文字才允许进入 10 分钟内存缓存；动作、任务、预测、处罚、摘要和上下文依赖
 回答不缓存。
 
-### 统一 outbox
+### 统一 outbox 与 Dispatcher
 
-回复、预测、欢迎、撤回、禁言、移出、改名、提醒和通知全部写入 `effect_outbox`，每项
-带稳定 `dedupeKey`。发送后写入 `actions`、脱敏回执和 `audit_events`。固定顺序是：
+回复、预测、欢迎、撤回、禁言、移出、改名、提醒和通知全部写入 `effect_outbox`（schema v14
+新增 `priority / lane / order_key / correlation_id / origin / expires_at`），每项带稳定
+`dedupeKey`。**Dispatcher** worker 每 tick 最多 claim 4 条，通过 **QueueKernel** 中间件链
+后再执行协议调用：
 
 ```text
-权限/群归属 -> capability -> 参数校验 -> 协议调用 -> 回读验证 -> 回执 -> 审计
+claim(4/tick)
+  └─ QueueKernel::run_chain(item, account_id)
+       1. ExpiryGuard       — expires_at 超时 → ChainOutcome::Skip
+       2. OrderKeyLock      — order_key 非空时获取互斥锁，保证同 key 串行
+       3. LaneConcurrencyGate — 同 lane 最多 4 并发，返回 OwnedSemaphorePermit
+       → ChainOutcome::Proceed{order_guard, lane_permit}
+  └─ 协议调用（持有 guard + permit 直到完成）
+  └─ 回执 → actions + audit_events
+  └─ DispatchStats 计数器原子更新
 ```
 
-回读失败或 transport 结果不确定时标记“待人工确认”，不自动补发。账号级外部写队列
+**DispatchStats** 原子计数器（`dispatched / proceeded / skipped / rejected / chain_micros`）
+通过 `RuntimeCoordination.dispatch_stats` 在整个运行时共享，不需要锁；快照由
+`DispatchStatsSnapshot` 序列化后进入诊断包。
+
+`DatabaseExecutor::claim_due_task_reminders` 仅由 `repository.rs` 测试使用，运行时路径
+通过 `finish_task_reminder` / `mark_task_reminder_unknown` 完成提醒生命周期。
+
+固定执行顺序：
+
+```text
+权限/群归属 → capability → 参数校验 → 协议调用 → 回读验证 → 回执 → 审计
+```
+
+回读失败或 transport 结果不确定时标记”待人工确认”，不自动补发。账号级外部写队列
 保持至少 500ms 间隔；这是协议保护，不是规则冷却。
 
 ### 运行任务与并发模型
@@ -181,3 +207,36 @@ pnpm verify:docs
 测试数据库、源码、PDB、Source Map 或开发命令。最终生产 EXE 只能在受控 Windows MSVC
 开发机生成并做真实旺商聊启动、托盘、登录复用、DPI 和退出残留验收。仓库与发行边界见
 [`ISOLATION.md`](ISOLATION.md) 和 [`RELEASE-ARCHITECTURE.md`](RELEASE-ARCHITECTURE.md)。
+
+## 9. 内存边界与本地桥
+
+### 内存边界
+
+所有运行时内存集合都有编译期上限，禁止无限增长：
+
+| 常量 | 值 | 文件 | 作用 |
+|---|---|---|---|
+| `MAX_GATEWAY_BATCH` | 100 | `gateway.rs` | 单次 CDP 轮询最大事件数 |
+| `MAX_MEMBER_CACHE_GROUPS` | 100 | `gateway.rs` | 成员名单 LRU 缓存上限；超出按 `checked_at` 驱逐最旧群 |
+| `MAX_MEMBER_EVENT_CACHE` | 500 | `gateway.rs` | 单次成员事件合并上限 |
+| `MAX_REPORTED_SET` | 500 | `runtime.rs` | 已报告运行项去重集合上限 |
+| `MAX_TRACKED_ITEMS` | 200 | `runtime_work.rs` | `RuntimeWorkTracker` 活跃项上限 |
+| `AI_PROVIDER_TIMEOUT` | 15 s | `ai.rs` | 单 AI 连接生成上限（另有 2s 连接超时、20s 总预算） |
+
+`list_members()` 在写入缓存前检查 `cache.len() >= MAX_MEMBER_CACHE_GROUPS`，驱逐最旧群后再插入，避免因群数量增长导致内存无限累积。诊断包的 `memoryCaps` 字段输出以上常量值供线上核对。
+
+### axum 本地桥
+
+`bridge.rs` 在 `127.0.0.1:51235` 启动轻量 axum 服务（仅限本机回环），让外部工具可以向 outbox 入队副作用或查询诊断状态，而不需要 Tauri IPC：
+
+```rust
+struct BridgeState {
+    gateway:  Arc<dyn RuntimeGateway + Send + Sync>,
+    database: DatabaseExecutor,
+}
+
+POST /enqueue  → database.enqueue_effect(EffectOutboxRequest) → EnqueuedEffect
+GET  /status   → gateway.diagnose() → DiagnosticSnapshot
+```
+
+`BridgeState` 与 `AppState` 共享同一个 `DatabaseExecutor` 和 `RuntimeGateway` 实例，写入的副作用由 Dispatcher 统一消费，不存在第二条写路径。
