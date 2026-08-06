@@ -143,6 +143,12 @@ impl Clock for SystemClock {
     }
 }
 
+impl crate::queue_kernel::ClockSource for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
 pub trait RuntimeEventSink: Send + Sync {
     fn emit(&self, event: &str, payload: Value);
 }
@@ -254,6 +260,7 @@ pub struct BackendRuntime {
     prediction_narration_pending: Arc<tokio::sync::Mutex<HashSet<String>>>,
     ai_rule_gate: Arc<tokio::sync::Semaphore>,
     coordination: RuntimeCoordination,
+    queue_kernel: Arc<crate::queue_kernel::QueueKernel>,
 }
 
 impl BackendRuntime {
@@ -313,6 +320,9 @@ impl BackendRuntime {
             prediction_narration_pending: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             coordination: RuntimeCoordination::default(),
+            queue_kernel: Arc::new(crate::queue_kernel::QueueKernel::new(Arc::new(
+                SystemClock,
+            ))),
         }
     }
 
@@ -361,7 +371,7 @@ impl BackendRuntime {
         let effects = self.clone();
         let effects_app = app.clone();
         workers.push(tauri::async_runtime::spawn(async move {
-            effects.effect_loop(effects_app).await;
+            effects.effect_dispatcher_loop(effects_app).await;
         }));
         let prediction_narration = self.clone();
         workers.push(tauri::async_runtime::spawn(async move {
@@ -556,32 +566,92 @@ impl BackendRuntime {
         Ok(())
     }
 
-    async fn effect_loop(&self, app: AppHandle) {
+    /// Batch dispatcher. Replaces the old single-item effect_loop.
+    ///
+    /// Claims up to 4 items per tick, runs each through QueueKernel
+    /// (expiry guard → order-key lock → lane concurrency gate), then:
+    ///   • Skip   → mark succeeded, no dispatch
+    ///   • Fail   → mark failed-terminal immediately
+    ///   • Retry  → mark failed, let backoff reschedule
+    ///   • Proceed → spawn a task holding the concurrency guards and dispatch
+    async fn effect_dispatcher_loop(&self, app: AppHandle) {
         loop {
-            let mut dispatched = false;
+            let mut dispatched: usize = 0;
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((_, account_id)) = self.gateway.session_identity().await {
-                    if let Ok(Some((permit, item))) =
-                        self.claim_effect_for_dispatch(account_id).await
+                    if let Ok(items) = self
+                        .database
+                        .claim_effect_outbox(Some(account_id.clone()), 4)
+                        .await
                     {
-                        let work_id =
-                            runtime_lane_id(&item.effect_type, &item.account_id, item.group_id);
-                        self.coordination.tracker.start_named(
-                            &work_id,
-                            "write",
-                            effect_label(&item.effect_type),
-                            "群操作",
-                            None,
-                        );
-                        self.dispatch_effect_permitted(Some(&app), item, &permit)
-                            .await;
-                        dispatched = true;
+                        for item in items {
+                            use crate::queue_kernel::ChainOutcome;
+                            let outcome = self
+                                .queue_kernel
+                                .run_chain(item.clone(), account_id.clone())
+                                .await;
+                            match outcome {
+                                ChainOutcome::Skip { reason } => {
+                                    self.skip_effect_item(&item, &reason).await;
+                                    dispatched += 1;
+                                }
+                                ChainOutcome::Fail { error } => {
+                                    self.reject_effect_item(&item, &error, false).await;
+                                    dispatched += 1;
+                                }
+                                ChainOutcome::Retry { error } => {
+                                    self.reject_effect_item(&item, &error, true).await;
+                                    dispatched += 1;
+                                }
+                                ChainOutcome::Proceed {
+                                    order_guard,
+                                    lane_permit,
+                                } => {
+                                    let work_id = runtime_lane_id(
+                                        &item.effect_type,
+                                        &item.account_id,
+                                        item.group_id,
+                                    );
+                                    self.coordination.tracker.start_named(
+                                        &work_id,
+                                        "write",
+                                        effect_label(&item.effect_type),
+                                        "群操作",
+                                        None,
+                                    );
+                                    match self.gateway.automatic_write_permit().await {
+                                        Ok(permit) => {
+                                            let rt = self.clone();
+                                            let app_clone = app.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                rt.dispatch_effect_permitted(
+                                                    Some(&app_clone),
+                                                    item,
+                                                    &permit,
+                                                )
+                                                .await;
+                                                // Release order-key and lane slots
+                                                drop(order_guard);
+                                                drop(lane_permit);
+                                            });
+                                            dispatched += 1;
+                                        }
+                                        Err(error) => {
+                                            // Gateway rejected the permit; put item back for retry
+                                            self.reject_effect_item(&item, &error, true).await;
+                                            drop(order_guard);
+                                            drop(lane_permit);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            if dispatched {
+            if dispatched > 0 {
                 tokio::select! {
-                    _ = sleep(Duration::from_millis(500)) => {},
+                    _ = sleep(Duration::from_millis(200)) => {},
                     _ = self.shutdown.cancelled() => break,
                 }
             } else {
@@ -594,18 +664,26 @@ impl BackendRuntime {
         }
     }
 
-    async fn claim_effect_for_dispatch(
-        &self,
-        account_id: String,
-    ) -> AppResult<Option<(AutomaticWritePermit, EffectOutboxItem)>> {
-        let permit = self.gateway.automatic_write_permit().await?;
-        let item = self
+    /// Mark an effect as succeeded without dispatching to the gateway.
+    async fn skip_effect_item(&self, item: &EffectOutboxItem, reason: &str) {
+        let receipt = serde_json::json!({"skipped": true, "reason": reason}).to_string();
+        let _ = self
             .database
-            .claim_effect_outbox(Some(account_id), 1)
-            .await?
-            .into_iter()
-            .next();
-        Ok(item.map(|item| (permit, item)))
+            .finish_effect_outbox(item.id, true, String::new(), receipt)
+            .await;
+    }
+
+    /// Mark an effect as failed (or retryable) due to a middleware rejection.
+    async fn reject_effect_item(&self, item: &EffectOutboxItem, error: &AppError, retryable: bool) {
+        let msg = if retryable {
+            format!("[middleware-retry] {}", error.message)
+        } else {
+            format!("[middleware-fail] {}", error.message)
+        };
+        let _ = self
+            .database
+            .finish_effect_outbox(item.id, false, msg, String::new())
+            .await;
     }
 
     async fn dispatch_effect_permitted(
@@ -5186,11 +5264,40 @@ impl BackendRuntime {
         let account_id = self.gateway.session_identity().await?.1;
         let mut count = 0;
         while count < 100 {
-            let Some((permit, item)) = self.claim_effect_for_dispatch(account_id.clone()).await?
+            let permit = self.gateway.automatic_write_permit().await?;
+            let Some(item) = self
+                .database
+                .claim_effect_outbox(Some(account_id.clone()), 1)
+                .await?
+                .into_iter()
+                .next()
             else {
                 break;
             };
-            self.dispatch_effect_permitted(None, item, &permit).await;
+            use crate::queue_kernel::ChainOutcome;
+            let outcome = self
+                .queue_kernel
+                .run_chain(item.clone(), account_id.clone())
+                .await;
+            match outcome {
+                ChainOutcome::Skip { reason } => {
+                    self.skip_effect_item(&item, &reason).await;
+                }
+                ChainOutcome::Fail { error } => {
+                    self.reject_effect_item(&item, &error, false).await;
+                }
+                ChainOutcome::Retry { error } => {
+                    self.reject_effect_item(&item, &error, true).await;
+                }
+                ChainOutcome::Proceed {
+                    order_guard,
+                    lane_permit,
+                } => {
+                    self.dispatch_effect_permitted(None, item, &permit).await;
+                    drop(order_guard);
+                    drop(lane_permit);
+                }
+            }
             count += 1;
         }
         Ok(count)
@@ -6268,10 +6375,18 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (permit, first) = runtime
-            .claim_effect_for_dispatch(FIXTURE_ACCOUNT.into())
+        let permit = runtime
+            .gateway
+            .automatic_write_permit()
+            .await
+            .unwrap();
+        let first = runtime
+            .database
+            .claim_effect_outbox(Some(FIXTURE_ACCOUNT.into()), 1)
             .await
             .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
         let starting_gateway = gateway.clone();
         let starting = tokio::spawn(async move {
@@ -6297,7 +6412,8 @@ mod tests {
         assert!(starting.await.unwrap().unwrap().active);
         assert_eq!(
             runtime
-                .claim_effect_for_dispatch(FIXTURE_ACCOUNT.into())
+                .gateway
+                .automatic_write_permit()
                 .await
                 .unwrap_err()
                 .code,
