@@ -477,6 +477,7 @@ fn enforce_bound(state: &mut WorkState) {
     if state.items.len() <= MAX_TRACKED_ITEMS {
         return;
     }
+    // Pass 1: remove terminal items oldest-first (existing behaviour)
     let mut removable = state
         .items
         .values()
@@ -489,6 +490,24 @@ fn enforce_bound(state: &mut WorkState) {
             break;
         }
         state.items.remove(&id);
+    }
+    // Pass 2: still over cap — drop oldest non-terminal entries so the tracker
+    // never blocks forever.  The in-flight work itself is unaffected; only the
+    // UI tracking entry is removed.
+    if state.items.len() > MAX_TRACKED_ITEMS {
+        let mut non_terminal: Vec<(u64, String)> = state
+            .items
+            .values()
+            .filter(|item| !item.terminal())
+            .map(|item| (item.sequence, item.id.clone()))
+            .collect();
+        non_terminal.sort_by_key(|(seq, _)| *seq);
+        for (_, id) in non_terminal {
+            if state.items.len() <= MAX_TRACKED_ITEMS {
+                break;
+            }
+            state.items.remove(&id);
+        }
     }
 }
 

@@ -33,6 +33,11 @@ use crate::secrets::SecretStore;
 use crate::shutdown::ShutdownSignal;
 use crate::{knowledge, moderation, prediction, scheduler};
 
+/// Hard cap for the per-connection member-event cache inside `connection_loop`.
+const MAX_MEMBER_EVENT_CACHE: usize = 500;
+/// Hard cap for the dedup warning sets (`reported_*`) inside `connection_loop`.
+const MAX_REPORTED_SET: usize = 500;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeProgress {
@@ -3030,6 +3035,17 @@ impl BackendRuntime {
                         match events {
                             Ok(events) if events.len() == expected_member_events => {
                                 if let Some(key) = &member_cache_key {
+                                    // Evict one arbitrary entry when the cache is full so it
+                                    // cannot grow without bound across a long-lived connection.
+                                    if member_event_cache.len() >= MAX_MEMBER_EVENT_CACHE
+                                        && !member_event_cache.contains_key(key.as_str())
+                                    {
+                                        if let Some(oldest) =
+                                            member_event_cache.keys().next().cloned()
+                                        {
+                                            member_event_cache.remove(&oldest);
+                                        }
+                                    }
                                     member_event_cache.insert(key.clone(), events.clone());
                                 }
                                 for (event_index, event) in events.into_iter().enumerate() {
@@ -3097,7 +3113,8 @@ impl BackendRuntime {
                                 let mismatch_key = member_cache_key
                                     .clone()
                                     .unwrap_or_else(|| member_event_ids.join("|"));
-                                if reported_member_event_mismatches.insert(mismatch_key) {
+                                if reported_member_event_mismatches.len() < MAX_REPORTED_SET
+                                    && reported_member_event_mismatches.insert(mismatch_key) {
                                     self.logger.write(
                                         "WARN",
                                         &format!(
@@ -3154,7 +3171,9 @@ impl BackendRuntime {
                     }
                 }
                 for (event_id, sequence, source, reason) in ignored {
-                    if !reported_ignored_events.insert(event_id) {
+                    if reported_ignored_events.len() >= MAX_REPORTED_SET
+                        || !reported_ignored_events.insert(event_id)
+                    {
                         continue;
                     }
                     let mapping_pending = reason == "解码失败且群身份未映射";

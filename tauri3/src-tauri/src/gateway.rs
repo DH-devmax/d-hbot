@@ -44,6 +44,10 @@ const GROUP_NOTICE_ADD_ROUTE: &str = "/v1/group/add-notice";
 const GROUP_NOTICE_UPDATE_ROUTE: &str = "/v1/group/notice-opt";
 const GROUP_NOTICE_DELETE_ROUTE: &str = "/v1/group/notice-del";
 const MAX_GATEWAY_BATCH: usize = 100;
+/// Hard cap on the number of groups held in the member-roster cache.
+/// Groups beyond this limit are evicted (oldest-checked-at first) on the next
+/// insert so the cache cannot grow without bound on long-running connections.
+const MAX_MEMBER_CACHE_GROUPS: usize = 100;
 
 /// Built-in protocol evidence recovered from the ZCG group-management path.
 /// It contains route names only; DH BOT still executes through WangShangLiao CDP/Electron/NIM.
@@ -1044,7 +1048,6 @@ pub struct CdpGateway {
     sender_id: Arc<RwLock<i64>>,
     listener_session: Arc<RwLock<String>>,
     session_epoch: Arc<AtomicU64>,
-    delivered_event_sequences: Arc<RwLock<BTreeMap<String, u64>>>,
     capabilities: Arc<SyncRwLock<GatewayCapabilities>>,
     protocol_probe_gate: Arc<tokio::sync::Mutex<()>>,
     member_requests: Arc<RwLock<BTreeMap<i64, Arc<MemberRequest>>>>,
@@ -1086,7 +1089,6 @@ impl CdpGateway {
             sender_id: Arc::new(RwLock::new(0)),
             listener_session: Arc::new(RwLock::new(String::new())),
             session_epoch: Arc::new(AtomicU64::new(0)),
-            delivered_event_sequences: Arc::new(RwLock::new(BTreeMap::new())),
             capabilities: Arc::new(SyncRwLock::new(unverified_production_capabilities())),
             protocol_probe_gate: Arc::new(tokio::sync::Mutex::new(())),
             member_requests: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1147,7 +1149,6 @@ impl CdpGateway {
         self.group_cache.write().await.take();
         self.member_cache.write().await.clear();
         self.member_requests.write().await.clear();
-        self.delivered_event_sequences.write().await.clear();
         if let Ok(mut throttle) = self.member_throttle.lock() {
             *throttle = MemberThrottle::default();
         }
@@ -1660,7 +1661,6 @@ impl CdpGateway {
             *self.group_cache.write().await = None;
             self.member_requests.write().await.clear();
             self.member_cache.write().await.clear();
-            self.delivered_event_sequences.write().await.clear();
             self.session_epoch.fetch_add(1, Ordering::AcqRel);
             if let Ok(mut checked) = self.identity_checked_at.lock() {
                 *checked = None;
@@ -1964,7 +1964,6 @@ impl CdpGateway {
                 self.group_cache.write().await.take();
                 self.member_cache.write().await.clear();
                 self.member_requests.write().await.clear();
-                self.delivered_event_sequences.write().await.clear();
                 self.session_epoch.fetch_add(1, Ordering::AcqRel);
             }
         }
@@ -2619,10 +2618,18 @@ impl CdpGateway {
         let result = self.list_members_with_backoff(group_id).await;
         if request_epoch == self.session_epoch.load(Ordering::Acquire) {
             if let Ok(roster) = &result {
-                self.member_cache
-                    .write()
-                    .await
-                    .insert(group_id, (Instant::now(), roster.clone()));
+                let mut cache = self.member_cache.write().await;
+                if cache.len() >= MAX_MEMBER_CACHE_GROUPS && !cache.contains_key(&group_id) {
+                    // Evict the entry whose roster was checked least recently.
+                    let oldest = cache
+                        .iter()
+                        .min_by_key(|(_, (checked_at, _))| *checked_at)
+                        .map(|(id, _)| *id);
+                    if let Some(id) = oldest {
+                        cache.remove(&id);
+                    }
+                }
+                cache.insert(group_id, (Instant::now(), roster.clone()));
             }
         }
         let _ = request.0.result.set(result.clone());
