@@ -581,6 +581,23 @@ CREATE TABLE IF NOT EXISTS gateway_capability_verifications (
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QueueDepthRow {
+    pub state: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionPolicyRow {
+    pub table_name: String,
+    pub max_days: i64,
+    pub max_rows: i64,
+    pub batch_size: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseStatus {
     pub path: String,
     pub schema_version: i64,
@@ -588,6 +605,12 @@ pub struct DatabaseStatus {
     pub accounts: i64,
     pub groups: i64,
     pub messages: i64,
+    /// Per-state row counts for `effect_outbox` (queued/retry/processing/failed/succeeded/unknown).
+    pub queue_depth: Vec<QueueDepthRow>,
+    /// Current rows from the `retention_policies` housekeeping table.
+    pub retention_policies: Vec<RetentionPolicyRow>,
+    /// Result of `PRAGMA integrity_check(16)` — "ok" when the database is healthy.
+    pub index_integrity: String,
 }
 
 pub struct Database {
@@ -2204,6 +2227,46 @@ impl Database {
                     connection.query_row("SELECT COUNT(*) FROM groups", [], |row| row.get(0))?;
                 let messages: i64 =
                     connection.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+
+                // Queue depth per state
+                let mut stmt = connection.prepare(
+                    "SELECT state, COUNT(*) FROM effect_outbox GROUP BY state ORDER BY state",
+                )?;
+                let queue_depth: Vec<QueueDepthRow> = stmt
+                    .query_map([], |row| {
+                        Ok(QueueDepthRow { state: row.get(0)?, count: row.get(1)? })
+                    })?
+                    .filter_map(Result::ok)
+                    .collect();
+
+                // Retention policy rows (may not exist in pre-v14 schemas)
+                let retention_policies: Vec<RetentionPolicyRow> = connection
+                    .prepare(
+                        "SELECT table_name,max_days,max_rows,batch_size,enabled FROM retention_policies ORDER BY table_name",
+                    )
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map([], |row| {
+                                let enabled: i64 = row.get(4)?;
+                                Ok(RetentionPolicyRow {
+                                    table_name: row.get(0)?,
+                                    max_days: row.get(1)?,
+                                    max_rows: row.get(2)?,
+                                    batch_size: row.get(3)?,
+                                    enabled: enabled != 0,
+                                })
+                            })?
+                            .filter_map(Result::ok)
+                            .collect();
+                        Ok(rows)
+                    })
+                    .unwrap_or_default();
+
+                // Integrity check capped at 16 errors so the report stays compact
+                let index_integrity: String = connection
+                    .query_row("PRAGMA integrity_check(16)", [], |row| row.get(0))
+                    .unwrap_or_else(|_| "error".into());
+
                 Ok(DatabaseStatus {
                     path: self.path.display().to_string(),
                     schema_version: version,
@@ -2211,6 +2274,9 @@ impl Database {
                     accounts,
                     groups,
                     messages,
+                    queue_depth,
+                    retention_policies,
+                    index_integrity,
                 })
             })
             .map_err(InternalError::from)?;

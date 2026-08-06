@@ -1459,6 +1459,7 @@ impl RuntimeGateway for FixtureGateway {
                 page_url: metadata.page_url.clone(),
                 nim_account: String::new(),
                 detail: "Fixture DevTools 已断开".into(),
+                rate_limit_hits: 0,
             };
         }
         DiagnosticSnapshot {
@@ -1480,6 +1481,7 @@ impl RuntimeGateway for FixtureGateway {
             } else {
                 "Fixture NIM 尚未初始化".into()
             },
+            rate_limit_hits: 0,
         }
     }
 

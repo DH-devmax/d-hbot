@@ -591,20 +591,27 @@ impl BackendRuntime {
                     {
                         for item in items {
                             use crate::queue_kernel::ChainOutcome;
+                            let chain_start = Instant::now();
                             let outcome = self
                                 .queue_kernel
                                 .run_chain(item.clone(), account_id.clone())
                                 .await;
+                            let chain_micros = chain_start.elapsed().as_micros() as u64;
+                            self.coordination.dispatch_stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.coordination.dispatch_stats.chain_micros.fetch_add(chain_micros, std::sync::atomic::Ordering::Relaxed);
                             match outcome {
                                 ChainOutcome::Skip { reason } => {
+                                    self.coordination.dispatch_stats.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.skip_effect_item(&item, &reason).await;
                                     dispatched += 1;
                                 }
                                 ChainOutcome::Fail { error } => {
+                                    self.coordination.dispatch_stats.rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.reject_effect_item(&item, &error, false).await;
                                     dispatched += 1;
                                 }
                                 ChainOutcome::Retry { error } => {
+                                    self.coordination.dispatch_stats.rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.reject_effect_item(&item, &error, true).await;
                                     dispatched += 1;
                                 }
@@ -612,6 +619,7 @@ impl BackendRuntime {
                                     order_guard,
                                     lane_permit,
                                 } => {
+                                    self.coordination.dispatch_stats.proceeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     let work_id = runtime_lane_id(
                                         &item.effect_type,
                                         &item.account_id,

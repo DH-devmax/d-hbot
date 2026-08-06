@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -408,10 +408,56 @@ impl RuntimeWorkTracker {
     }
 }
 
+/// Lightweight counters incremented by the effect dispatcher loop.
+/// All fields are `Arc<AtomicU64>` so they can be read from any thread
+/// without locking; `Default` initialises all counters to zero.
+#[derive(Debug, Default, Clone)]
+pub struct DispatchStats {
+    /// Total items that entered the kernel chain (Skip + Fail + Retry + Proceed).
+    pub dispatched: Arc<AtomicU64>,
+    /// Items that resulted in `ChainOutcome::Proceed` (sent to the gateway).
+    pub proceeded: Arc<AtomicU64>,
+    /// Items that were skipped (expired or blocked) without a gateway call.
+    pub skipped: Arc<AtomicU64>,
+    /// Items that failed or were retried (terminal or transient errors).
+    pub rejected: Arc<AtomicU64>,
+    /// Cumulative microseconds spent inside `QueueKernel::run_chain`.
+    pub chain_micros: Arc<AtomicU64>,
+}
+
+impl DispatchStats {
+    /// Returns a plain-value snapshot suitable for serialisation.
+    pub fn snapshot(&self) -> DispatchStatsSnapshot {
+        DispatchStatsSnapshot {
+            dispatched: self.dispatched.load(Ordering::Relaxed),
+            proceeded: self.proceeded.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            chain_micros: self.chain_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serialisable snapshot of [`DispatchStats`] for diagnostic bundles.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchStatsSnapshot {
+    pub dispatched: u64,
+    pub proceeded: u64,
+    pub skipped: u64,
+    pub rejected: u64,
+    pub chain_micros: u64,
+}
+
+/// Dispatch counters and work tracker shared between the runtime loop and
+/// `AppState` so that diagnostic bundles can read live values without locks.
 #[derive(Clone, Default)]
 pub struct RuntimeCoordination {
     pub tracker: RuntimeWorkTracker,
     pub wake: Arc<Notify>,
+    /// Effect-dispatch counters; shared with the runtime loop and readable
+    /// from `AppState` for diagnostic bundles without acquiring any lock.
+    pub dispatch_stats: DispatchStats,
 }
 
 impl RuntimeCoordination {

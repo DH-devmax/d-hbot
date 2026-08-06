@@ -91,6 +91,10 @@ pub struct DiagnosticSnapshot {
     pub page_url: String,
     pub nim_account: String,
     pub detail: String,
+    /// Cumulative count of member-roster rate-limit hits since the gateway
+    /// was last constructed (reset on reconnect). Exposed in diagnostic
+    /// bundles to help identify overly-aggressive sync schedules.
+    pub rate_limit_hits: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -501,6 +505,7 @@ impl CdpClient {
             page_url: String::new(),
             nim_account: String::new(),
             detail: String::new(),
+            rate_limit_hits: 0,
         };
         let page = match self.page().await {
             Ok(page) => page,
@@ -2046,7 +2051,13 @@ impl CdpGateway {
 #[async_trait]
 impl RuntimeGateway for CdpGateway {
     async fn diagnose(&self) -> DiagnosticSnapshot {
-        let snapshot = self.cdp.diagnose().await;
+        let mut snapshot = self.cdp.diagnose().await;
+        // Overlay the rate-limit counter, which lives on CdpGateway not CdpClient.
+        snapshot.rate_limit_hits = self
+            .member_throttle
+            .lock()
+            .map(|t| t.consecutive_rate_limits)
+            .unwrap_or(0);
         if snapshot.status != ConnectionStatus::Ready {
             self.reset_session_state().await;
         }
