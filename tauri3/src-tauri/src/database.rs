@@ -1449,14 +1449,6 @@ impl DatabaseExecutor {
             .await
     }
 
-    pub async fn claim_due_task_reminders(
-        &self,
-        now: DateTime<Utc>,
-        limit: usize,
-    ) -> AppResult<Vec<TaskItem>> {
-        self.execute(move |database| database.claim_due_task_reminders(now, limit))
-            .await
-    }
 
     pub async fn finish_task_reminder(
         &self,
