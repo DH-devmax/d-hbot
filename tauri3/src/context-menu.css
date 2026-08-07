@@ -1,0 +1,93 @@
+/* 右键菜单浮层。视觉沿用 .select-field__menu（同为"菜单"语义），层级高于既有 1200。 */
+.dh-context-menu {
+  position: fixed;
+  z-index: 1300;
+  display: grid;
+  min-width: 176px;
+  max-width: min(300px, calc(100vw - 16px));
+  padding: 4px;
+  border: 1px solid #d9d9d9;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 14px 34px rgb(0 0 0 / 14%);
+  color: #555;
+  font-size: 12px;
+  animation: dh-context-menu-in 110ms ease-out;
+}
+
+.dh-context-menu__item {
+  display: grid;
+  gap: 2px;
+  min-height: 34px;
+  padding: 7px 9px;
+  border-radius: 5px;
+  color: #555;
+  cursor: default;
+  align-content: center;
+}
+
+.dh-context-menu__item:hover,
+.dh-context-menu__item.active {
+  background: #f1f1f1;
+  color: #111;
+}
+
+.dh-context-menu__item:focus-visible {
+  outline: 2px solid #b8b8b8;
+  outline-offset: -2px;
+}
+
+.dh-context-menu__item > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dh-context-menu__item > small {
+  color: #999;
+  font-size: 11px;
+}
+
+.dh-context-menu__item.danger {
+  color: #a23a35;
+}
+
+.dh-context-menu__item.danger:hover,
+.dh-context-menu__item.danger.active {
+  background: #fdf1f0;
+  color: #8f2f2a;
+}
+
+.dh-context-menu__item[aria-disabled='true'] {
+  color: #b5b5b5;
+  cursor: not-allowed;
+}
+
+.dh-context-menu__item[aria-disabled='true']:hover {
+  background: transparent;
+  color: #b5b5b5;
+}
+
+.dh-context-menu__separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: #ececec;
+}
+
+.dh-context-menu__feedback {
+  margin: 2px 0 0;
+  padding: 6px 9px;
+  border-top: 1px solid #ececec;
+  color: #a23a35;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@keyframes dh-context-menu-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dh-context-menu { animation: none; }
+}

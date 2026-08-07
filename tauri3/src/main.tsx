@@ -11,6 +11,7 @@ import './runtime.css'
 import './pages.css'
 import './close-dialog.css'
 import './button-help.css'
+import './context-menu.css'
 import './select-field.css'
 import './premium.css'
 import './about.css'
@@ -25,6 +26,7 @@ import SettingsPage from './pages/SettingsPage'
 import DebugPage from './pages/DebugPage'
 import CloseDialog from './components/CloseDialog'
 import ButtonHelp from './components/ButtonHelp'
+import ContextMenu from './components/ContextMenu'
 import AboutDialog from './components/AboutDialog'
 import WindowTitlebar from './components/WindowTitlebar'
 import RuntimeWorkIndicator from './components/RuntimeWorkIndicator'
@@ -350,7 +352,7 @@ function App() {
       {page === '设置' && <SettingsPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
       {page === '调试' && <DebugPage diagnostic={diagnostic} database={database} refresh={refresh} onError={setError} />}
     </section>
-  </main><ButtonHelp />{showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={cancelClose} onResolve={action => void resolveClose(action)} />}</div>
+  </main><ButtonHelp /><ContextMenu />{showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}{closePrompt && <CloseDialog remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onCancel={cancelClose} onResolve={action => void resolveClose(action)} />}</div>
 }
 
 async function bootstrap() {

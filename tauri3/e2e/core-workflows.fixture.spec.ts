@@ -214,3 +214,89 @@ test('captures current Tauri pages for the manual', async ({ page }) => {
   await page.screenshot({ path: path.join(directory, 'ai-test.png'), fullPage: false })
   await capture('调试', 'debug.png')
 })
+
+/**
+ * 右键菜单的这三条只能在真实浏览器里验：
+ * jsdom 下 getBoundingClientRect 恒为 0（验不到贴边翻转和层级），
+ * navigator.clipboard 是本地 mock（验不到真的写进系统剪贴板）。
+ */
+test('右键菜单替换 WebView 默认菜单，复制进真实剪贴板，镜像项触达真实 handler', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.getByRole('button', { name: '消息台' }).click()
+  const row = page.locator('.message-row').filter({ hasText: '@DH 请查看群规' })
+  await expect(row).toBeVisible()
+
+  // 组件的监听在 capture 阶段，这里在冒泡阶段读 defaultPrevented，能确认默认菜单真被吞掉。
+  await page.evaluate(() => {
+    ;(window as unknown as Record<string, unknown>).__DH_MENU_PREVENTED__ = null
+    document.addEventListener('contextmenu', event => {
+      ;(window as unknown as Record<string, unknown>).__DH_MENU_PREVENTED__ = event.defaultPrevented
+    })
+  })
+
+  await row.getByText('@DH 请查看群规').click({ button: 'right' })
+  const menu = page.getByRole('menu', { name: '右键菜单' })
+  await expect(menu).toBeVisible()
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__DH_MENU_PREVENTED__)).toBe(true)
+
+  const box = (await menu.boundingBox())!
+  expect(box.width).toBeGreaterThan(80)
+  expect(box.height).toBeGreaterThan(40)
+  expect(await menu.evaluate(node => getComputedStyle(node).zIndex)).toBe('1300')
+
+  await menu.getByRole('menuitem', { name: '复制整行' }).click()
+  await expect(menu).toBeHidden()
+  const clipboard = await page.evaluate(() => navigator.clipboard.readText())
+  expect(clipboard).toContain('@DH 请查看群规')
+  expect(clipboard).toContain('\t')
+
+  // 镜像项必须打开消息台自己的二次确认，而不是菜单另写一套撤回逻辑。
+  await row.getByText('@DH 请查看群规').click({ button: 'right' })
+  await menu.getByRole('menuitem', { name: '撤回消息' }).click()
+  await expect(page.getByText(/撤回这条消息/)).toBeVisible()
+  await expect(page.locator('.message-recall-preview')).toHaveText('@DH 请查看群规')
+})
+
+test('右键菜单贴近视口右缘时翻转，不被裁掉', async ({ page }) => {
+  await page.getByRole('button', { name: '消息台' }).click()
+  const row = page.locator('.message-row').filter({ hasText: '@DH 请查看群规' })
+  await expect(row).toBeVisible()
+  // page.mouse.click 不会自动滚动，行若在折叠线以下，落点会掉到视口外命中 <html>。
+  // 先滚进来并等滚动稳定，再量坐标。
+  await row.scrollIntoViewIfNeeded()
+  await page.waitForTimeout(150)
+  const rowBox = (await row.boundingBox())!
+  const viewport = page.viewportSize()!
+  expect(rowBox.y).toBeGreaterThanOrEqual(0)
+  expect(rowBox.y + rowBox.height).toBeLessThanOrEqual(viewport.height)
+
+  const clickX = Math.round(rowBox.x + rowBox.width - 4)
+  const clickY = Math.round(rowBox.y + rowBox.height / 2)
+  await page.mouse.click(clickX, clickY, { button: 'right' })
+
+  const menu = page.getByRole('menu', { name: '右键菜单' })
+  await expect(menu).toBeVisible()
+  const box = (await menu.boundingBox())!
+
+  // 前提：落点右侧确实放不下整个菜单。前提不成立就该报错，而不是让翻转断言变成空转。
+  expect(viewport.width - clickX).toBeLessThan(box.width)
+  expect(box.x).toBeLessThan(clickX)
+  expect(box.x).toBeGreaterThanOrEqual(0)
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width)
+  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height)
+})
+
+test('密码框右键不提供复制和剪切', async ({ page }) => {
+  await page.getByRole('button', { name: '知识与 AI' }).click()
+  await page.getByRole('button', { name: /AI 助手/ }).click()
+  const apiKey = page.getByLabel('API Key')
+  await expect(apiKey).toBeVisible()
+  await apiKey.fill('占位密钥仅用于测试')
+
+  await apiKey.click({ button: 'right' })
+  const menu = page.getByRole('menu', { name: '右键菜单' })
+  await expect(menu).toBeVisible()
+  await expect(menu.getByRole('menuitem', { name: '复制', exact: true })).toHaveCount(0)
+  await expect(menu.getByRole('menuitem', { name: '剪切', exact: true })).toHaveCount(0)
+  await expect(menu.getByRole('menuitem', { name: '全选', exact: true })).toBeVisible()
+})
