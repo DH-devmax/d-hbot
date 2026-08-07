@@ -1,5 +1,15 @@
 # DH BOT Windows 本地发行步骤
 
+DH BOT 不使用 GitHub Actions 构建程序：
+
+| 仓库 | 用途 | Actions |
+|---|---|---|
+| `DH-devmax/d-hbot` | 私有 Rust/Tauri 源码、Fixture、脱敏契约和本地工具 | 停用 |
+| `DH-devmax/d-hbot-releases` | 可选下载说明与历史发行索引 | 停用 |
+| `sh492773746/*` | 旧账号归档 | 不参与当前线路 |
+
+测试、Windows MSVC 构建、NSIS/portable 打包、生产隔离扫描和真实桌面验收都在开发机本地完成。GitHub 不保存签名证书、源码读取 Token 或构建产物。
+
 ## 1. 固定源码
 
 在源码仓库确认工作树、远端、账号和作者：
@@ -17,20 +27,7 @@ git config user.email
 
 ## 2. 完成本地门禁
 
-进入 `tauri3` 后执行：
-
-```text
-pnpm install --frozen-lockfile
-pnpm test:contract-sanitizer
-pnpm test:production-isolation
-pnpm test:production
-pnpm test:fixture
-pnpm test:ui
-pnpm test:e2e:fixture
-cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
-cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
-python3 ../tools/verify_repository_redaction.py
-```
+门禁清单见 [ENGINEERING-STANDARDS.md](ENGINEERING-STANDARDS.md) 的“测试门禁”一节，那里是唯一权威来源。全部通过后再进入下一步。
 
 Fixture 只用于开发测试，不进入下一步生产构建。
 
@@ -79,3 +76,18 @@ tauri3\dist\DH-BOT-VERSION-windows-x64-portable.zip
 上传后重新下载一次，用 `Get-FileHash -Algorithm SHA256` 比对云盘文件。分享说明应写明版本、SHA-256、Windows 首次启动可能出现的未知发布者提示，以及下载链接的更新日期。
 
 自签名根证书、PFX 和密码不随包发布，也不要求用户安装根证书。
+
+## 6. 远端 Actions 只读核对
+
+以下命令用于确认远端没有活动 workflow：
+
+```text
+gh workflow list --repo DH-devmax/d-hbot
+gh workflow list --repo DH-devmax/d-hbot-releases
+gh api repos/DH-devmax/d-hbot/actions/permissions
+gh api repos/DH-devmax/d-hbot-releases/actions/permissions
+```
+
+两个权限接口都应返回 `enabled: false`，workflow 列表应为空。后续若采用公共信任代码签名或恢复 GitHub Release，需要先更新本规范和长期记忆，再建立新的独立发布方案。
+
+最近只读核对：2026-08-01，两个权限接口均返回 `enabled: false`，两个 workflow 列表均为空。

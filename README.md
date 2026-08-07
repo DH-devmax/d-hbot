@@ -58,7 +58,7 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 - `docs/DATABASE-SCHEMA.md`：schema v14 表、身份约束、状态恢复和备份边界。
 - `docs/PROTOCOL-CONTRACT.md`：ZCG 基线、旺商聊专有协议、能力探测和回执错误分类。
 - `docs/FEATURE-CATALOG.md`：功能入口、命令、默认开关、权限和能力状态。
-- `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互和测试规范。
+- `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互规范，协作范围与仓库权限，以及门禁命令清单的唯一权威。
 - `docs/ISOLATION.md`：生产/开发、端口、数据、凭据和发布仓库隔离。
 - `docs/WINDOWS-ACCEPTANCE.md`：Windows 实机验收总纲；快照事实、门禁基线、右键菜单/memoryCaps/限长读取验收和结果回填格式。
 - `docs/WINDOWS-REAL-MACHINE-TEST.md`：Windows 桌面层与进程层的分层步骤、自动探针用法和通过标准。
@@ -68,10 +68,8 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 - `tools/verify_repository_redaction.py`：扫描 Git 跟踪内容和归档 ZIP 的凭据与真实身份残留。
 - `archive/go-2.7-final/`：旧 Go 2.7 只读源码 ZIP、说明和 SHA-256；当前工作树不保留 Go 源码。
 
-### 协作与历史记录
+### 历史记录
 
-- `docs/COLLABORATION-REQUIREMENTS.md`：协作范围、仓库权限、提交前门禁和功能边界要求。
-- `docs/GITHUB-ACTIONS.md`：为什么不用 Actions 构建，以及两个仓库各自的 Actions 状态。
 - `docs/OPTIMIZATION-REVIEW.md`：2026-08-06 的代码与实机问题审查记录（对照基线 `d739a70`）。
 - `docs/ZCG参考材料.md`：历史 ZCG 材料的用途与边界；只作协议对照，不打包、不执行。
 

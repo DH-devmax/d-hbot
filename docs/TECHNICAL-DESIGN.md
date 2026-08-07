@@ -196,19 +196,7 @@ SHA 仅用于诊断指纹；路由、IPC、NIM 方法和双层响应结构才决
 
 ## 8. 测试和发布门禁
 
-```sh
-cd tauri3
-pnpm install --frozen-lockfile
-pnpm test:contract-sanitizer
-pnpm test:production-isolation
-pnpm test:production
-pnpm test:fixture
-pnpm test:ui
-pnpm test:e2e:fixture
-cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
-cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
-pnpm verify:docs
-```
+完整门禁命令清单以 [`ENGINEERING-STANDARDS.md`](ENGINEERING-STANDARDS.md) 的“测试门禁”一节为唯一权威，本文不再抄写一份。
 
 生产构建必须使用 `--no-default-features`，扫描中不能出现 Fixture、`9233/51300`、
 测试数据库、源码、PDB、Source Map 或开发命令。最终生产 EXE 只能在受控 Windows MSVC

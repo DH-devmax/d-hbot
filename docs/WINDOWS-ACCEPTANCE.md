@@ -1,6 +1,6 @@
 # DH BOT Windows 验收总纲
 
-本文是 Windows 实机验收的唯一入口，自包含：新克隆仓库只读这一份就能跑完全流程。桌面层与进程层的细节步骤见 [`WINDOWS-REAL-MACHINE-TEST.md`](WINDOWS-REAL-MACHINE-TEST.md)，本文不重复抄写。
+本文是 Windows 实机验收的唯一入口，自包含：新克隆仓库只读这一份就能跑完全流程。桌面层与进程层的细节步骤见 [`WINDOWS-REAL-MACHINE-TEST.md`](WINDOWS-REAL-MACHINE-TEST.md)，本文只在必须离线逐条执行的地方（PowerShell 取证块、进程快照命令）保留少量逐字重复，这是为“新克隆只读这一份”有意保留的冗余，不是待清理的重复。
 
 ## 0. 开跑前的版本确认
 
@@ -73,7 +73,7 @@ Windows 独占的责任是 macOS 覆盖不到的部分：任务栏、托盘、�
 
 ## 4. 本地构建门禁
 
-用 `tauri3/package.json` 里的真实脚本名，不手抄命令：
+用 `tauri3/package.json` 里的真实脚本名，不手抄命令。下列命令按 Windows 验收顺序内联保留，便于离线逐条执行；命令清单本身的唯一权威是 [`ENGINEERING-STANDARDS.md`](ENGINEERING-STANDARDS.md) 的“测试门禁”一节，两处不一致时以该节为准：
 
 ```powershell
 cd tauri3
