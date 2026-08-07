@@ -155,7 +155,9 @@ impl RuntimeDependencies {
             events: Arc::new(NoopEventSink),
             ai_factory: Arc::new(ConfiguredAiProviderFactory::default()),
             semantic_classifier: Arc::new(moderation::DeterministicSemanticClassifier::default()),
-            prediction_source: Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?),
+            prediction_source: Arc::new(prediction::PublicLotterySource::new(
+                Duration::from_secs(8),
+            )?),
         })
     }
 }

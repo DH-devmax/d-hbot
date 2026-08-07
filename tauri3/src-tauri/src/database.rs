@@ -1952,7 +1952,7 @@ impl Database {
             let transaction = connection.transaction()?;
             let now = Utc::now().to_rfc3339();
             transaction.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, now],
             )?;
             if transaction
@@ -2052,7 +2052,7 @@ impl Database {
     pub fn ensure_business_apps(&self, account_id: &str) -> AppResult<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取已校准结果并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
+                "INSERT OR IGNORE INTO business_apps(account_id,app_id,name,description,version,enabled,status,status_detail,last_checked_at,updated_at) VALUES(?,'prediction','预测','读取公开或官方开奖并生成统计参考','1.0.0',0,'unchecked','尚未检查数据源',NULL,?)",
                 params![account_id, Utc::now().to_rfc3339()],
             )?;
             Ok(())

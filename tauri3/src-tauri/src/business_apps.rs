@@ -115,18 +115,7 @@ impl PredictionApp {
             app_id: PREDICTION_APP_ID.into(),
             status: "stale".into(),
             freshness: "stale".into(),
-            fallback_reply: format!(
-                "{} 第{}期\n最新结果：{}\n更新时间：{}\n数据状态：数据已过期，当前仅展示最后一次已核验结果。",
-                snapshot.game,
-                snapshot.period,
-                snapshot
-                    .result
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" + "),
-                snapshot.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
-            ),
+            fallback_reply: prediction::format_stale_reply(snapshot),
             narration: None,
         }
     }
@@ -159,7 +148,7 @@ impl BusinessApp for PredictionApp {
         BusinessAppManifest {
             id: PREDICTION_APP_ID,
             name: "预测",
-            description: "读取已校准结果并生成统计参考",
+            description: "读取公开或官方开奖并生成统计参考",
             version: PREDICTION_APP_VERSION,
             trigger_hint: "@DH 预测 彩种名称",
             scope: "所有已启用管理且开启 AI 回复的群",
@@ -185,7 +174,7 @@ impl BusinessApp for PredictionApp {
                         id: game.id.into(),
                         name: game.name.into(),
                         status: "ready".into(),
-                        detail: "结果与历史数据可用".into(),
+                        detail: prediction::public_source_label(game.id).into(),
                     },
                     PredictionFreshness::Stale => BusinessAppGameHealth {
                         id: game.id.into(),
@@ -205,10 +194,22 @@ impl BusinessApp for PredictionApp {
                     name: game.name.into(),
                     status: "unavailable".into(),
                     detail: match error.code.as_str() {
-                        "prediction_not_configured" => "数据源凭据尚未配置".into(),
+                        "prediction_not_configured" => {
+                            "公开源不可用，兼容数据源未配置独立凭据".into()
+                        }
                         "prediction_auth" => "数据源凭据无效或已过期".into(),
                         "prediction_contract" => "数据结构变化，等待适配".into(),
                         "prediction_http" => "数据源返回异常，请稍后重试".into(),
+                        "prediction_algorithm_unverified" => {
+                            "公开原始数据可用，但28派生算法尚未核验".into()
+                        }
+                        "prediction_no_official_source" => "未发现可核验的官方公开数据源".into(),
+                        "prediction_public_contract" => "官方公开数据格式变化，等待适配".into(),
+                        "prediction_public_http"
+                        | "prediction_public_request"
+                        | "prediction_public_response" => {
+                            "官方公开数据暂时不可用，请稍后重试".into()
+                        }
                         _ => "数据源连接失败，请稍后重试".into(),
                     },
                 },

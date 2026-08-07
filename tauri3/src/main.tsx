@@ -117,6 +117,7 @@ function App() {
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [wangStartupError, setWangStartupError] = useState('')
   const [automationPaused, setAutomationPaused] = useState(false)
   const [pageEpoch, setPageEpoch] = useState(0)
   const [closePrompt, setClosePrompt] = useState(false)
@@ -197,13 +198,13 @@ function App() {
           devtoolsUrl: 'http://127.0.0.1:9222',
           confirmRestart: false,
         })
-        if (result.status && !wangInformationalStatuses.has(result.status) && !result.needsConfirmation && result.detail) setError(result.detail)
+        if (result.status && !wangInformationalStatuses.has(result.status) && !result.needsConfirmation && result.detail) setWangStartupError(result.detail)
         diagnosticResult = await Promise.resolve(invoke<Diagnostic>('diagnose')).then(
           value => ({ status: 'fulfilled', value } as PromiseFulfilledResult<Diagnostic>),
           reason => ({ status: 'rejected', reason } as PromiseRejectedResult),
         )
       } catch (reason) {
-        setError(readableError(reason))
+        setWangStartupError(readableError(reason))
       }
     }
     if (refreshSequence !== refreshSequenceRef.current) return
@@ -236,6 +237,7 @@ function App() {
       if (payload.eventId) handledWangStartupRef.current.add(payload.eventId)
       setWangStartup(payload)
       if (payload.status === 'nim-not-ready' || payload.status === 'devtools-ready') requestWangLoginFocus()
+      if (wangInformationalStatuses.has(payload.status)) setWangStartupError('')
       if (wangTransientStatuses.has(payload.status)) return
       void (async () => {
         if (payload.needsConfirmation && window.confirm('检测到旺商聊已运行，但没有开启 9222 DevTools。需要结束该旺商聊进程并重新启动，是否继续？')) {
@@ -247,12 +249,12 @@ function App() {
               confirmRestart: true,
             })
             const result = await finishConfirmedWangRestart(start, await start())
-            if (result.status && !wangInformationalStatuses.has(result.status) && result.detail) setError(result.detail)
+            if (result.status && !wangInformationalStatuses.has(result.status) && result.detail) setWangStartupError(result.detail)
           } catch (reason) {
-            setError(readableError(reason))
+            setWangStartupError(readableError(reason))
           }
         } else if (payload.status && !wangInformationalStatuses.has(payload.status) && payload.detail) {
-          setError(payload.detail)
+          setWangStartupError(payload.detail)
         }
         await refresh()
       })()
@@ -261,6 +263,7 @@ function App() {
       setDiagnostic(event.payload)
       updateWangLoginFocus(event.payload)
       if (event.payload.status === 'ready') setWangStartup(null)
+      if (wangInformationalStatuses.has(event.payload.status)) setWangStartupError('')
       const nextAccount = event.payload.nimAccount || ''
       if (nextAccount && switchAccount(nextAccount)) void refresh()
     }))
@@ -278,6 +281,7 @@ function App() {
         setDiagnostic(next)
         updateWangLoginFocus(next)
         if (next.status === 'ready') setWangStartup(null)
+        if (wangInformationalStatuses.has(next.status)) setWangStartupError('')
         const nextAccount = next.nimAccount || ''
         if (nextAccount && switchAccount(nextAccount)) void refresh()
       } catch {
@@ -318,6 +322,7 @@ function App() {
       <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}
       <WangStatusBanner diagnostic={diagnostic} startup={wangStartup} />
+      {wangStartupError && <ErrorBanner message={wangStartupError} onClose={() => setWangStartupError('')} />}
       {error && <ErrorBanner message={error} onClose={() => setError('')} />}
       {page === '总览' && <OverviewPage diagnostic={diagnostic} database={database} groups={groups} audits={overviewAudits} summaries={summaries} loading={loading} refresh={() => void refresh(true)} />}
       {page === '群组与成员' && <GroupMembersPage groups={groups} selectedGroup={selectedGroup} setSelectedGroup={setSelectedGroup} activeGroup={activeGroup} onError={setError} refresh={refresh} />}

@@ -420,8 +420,9 @@ impl AppState {
         let devtools_url = paths.default_devtools_url().to_string();
         let gateway: Arc<dyn RuntimeGateway> =
             Arc::new(CdpGateway::new(CdpClient::new(devtools_url)?));
-        let prediction_source: Arc<dyn PredictionSource> =
-            Arc::new(prediction::ZcgLotterySource::new(Duration::from_secs(8))?);
+        let prediction_source: Arc<dyn PredictionSource> = Arc::new(
+            prediction::PublicLotterySource::new(Duration::from_secs(8))?,
+        );
         Ok(Self {
             secrets: SecretStore::new(paths.secrets.clone()),
             paths,
@@ -4395,7 +4396,18 @@ async fn auto_start_wangshangliao(
             status.as_str(),
             "ready" | "devtools-ready" | "nim-not-ready"
         ) {
-            last_problem = None;
+            if last_problem.take().is_some() {
+                let detail = if status == "ready" {
+                    "旺商聊协议会话已就绪。"
+                } else {
+                    "DevTools 已连接，请在旺商聊完成登录，DH BOT 会继续等待会话初始化。"
+                };
+                publish_wang_startup_status(
+                    &app,
+                    Some(&startup_status),
+                    wang_startup_event(status, detail, false),
+                );
+            }
             continue;
         }
 
