@@ -53,12 +53,12 @@
 
 ## 当前验证
 
-- `cargo test --no-default-features`：核心库 214 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v14、多 Provider 与思考深度迁移、活动本地时区修正、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、AI 文案事实双向校验、single-flight 与缓存校验。
-- `cargo test --features fixture`：核心库 208 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
+- `cargo test --no-default-features`：核心库 225 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v14、多 Provider 与思考深度迁移、活动本地时区修正、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、AI 文案事实双向校验、single-flight 与缓存校验、远端响应体限长读取（含恰好等于上限的边界与错误码映射）、诊断包 `memoryCaps` 七项上限与常量逐一对齐的漂移守卫。
+- `cargo test --features fixture`：核心库 231 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
 - 群公告发布语义已固定为 `add-notice → 按新 noticeId 回读 → NIM 广播`，每次明确发布都会新增历史；`notice-opt` 仅保留给明确选择旧公告后的编辑流程。
 - 两套 `cargo clippy --all-targets -- -D warnings` 通过。
-- `pnpm test`：58 项 RTL/Vitest 通过，包含业务应用、多 Provider 离群测试、批量群控、机器/AI 规则、知识、审计汉化、调试诊断包和消息游标分页回归测试。
-- `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用。
+- `pnpm test`：20 个文件 77 项 RTL/Vitest 通过，包含业务应用、多 Provider 离群测试、批量群控、机器/AI 规则、知识、审计汉化、调试诊断包、消息游标分页和右键菜单（默认菜单屏蔽、通道分级、镜像行内按钮、密码框不给复制/剪切、剪贴板失败降级）回归测试。
+- `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用；另含右键菜单在真实 Chromium 下的默认菜单抑制、层级、真实剪贴板读写和边缘翻转。
 - macOS 本机登录旺商聊的只读探测通过：读到 8 个群、一个完整 3097 人名单，消息编码和 NIM 成员事件为 `Supported`，公告为 `ManualVerification`。没有执行任何群写操作。
 - macOS 真实双群计时验证通过：2026-07-28 15:00 对脱敏测试群 A/B 执行关群，15:01 执行开群；每次写入均通过 `nim.getTeam` 回读，两个群最终均确认为允许发言。
 - Contract v2 采集、组装、合并、严格验证与脱敏工具链 34 项测试及自检通过，可在多 DevTools 页面中唯一选择旺商聊；生产/开发构建边界、10 场景生产隔离扫描、前端生产扫描和无 Fixture 的 Rust release 构建通过。

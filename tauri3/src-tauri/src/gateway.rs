@@ -43,11 +43,11 @@ const GROUP_NOTICE_LIST_ROUTE: &str = "/v1/group/notice-list";
 const GROUP_NOTICE_ADD_ROUTE: &str = "/v1/group/add-notice";
 const GROUP_NOTICE_UPDATE_ROUTE: &str = "/v1/group/notice-opt";
 const GROUP_NOTICE_DELETE_ROUTE: &str = "/v1/group/notice-del";
-const MAX_GATEWAY_BATCH: usize = 100;
+pub(crate) const MAX_GATEWAY_BATCH: usize = 100;
 /// Hard cap on the number of groups held in the member-roster cache.
 /// Groups beyond this limit are evicted (oldest-checked-at first) on the next
 /// insert so the cache cannot grow without bound on long-running connections.
-const MAX_MEMBER_CACHE_GROUPS: usize = 100;
+pub(crate) const MAX_MEMBER_CACHE_GROUPS: usize = 100;
 
 /// Built-in protocol evidence recovered from the ZCG group-management path.
 /// It contains route names only; DH BOT still executes through WangShangLiao CDP/Electron/NIM.

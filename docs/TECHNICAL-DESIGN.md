@@ -42,6 +42,7 @@ tauri3/src-tauri/src/lib.rs         AppState、共享校验辅助、dh_handlers!
     |-- cardnames.rs                建议名片、改名验证、欢迎队列
     |-- knowledge.rs / ai.rs        文档检索、AiProviderPool、AI 决策校验
     |-- business_apps.rs            BusinessAppRegistry
+    |-- http_body.rs                共享限长响应体读取；ai.rs 与 prediction.rs 经此读远端响应
     |-- prediction.rs               PublicLotterySource — BCLC/CWL/pc28.help
     |-- scheduler.rs                摘要、任务提醒、每日开关群计划
     |-- diagnostics.rs              JSONL 日志轮转和支持包 ZIP
@@ -228,8 +229,15 @@ pnpm verify:docs
 | `MAX_REPORTED_SET` | 500 | `runtime/mod.rs` | 已报告运行项去重集合上限 |
 | `MAX_TRACKED_ITEMS` | 200 | `runtime_work.rs` | `RuntimeWorkTracker` 活跃项上限 |
 | `AI_PROVIDER_TIMEOUT` | 15 s | `ai.rs` | 单 AI 连接生成上限（另有 2s 连接超时、20s 总预算） |
+| `DEFAULT_RESPONSE_LIMIT` | 20 MiB | `http_body.rs` | 单个远端 HTTP 响应体上限；按 chunk 累加，超限立即返回并断开连接 |
 
-`list_members()` 在写入缓存前检查 `cache.len() >= MAX_MEMBER_CACHE_GROUPS`，驱逐最旧群后再插入，避免因群数量增长导致内存无限累积。诊断包的 `memoryCaps` 字段输出以上常量值供线上核对。
+`list_members()` 在写入缓存前检查 `cache.len() >= MAX_MEMBER_CACHE_GROUPS`，驱逐最旧群后再插入，避免因群数量增长导致内存无限累积。
+
+响应体上限必须在读取过程中生效：先 `bytes().await` 或 `.json()` 再检查长度，等于已经把整个响应收进内存，上限形同虚设。`http_body::read_capped_body` 因此按 chunk 累加，一超限立刻返回 `CappedReadError` 并丢弃 response（连接随之关闭）。该模块只决定"读多少"，不决定"怎么报错"——错误码由各调用方映射到自己域内，避免某一域的错误码泄漏到别处。
+
+诊断包的 `memoryCaps` 字段输出以上全部七项供线上核对，键名依次为 `maxMemberEventCache`、`maxReportedSet`、`maxMemberCacheGroups`、`maxTrackedWorkItems`、`maxGatewayBatch`、`aiProviderTimeoutSeconds`、`defaultResponseLimitBytes`。
+
+这些值直接引用常量本身，不重抄字面量：重抄等于同一个值维护两处，改了常量忘了改诊断包时线上会读到旧值而测试仍绿。`memory_caps_report_every_compile_time_constant` 逐字段断言 JSON 与常量相等，因此漏改会在测试期暴露。除键名自带单位的两项（秒、字节）外其余均为计数；`aiProviderTimeoutSeconds` 是时间上限而非内存上限，为保持字段名稳定仍归在 `memoryCaps` 下。
 
 ### axum 本地桥
 

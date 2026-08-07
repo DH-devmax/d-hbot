@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use crate::diagnostics::redact;
 
 const SUCCESS_RETENTION: Duration = Duration::from_secs(5);
-const MAX_TRACKED_ITEMS: usize = 200;
+pub(crate) const MAX_TRACKED_ITEMS: usize = 200;
 const EVENT_COALESCE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

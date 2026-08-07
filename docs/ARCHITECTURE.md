@@ -223,7 +223,7 @@ flowchart LR
 - 加拿大28：优先 BCLC 官方 Keno 年度文件，不可达时回退 `pc28.help/api/keno.json`（parse_public_keno_snapshot 行级容错，单行字段缺失只跳过不中止）。
 - PC28/北京28：中国福彩网官方快乐8，DH 按公开约定派生三位结果。
 - 比特币28 / 腾讯一分彩28：无可核验算法或官方开奖源，保持不可用。
-- 所有公开 HTTP 响应使用 `read_capped_body`（20 MiB 流式上限）。
+- 所有公开 HTTP 响应经 `http_body::read_capped_body` 边读边限长（20 MiB 流式上限），超限立即断开连接；AI 提供方与 Webhook 响应共用同一个读取器。
 
 ---
 
@@ -251,8 +251,11 @@ GET  /status   →  BridgeState.gateway.diagnose() → DiagnosticSnapshot
 | `MAX_REPORTED_SET` | 500 | `runtime/mod.rs` | 已报告运行项去重集合上限 |
 | `MAX_TRACKED_ITEMS` | 200 | `runtime_work.rs` | RuntimeWorkTracker 活跃项上限 |
 | `AI_PROVIDER_TIMEOUT` | 15 s | `ai.rs` | 单 AI 连接生成上限 |
+| `DEFAULT_RESPONSE_LIMIT` | 20 MiB | `http_body.rs` | 单个远端 HTTP 响应体上限（公开开奖源 / AI / Webhook 共用） |
 
-所有上限在编译期固定，诊断包的 `memoryCaps` 字段输出当前值以供核对。
+所有上限在编译期固定。诊断包的 `memoryCaps` 字段输出以上全部七项，且直接读常量本身而不是重抄一遍字面量 —— 抄字面量等于把同一个值维护两处，改了常量忘了改诊断包时诊断包会安静地报旧值。`diagnostics.rs` 的 `memory_caps_report_every_compile_time_constant` 逐字段钉住这一点。
+
+字段单位：除键名自带单位的 `aiProviderTimeoutSeconds`（秒）和 `defaultResponseLimitBytes`（字节）外均为计数。`aiProviderTimeoutSeconds` 严格说是时间上限而非内存上限，为不破坏既有字段名仍留在 `memoryCaps` 下。
 
 ---
 
@@ -274,7 +277,7 @@ flowchart LR
 - `database.indexIntegrity` — `PRAGMA integrity_check(16)` 结果
 - `queueDepth` — `effect_outbox` 按 state 分组计数
 - `retentionPolicies` — `retention_policies` 表当前配置
-- `memoryCaps` — 编译期内存上限表
+- `memoryCaps` — 编译期上限表，七项全部直接读常量（含一项时间上限与一项字节上限）
 - `dispatchStats` — Dispatcher 累计计数器快照
 - `connection.rateLimitHits` — 成员查询连续限速次数
 

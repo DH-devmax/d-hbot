@@ -462,11 +462,14 @@ fn support_diagnostic_document(
         "queueDepth": database.queue_depth,
         "retentionPolicies": database.retention_policies,
         "memoryCaps": {
-            "maxMemberEventCache": 500,
-            "maxReportedSet": 500,
-            "maxMemberCacheGroups": 100,
-            "maxTrackedWorkItems": 200,
-            "note": "in-memory caps; actual values reflect compile-time constants",
+            "maxMemberEventCache": crate::runtime::MAX_MEMBER_EVENT_CACHE,
+            "maxReportedSet": crate::runtime::MAX_REPORTED_SET,
+            "maxMemberCacheGroups": crate::gateway::MAX_MEMBER_CACHE_GROUPS,
+            "maxTrackedWorkItems": crate::runtime_work::MAX_TRACKED_ITEMS,
+            "maxGatewayBatch": crate::gateway::MAX_GATEWAY_BATCH,
+            "aiProviderTimeoutSeconds": crate::ai::AI_PROVIDER_TIMEOUT.as_secs(),
+            "defaultResponseLimitBytes": crate::http_body::DEFAULT_RESPONSE_LIMIT,
+            "note": "compile-time caps read from the constants themselves; counts unless the key names a unit",
         },
         "connection": {
             "status": diagnostic.status,
@@ -874,6 +877,89 @@ mod tests {
             .iter()
             .all(|line| serde_json::from_str::<Value>(line).is_ok()));
         assert!(!tail.starts_with("{\"sequence\":1"));
+    }
+
+    #[test]
+    fn memory_caps_report_every_compile_time_constant() {
+        // 每个字段与常量逐一对齐。写字面量断言就等于把同一个错抄两遍——
+        // 有人改了常量、忘了改诊断包，这个测试仍会绿。
+        let directory = tempdir().unwrap();
+        let paths = AppPaths {
+            root: directory.path().join("DH"),
+            v3: directory.path().join("DH").join("3.0"),
+            database: directory.path().join("DH").join("3.0").join("dh.db"),
+            secrets: directory.path().join("DH").join("3.0").join("secrets.dat"),
+            logs: directory.path().join("DH").join("3.0").join("logs"),
+            legacy_backups: directory.path().join("DH").join("legacy-backups"),
+            runtime_mode_file: directory.path().join("DH").join("runtime-mode"),
+        };
+        let document = support_diagnostic_document(
+            &paths,
+            DatabaseStatus {
+                path: paths.database.display().to_string(),
+                schema_version: 14,
+                integrity: "ok".into(),
+                accounts: 0,
+                groups: 0,
+                messages: 0,
+                queue_depth: vec![],
+                retention_policies: vec![],
+                index_integrity: "ok".into(),
+            },
+            DiagnosticSnapshot {
+                status: crate::gateway::ConnectionStatus::Ready,
+                devtools_url: "http://127.0.0.1:9222".into(),
+                page_title: "Wang".into(),
+                page_url: "app://wang".into(),
+                nim_account: "1".into(),
+                detail: "ok".into(),
+                rate_limit_hits: 0,
+            },
+            capabilities(),
+            "2026-08-07T00:00:00Z",
+            &DispatchStatsSnapshot {
+                dispatched: 0,
+                proceeded: 0,
+                skipped: 0,
+                rejected: 0,
+                chain_micros: 0,
+            },
+        )
+        .unwrap();
+        let caps = serde_json::from_slice::<Value>(&document).unwrap()["memoryCaps"].clone();
+
+        assert_eq!(
+            caps["maxMemberEventCache"],
+            crate::runtime::MAX_MEMBER_EVENT_CACHE
+        );
+        assert_eq!(caps["maxReportedSet"], crate::runtime::MAX_REPORTED_SET);
+        assert_eq!(
+            caps["maxMemberCacheGroups"],
+            crate::gateway::MAX_MEMBER_CACHE_GROUPS
+        );
+        assert_eq!(
+            caps["maxTrackedWorkItems"],
+            crate::runtime_work::MAX_TRACKED_ITEMS
+        );
+        assert_eq!(caps["maxGatewayBatch"], crate::gateway::MAX_GATEWAY_BATCH);
+        assert_eq!(
+            caps["aiProviderTimeoutSeconds"],
+            crate::ai::AI_PROVIDER_TIMEOUT.as_secs()
+        );
+        assert_eq!(
+            caps["defaultResponseLimitBytes"],
+            crate::http_body::DEFAULT_RESPONSE_LIMIT
+        );
+
+        // 文档承诺"7 项全报"，所以字段数也要钉住：加常量忘了加字段时这里会红。
+        let keys = caps.as_object().unwrap();
+        assert_eq!(
+            keys.len(),
+            8,
+            "memoryCaps 应有 7 个常量字段 + note，实际 {}：{:?}",
+            keys.len(),
+            keys.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

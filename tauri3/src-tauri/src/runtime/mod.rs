@@ -40,9 +40,9 @@ mod roster;
 mod summary;
 
 /// Hard cap for the per-connection member-event cache inside `connection_loop`.
-const MAX_MEMBER_EVENT_CACHE: usize = 500;
+pub(crate) const MAX_MEMBER_EVENT_CACHE: usize = 500;
 /// Hard cap for the dedup warning sets (`reported_*`) inside `connection_loop`.
-const MAX_REPORTED_SET: usize = 500;
+pub(crate) const MAX_REPORTED_SET: usize = 500;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
