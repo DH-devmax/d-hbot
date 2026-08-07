@@ -17,6 +17,7 @@ pub mod error;
 #[cfg(any(feature = "fixture", test))]
 pub mod fixture;
 pub mod gateway;
+mod http_body;
 mod knowledge;
 pub mod models;
 mod moderation;

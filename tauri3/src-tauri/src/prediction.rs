@@ -215,36 +215,30 @@ const FALLBACK_BASES: &[&str] = &[
     "https://api2.mbf52.com",
 ];
 /// 公开开奖源响应体上限。这些都是第三方/公网地址，必须在读取过程中就设上限。
-const PUBLIC_RESPONSE_LIMIT: usize = 20 * 1024 * 1024;
+const PUBLIC_RESPONSE_LIMIT: usize = crate::http_body::DEFAULT_RESPONSE_LIMIT;
 
-/// 边读边限长地取回响应体。
+/// 边读边限长地取回响应体，并把失败原因映射成本模块的错误码。
 ///
-/// 先 `bytes().await` 再检查长度等于已经把整个响应收进内存，上限就形同虚设；
-/// 这里按 chunk 累加，一超限立刻断开连接。
+/// 读取机制在 [`crate::http_body`]；这里只负责错误措辞，保持本模块对外的
+/// 错误码与文案不变。
 async fn read_capped_body(
     response: reqwest::Response,
     limit: usize,
     source_label: &str,
 ) -> AppResult<Vec<u8>> {
-    let mut response = response;
-    let mut body = Vec::new();
-    loop {
-        let chunk = response.chunk().await.map_err(|_| {
+    use crate::http_body::CappedReadError;
+    crate::http_body::read_capped_body(response, limit)
+        .await
+        .map_err(|error| {
+            let reason = match error {
+                CappedReadError::Transport => "读取失败",
+                CappedReadError::TooLarge => "超过大小限制",
+            };
             AppError::new(
                 "prediction_public_response",
-                format!("{source_label}读取失败"),
+                format!("{source_label}{reason}"),
             )
-        })?;
-        let Some(chunk) = chunk else { break };
-        if body.len() + chunk.len() > limit {
-            return Err(AppError::new(
-                "prediction_public_response",
-                format!("{source_label}超过大小限制"),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        })
 }
 
 #[derive(Clone)]
@@ -332,7 +326,12 @@ impl PublicLotterySource {
         }
         let mut bases = Vec::new();
         if let Ok(response) = self.client.get(DYNAMIC_CONFIG_URL).send().await {
-            if let Ok(value) = response.json::<serde_json::Value>().await {
+            // 动态配置也是公网地址，必须边读边限长。直接 `.json()` 会先把整个响应体收进内存，
+            // 等于没有上限；读取失败或超限时退回空 body，让下面的解析失败并走 FALLBACK_BASES。
+            let body = read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "开奖源动态配置")
+                .await
+                .unwrap_or_default();
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
                 for key in ["api1", "api2"] {
                     if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
                         let normalized = value.replace("http://", "https://");
@@ -519,7 +518,8 @@ impl PublicLotterySource {
                 ));
                 continue;
             }
-            let bytes = match response.bytes().await {
+            let bytes = match read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "开奖数据响应").await
+            {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     last_error = Some(AppError::new("prediction_response", "开奖数据响应读取失败"));
@@ -1355,6 +1355,38 @@ mod tests {
         );
         worker.join().unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn capped_body_maps_over_limit_to_prediction_error_code() {
+        // 读取机制本身由 http_body 模块的测试覆盖；这里只钉住本模块的错误码映射，
+        // 避免共享模块的错误类型泄漏成别的域的错误码。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8 * 1024];
+            let _ = stream.read(&mut request);
+            let body = "x".repeat(16 * 1024);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            // 客户端一超限就断开连接，这里的写入可能是 broken pipe，属预期。
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_capped_body(response, 1024, "测试源").await.unwrap_err();
+        assert_eq!(error.code, "prediction_public_response");
+        assert_eq!(error.message, "测试源超过大小限制");
+        worker.join().unwrap();
     }
 
     #[test]

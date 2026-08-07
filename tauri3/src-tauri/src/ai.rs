@@ -275,10 +275,7 @@ impl ConfiguredProvider {
             .await
             .map_err(|error| AppError::new("ai_request", ai_transport_error(&error)).retryable())?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| AppError::new("ai_response", "AI 响应读取失败，请稍后重试"))?;
+        let bytes = read_capped_ai_body(response).await?;
         if !status.is_success() {
             return Err(AppError::new("ai_http", format!("AI 请求返回 HTTP {status}")).retryable());
         }
@@ -315,10 +312,7 @@ impl ConfiguredProvider {
             .await
             .map_err(|error| AppError::new("ai_request", ai_transport_error(&error)).retryable())?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| AppError::new("ai_response", "AI 响应读取失败，请稍后重试"))?;
+        let bytes = read_capped_ai_body(response).await?;
         if !status.is_success() {
             return Err(AppError::new(
                 "ai_http",
@@ -349,12 +343,30 @@ impl ConfiguredProvider {
                 AppError::new("webhook_http", format!("Webhook 返回 HTTP {status}")).retryable(),
             );
         }
-        let wire: WireDecision = response
-            .json()
+        // Webhook 地址由用户配置，指向远端；响应体必须边读边限长。
+        let bytes = crate::http_body::read_capped_body(response, AI_RESPONSE_LIMIT)
             .await
+            .map_err(|_| AppError::new("webhook_response", "Webhook 响应读取失败"))?;
+        let wire: WireDecision = serde_json::from_slice(&bytes)
             .map_err(|_| AppError::new("webhook_response", "Webhook 响应格式错误"))?;
         validate_decision(wire.into())
     }
+}
+
+/// AI 提供方响应体上限。
+///
+/// AI 决策本身只有几 KB，但这里沿用共享默认值：要关掉的缺陷是"无上限"，
+/// 不是"上限太大"。收紧到一个我无法验证的数值，反而可能挡掉正常响应。
+const AI_RESPONSE_LIMIT: usize = crate::http_body::DEFAULT_RESPONSE_LIMIT;
+
+/// 读取 AI 提供方响应体并限长，把失败映射成本模块的错误码。
+///
+/// `base_url` 由用户配置、指向远端，所以不能直接 `bytes().await`。
+/// 文案与错误码保持与限长前一致，避免影响依赖错误码的上层逻辑。
+async fn read_capped_ai_body(response: reqwest::Response) -> AppResult<Vec<u8>> {
+    crate::http_body::read_capped_body(response, AI_RESPONSE_LIMIT)
+        .await
+        .map_err(|_| AppError::new("ai_response", "AI 响应读取失败，请稍后重试"))
 }
 
 fn response_error_suffix(bytes: &[u8]) -> String {
