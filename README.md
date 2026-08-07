@@ -61,6 +61,7 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 - `docs/ENGINEERING-STANDARDS.md`：协议、数据库、前端交互规范，协作范围与仓库权限，以及门禁命令清单的唯一权威。
 - `docs/ISOLATION.md`：生产/开发、端口、数据、凭据和发布仓库隔离。
 - `docs/WINDOWS-ACCEPTANCE.md`：Windows 实机验收总纲；快照事实、门禁基线、右键菜单/memoryCaps/限长读取验收和结果回填格式。
+- `docs/REAL-BUSINESS-TEST.md`：真实旺商聊业务测试的运行手册；67 个环境变量、确认令牌和 `--ignored` 用法。
 - `docs/WINDOWS-REAL-MACHINE-TEST.md`：Windows 桌面层与进程层的分层步骤、自动探针用法和通过标准。
 - `docs/REAL-GROUP-TEST-20260731.md`：macOS 真实群协议链基线报告；Windows 验收据此判断哪些破坏性测试不必重复。
 - `docs/WINDOWS-CODEX-PROMPT.md`：可直接交给 Windows Codex 的验收提示词。

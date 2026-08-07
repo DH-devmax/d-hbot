@@ -93,13 +93,13 @@ pnpm verify:windows:production     # 产物深度扫描
 | 门禁 | 实测 |
 |---|---:|
 | Rust 生产 | 225 项通过 |
-| Rust Fixture | 231 项通过 |
+| Rust Fixture | 231 项通过（主测试二进制；全二进制合计 233） |
 | vitest | 20 文件 / 77 项通过 |
 | Contract v2 | 34 项通过 |
 | 生产隔离 | 10 场景通过 |
 | Clippy 两通道 | 0 警告（`-D warnings`） |
 
-两个通道各有 1 项需要外部密钥的 live 测试按设计忽略，不算失败。
+被忽略的项不算失败，但数量远不止一两项：生产通道 21 项、Fixture 通道 25 项，它们是跑在真实旺商聊上的业务测试，靠环境变量加 `-- --ignored` 才会执行。运行方式见 [`REAL-BUSINESS-TEST.md`](REAL-BUSINESS-TEST.md)。只跑本节命令的话这批一定不会执行。
 
 ## 5. 生产包边界
 
