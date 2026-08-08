@@ -10,12 +10,20 @@
 
 | 项 | 值 |
 |---|---|
-| 源码提交 | `d923e5d`（`main` 与 `origin/main` 同值） |
+| 源码分支 | `codex/zcg-runtime-probe`（PR #8 合并后 `main` 同样满足下面的判据） |
 | 应用版本 | `3.0.0-beta.1` |
 | SQLite schema | v14 |
 | 仓库 | `DH-devmax/d-hbot`（私有） |
 
-在仓库根目录确认三个新功能真的在这份源码里，缺任何一项说明拉错了提交：
+这里刻意钉分支而不是某个 sha：本文所在分支还在收文档提交，写死短 sha 必然过期，而过期的钉子正是上面那类误判的来源。判据改成「必须包含哪几个提交」，与文档提交无关：
+
+```powershell
+git rev-parse HEAD
+git merge-base --is-ancestor 7c13129 HEAD; $LASTEXITCODE   # 右键菜单
+git merge-base --is-ancestor d923e5d HEAD; $LASTEXITCODE   # 运行时基线（已含右键菜单）
+```
+
+两个 `$LASTEXITCODE` 都必须是 `0`。再确认三个新功能的文件真的在工作区里，缺任何一项说明拉错了分支：
 
 ```powershell
 Test-Path tauri3\src\components\ContextMenu.tsx
@@ -23,7 +31,7 @@ Test-Path tauri3\src-tauri\src\http_body.rs
 Select-String -Path tauri3\src-tauri\src\diagnostics.rs -Pattern 'defaultResponseLimitBytes' -Quiet
 ```
 
-三条都必须为 `True`。测试报告首行记录 `git rev-parse HEAD` 的完整 40 位 SHA，不用短 SHA。
+三条都必须为 `True`。注意这几条只证明源码对，不证明你装的包是用这份源码构建的——那要靠第 5 节的正向标记。测试报告首行记录 `git rev-parse HEAD` 的完整 40 位 SHA，不用短 SHA。
 
 ## 1. 产品边界
 
@@ -88,7 +96,7 @@ pnpm package:windows:production    # NSIS + portable + SHA256SUMS
 pnpm verify:windows:production     # 产物深度扫描
 ```
 
-`d923e5d` 上的实测基线，偏离要先查原因再继续：
+下面是 macOS 上实测的基线，偏离要先查原因再继续。基线测于 `d923e5d`，此后到本文修订时的提交只改了文档、工具和 `package.json` 里一行脚本，没有触及 Rust 与前端源码，所以数字仍然适用：
 
 | 门禁 | 实测 |
 |---|---:|
