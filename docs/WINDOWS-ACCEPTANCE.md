@@ -105,13 +105,25 @@ pnpm verify:windows:production     # 产物深度扫描
 
 解压 portable ZIP，确认没有 `DH-Fixture.exe`、Fixture 字样入口、`9233`、`51300`、测试数据库、PDB、Source Map、源码或开发命令。再核对 EXE 与 ZIP 的 SHA-256。
 
-前端产物要单独搜一遍。这三个符号依赖 Vite 的字面量 `import.meta.env.X` 才能被消除，一旦写法被改成动态取值，开发分支会残留在生产包里：
+前端产物要单独搜一遍。这两个符号依赖 Vite 的字面量 `import.meta.env.X` 才能被消除，一旦写法被改成动态取值，开发分支会残留在生产包里：
 
 ```powershell
-Select-String -Path dist\assets\*.js -Pattern 'VITE_DH_FIXTURE','isDeveloperChannel','shiftKey'
+Select-String -Path dist\assets\*.js -Pattern 'VITE_DH_FIXTURE','isDeveloperChannel'
 ```
 
-预期零命中。其中 `shiftKey` 尤其重要：它是开发通道 `Shift + 右键` 透传原生菜单的判定，生产包里整个分支应当已被消除。
+预期零命中。这两个符号一起消失，说明 `Shift + 右键` 透传原生菜单的整个开发分支已被消除。
+
+不要拿 `shiftKey` 当判据：React 的合成事件表里本来就有 `Shift:"shiftKey"` 和若干 `shiftKey:0`，本地实测生产产物固定 4 次命中，与 DH 的代码无关。
+
+反向检查只能证明开发产物不在包里，证明不了包是新的。**过期的生产包能通过上面每一条**，所以再加一条正向标记：
+
+```powershell
+Select-String -Path dist\assets\*.js -Pattern 'dh-context-menu'
+```
+
+预期至少 1 次命中（本地实测 4 次）。这是右键菜单容器的 class 前缀，整个前端只有 `ContextMenu.tsx` 用。搜不到就说明这个包早于右键菜单功能，第 7 节直接判定为无效运行，不要记成功能失败——先回到第 3 节重新构建。
+
+标记刻意选了纯 ASCII。`Select-String` 在 PowerShell 5.1 下读无 BOM 的 UTF-8 文件时按系统代码页解码，中文 pattern 在中文 Windows 上会搜不到而给出假阴性，反倒把好包判成旧包。
 
 ## 6. 桌面层与进程层
 
@@ -128,6 +140,8 @@ Select-String -Path dist\assets\*.js -Pattern 'VITE_DH_FIXTURE','isDeveloperChan
 ## 7. 右键菜单与剪贴板
 
 这一节在 macOS 上无法验证：WKWebView 不暴露 CDP，开发机驱动不了真实窗口的右键。合并时状态为**未验证**，必须在 Windows 真机 WebView2 下逐条确认。
+
+开跑前先确认包里真的有这个功能。右键菜单是 `7c13129`（2026-08-08）才加的，比 `output/` 下已有的 Windows 产物晚两周以上，拿旧包测会看到完整的 WebView2 默认菜单——那是包的问题，不是功能的问题。判据是第 5 节那条正向标记，不是第 0 节的 `Test-Path`：`Test-Path` 只证明源码在，证明不了 EXE 里编进去了。
 
 菜单的设计前提是「不新增能力」：数据行和列表项的菜单项直接镜像行内已有按钮，读取其 `title` 作为文案、执行时调用该按钮。所以业务逻辑、二次确认和 `disabled` 规则应当与点按钮完全一致。
 
