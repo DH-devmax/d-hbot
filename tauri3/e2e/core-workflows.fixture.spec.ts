@@ -33,7 +33,7 @@ async function installDeveloperFixture(page: Page) {
         case 'plugin:event|listen': return callbackId++
         case 'plugin:event|unlisten': return null
         case 'diagnose': return { status: 'ready', devtoolsUrl: 'http://127.0.0.1:9233', pageTitle: 'DH Fixture', pageUrl: 'http://127.0.0.1:51300', nimAccount: 'ACCOUNT', detail: '开发 Fixture 已就绪' }
-        case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 13, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
+        case 'database_status': return { path: '%APPDATA%\\DH\\fixture\\dh.db', schemaVersion: 14, integrity: 'ok', accounts: 1, groups: 1, messages: messages.length }
         case 'get_ai_settings': return { base_url: 'http://127.0.0.1:51300/v1', webhook_url: '', model: 'fixture-model', api_key_configured: true }
         case 'get_wang_startup_settings': return { path: '', autoStart: true }
         case 'save_wang_startup_settings': return null

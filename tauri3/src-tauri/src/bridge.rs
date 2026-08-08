@@ -185,10 +185,7 @@ struct Mute {
     user_id: i64,
     duration_seconds: i64,
 }
-async fn mute(
-    State(state): State<Arc<BridgeState>>,
-    Json(input): Json<Mute>,
-) -> BridgeResponse {
+async fn mute(State(state): State<Arc<BridgeState>>, Json(input): Json<Mute>) -> BridgeResponse {
     let account_id = get_account_id(&state).await?;
     state
         .database

@@ -25,7 +25,11 @@ pub(crate) struct GroupBatchResult {
 }
 
 #[tauri::command]
-pub(crate) async fn send_text(state: State<'_, AppState>, group_id: i64, text: String) -> AppResult<String> {
+pub(crate) async fn send_text(
+    state: State<'_, AppState>,
+    group_id: i64,
+    text: String,
+) -> AppResult<String> {
     require_manager(&state, group_id).await?;
     let (sender_id, account_id) = state.gateway.session_identity().await?;
     let result = state.gateway.send_text(group_id, &text).await;

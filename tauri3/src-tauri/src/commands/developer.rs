@@ -17,7 +17,10 @@ pub(crate) fn get_runtime_mode(state: State<'_, AppState>) -> serde_json::Value 
 }
 
 #[tauri::command]
-pub(crate) fn set_runtime_mode(state: State<'_, AppState>, mode: String) -> AppResult<serde_json::Value> {
+pub(crate) fn set_runtime_mode(
+    state: State<'_, AppState>,
+    mode: String,
+) -> AppResult<serde_json::Value> {
     state.paths.set_runtime_mode(&mode)?;
     Ok(serde_json::json!({
         "mode": mode.trim().to_ascii_lowercase(),
@@ -26,7 +29,10 @@ pub(crate) fn set_runtime_mode(state: State<'_, AppState>, mode: String) -> AppR
 }
 
 #[tauri::command]
-pub(crate) fn start_fixture_host(app: tauri::AppHandle, state: State<'_, AppState>) -> AppResult<String> {
+pub(crate) fn start_fixture_host(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
     let executable = std::env::current_exe()
         .map_err(|error| AppError::new("fixture_start", error.to_string()))?;
     let directory = executable.parent().unwrap_or(std::path::Path::new("."));
@@ -138,7 +144,9 @@ pub(crate) async fn begin_developer_calibration(
 }
 
 #[tauri::command]
-pub(crate) fn get_developer_calibration_status(state: State<'_, AppState>) -> DeveloperCalibrationStatus {
+pub(crate) fn get_developer_calibration_status(
+    state: State<'_, AppState>,
+) -> DeveloperCalibrationStatus {
     state.gateway.developer_calibration_status()
 }
 

@@ -78,7 +78,10 @@ fn normalize_activity(mut activity: Activity) -> AppResult<Activity> {
 }
 
 #[tauri::command]
-pub(crate) async fn save_activity(state: State<'_, AppState>, activity: Activity) -> AppResult<i64> {
+pub(crate) async fn save_activity(
+    state: State<'_, AppState>,
+    activity: Activity,
+) -> AppResult<i64> {
     let activity = normalize_activity(activity)?;
     require_account(&state, &activity.account_id).await?;
     for group_id in &activity.group_ids {
@@ -233,7 +236,10 @@ pub(crate) async fn list_schedules(
 }
 
 #[tauri::command]
-pub(crate) async fn save_schedule(state: State<'_, AppState>, mut schedule: GroupSchedule) -> AppResult<i64> {
+pub(crate) async fn save_schedule(
+    state: State<'_, AppState>,
+    mut schedule: GroupSchedule,
+) -> AppResult<i64> {
     if schedule.name.trim().is_empty() || schedule.group_ids.is_empty() {
         return Err(AppError::new(
             "schedule_invalid",

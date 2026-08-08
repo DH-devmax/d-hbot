@@ -17,7 +17,9 @@ pub(crate) async fn locate_wangshangliao() -> AppResult<Vec<platform::InstallCan
 }
 
 #[tauri::command]
-pub(crate) async fn get_wang_startup_settings(state: State<'_, AppState>) -> AppResult<WangStartupSettings> {
+pub(crate) async fn get_wang_startup_settings(
+    state: State<'_, AppState>,
+) -> AppResult<WangStartupSettings> {
     let path = state
         .database_executor
         .get_setting("wangshangliao.path".into())
@@ -69,7 +71,9 @@ pub(crate) async fn save_wang_startup_settings(
 }
 
 #[tauri::command]
-pub(crate) fn take_wang_startup_status(state: State<'_, AppState>) -> AppResult<Option<WangStartupEvent>> {
+pub(crate) fn take_wang_startup_status(
+    state: State<'_, AppState>,
+) -> AppResult<Option<WangStartupEvent>> {
     state
         .startup_status
         .lock()

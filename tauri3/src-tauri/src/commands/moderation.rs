@@ -90,7 +90,11 @@ pub(crate) async fn mute_member(
 }
 
 #[tauri::command]
-pub(crate) async fn unmute_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
+pub(crate) async fn unmute_member(
+    state: State<'_, AppState>,
+    group_id: i64,
+    user_id: i64,
+) -> AppResult<()> {
     let roster = require_member_manager(&state, group_id).await?;
     let target = canonical_member(&roster, user_id)?;
     let account_id = state.gateway.session_identity().await?.1;
@@ -165,7 +169,11 @@ pub(crate) async fn rename_member(
 }
 
 #[tauri::command]
-pub(crate) async fn remove_member(state: State<'_, AppState>, group_id: i64, user_id: i64) -> AppResult<()> {
+pub(crate) async fn remove_member(
+    state: State<'_, AppState>,
+    group_id: i64,
+    user_id: i64,
+) -> AppResult<()> {
     let roster = require_member_manager(&state, group_id).await?;
     let target = canonical_member(&roster, user_id)?;
     let account_id = state.gateway.session_identity().await?.1;
@@ -185,7 +193,11 @@ pub(crate) async fn remove_member(state: State<'_, AppState>, group_id: i64, use
 }
 
 #[tauri::command]
-pub(crate) async fn set_group_mute(state: State<'_, AppState>, group_id: i64, muted: bool) -> AppResult<()> {
+pub(crate) async fn set_group_mute(
+    state: State<'_, AppState>,
+    group_id: i64,
+    muted: bool,
+) -> AppResult<()> {
     let _roster = require_member_manager(&state, group_id).await?;
     let account_id = state.gateway.session_identity().await?.1;
     let result = state.gateway.set_group_mute(group_id, muted).await;

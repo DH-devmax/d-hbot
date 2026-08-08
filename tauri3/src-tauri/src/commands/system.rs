@@ -42,7 +42,9 @@ pub(crate) async fn database_status(state: State<'_, AppState>) -> AppResult<Dat
 }
 
 #[tauri::command]
-pub(crate) async fn export_support_bundle(state: State<'_, AppState>) -> AppResult<SupportBundleResult> {
+pub(crate) async fn export_support_bundle(
+    state: State<'_, AppState>,
+) -> AppResult<SupportBundleResult> {
     let database = state.database_executor.status().await?;
     let audits = state.database_executor.list_support_audit(200).await?;
     let diagnostic = state.gateway.diagnose().await;
@@ -50,7 +52,14 @@ pub(crate) async fn export_support_bundle(state: State<'_, AppState>) -> AppResu
     let dispatch_stats = state.runtime_coordination.dispatch_stats.snapshot();
     let paths = state.paths.clone();
     let result = tokio::task::spawn_blocking(move || {
-        diagnostics::create_support_bundle(&paths, database, audits, diagnostic, capabilities, dispatch_stats)
+        diagnostics::create_support_bundle(
+            &paths,
+            database,
+            audits,
+            diagnostic,
+            capabilities,
+            dispatch_stats,
+        )
     })
     .await
     .map_err(|error| AppError::new("support_bundle", format!("生成诊断包任务异常：{error}")))??;
