@@ -12,11 +12,12 @@ use sha2::{Digest, Sha256};
 use crate::defaults;
 use crate::error::{AppError, AppResult, InternalError};
 use crate::models::{
-    Account, ActionRecord, Activity, ActivityRun, AiProviderEndpoint, AuditEvent, BatchIngestResult,
-    BusinessAppRecord, BusinessAppRun, CardPlan, CardRenameJob, DailySummary, DueActivityRun,
-    EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect, GatewayInboxEvent, GatewayInboxItem,
-    Group, GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding, KnowledgeChunk,
-    KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage, ScheduleRun, TaskItem,
+    Account, ActionRecord, Activity, ActivityRun, AiProviderEndpoint, AuditEvent,
+    BatchIngestResult, BusinessAppRecord, BusinessAppRun, CardPlan, CardRenameJob, DailySummary,
+    DueActivityRun, EffectOutboxItem, EffectOutboxRequest, EnqueuedEffect, GatewayInboxEvent,
+    GatewayInboxItem, Group, GroupAiPermissions, GroupSchedule, KnowledgeBase, KnowledgeBinding,
+    KnowledgeChunk, KnowledgeDocument, Member, Message, ModerationRule, PersistedMessage,
+    ScheduleRun, TaskItem,
 };
 use crate::paths::AppPaths;
 
@@ -1450,7 +1451,6 @@ impl DatabaseExecutor {
             .await
     }
 
-
     pub async fn finish_task_reminder(
         &self,
         task_id: i64,
@@ -2278,12 +2278,16 @@ fn migrate_schema(connection: &mut Connection, old_version: i64) -> AppResult<()
     // ── v14：effect_outbox 扩展列 + 索引 + 保留策略表 ──────────────────────────
     // 所有变更均为纯增量，零行为改动；已有行从列默认值获得对应值。
     for (table, column, definition) in [
-        ("effect_outbox", "priority",       "INTEGER NOT NULL DEFAULT 100"),
-        ("effect_outbox", "lane",           "TEXT NOT NULL DEFAULT 'default'"),
-        ("effect_outbox", "order_key",      "TEXT"),
-        ("effect_outbox", "correlation_id", "TEXT NOT NULL DEFAULT ''"),
-        ("effect_outbox", "origin",         "TEXT NOT NULL DEFAULT 'unknown'"),
-        ("effect_outbox", "expires_at",     "TEXT"),
+        ("effect_outbox", "priority", "INTEGER NOT NULL DEFAULT 100"),
+        ("effect_outbox", "lane", "TEXT NOT NULL DEFAULT 'default'"),
+        ("effect_outbox", "order_key", "TEXT"),
+        (
+            "effect_outbox",
+            "correlation_id",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        ("effect_outbox", "origin", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("effect_outbox", "expires_at", "TEXT"),
     ] {
         add_column_if_missing(&transaction, table, column, definition).map_err(|error| {
             AppError::new(
@@ -5008,7 +5012,8 @@ mod tests {
             );
             drop(database);
             let reopened = Database::open(&paths).unwrap();
-            assert_eq!(reopened.status().unwrap().schema_version, 14);            assert_eq!(
+            assert_eq!(reopened.status().unwrap().schema_version, 14);
+            assert_eq!(
                 std::fs::read_dir(paths.v3.join("backups")).unwrap().count(),
                 1
             );

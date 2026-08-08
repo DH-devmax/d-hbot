@@ -265,8 +265,14 @@ pub fn create_support_bundle(
 ) -> AppResult<SupportBundleResult> {
     let generated_at = Utc::now().to_rfc3339();
     let aliases = SupportAliases::from_audits(&audits);
-    let diagnostic_document =
-        support_diagnostic_document(paths, database, diagnostic, capabilities, &generated_at, &dispatch_stats)?;
+    let diagnostic_document = support_diagnostic_document(
+        paths,
+        database,
+        diagnostic,
+        capabilities,
+        &generated_at,
+        &dispatch_stats,
+    )?;
     let audit_document = serde_json::to_vec_pretty(
         &audits
             .iter()
@@ -1015,7 +1021,13 @@ mod tests {
                 rate_limit_hits: 0,
             },
             capabilities(),
-            DispatchStatsSnapshot { dispatched: 0, proceeded: 0, skipped: 0, rejected: 0, chain_micros: 0 },
+            DispatchStatsSnapshot {
+                dispatched: 0,
+                proceeded: 0,
+                skipped: 0,
+                rejected: 0,
+                chain_micros: 0,
+            },
         )
         .unwrap();
         let mut archive = zip::ZipArchive::new(File::open(&result.path).unwrap()).unwrap();
@@ -1079,7 +1091,13 @@ mod tests {
                 rate_limit_hits: 0,
             },
             capabilities(),
-            DispatchStatsSnapshot { dispatched: 0, proceeded: 0, skipped: 0, rejected: 0, chain_micros: 0 },
+            DispatchStatsSnapshot {
+                dispatched: 0,
+                proceeded: 0,
+                skipped: 0,
+                rejected: 0,
+                chain_micros: 0,
+            },
         )
         .unwrap();
         assert_ne!(result.path, repeated.path);

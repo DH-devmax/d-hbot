@@ -16,13 +16,19 @@ pub(crate) async fn list_knowledge_bases(
 }
 
 #[tauri::command]
-pub(crate) async fn create_knowledge_base(state: State<'_, AppState>, base: KnowledgeBase) -> AppResult<i64> {
+pub(crate) async fn create_knowledge_base(
+    state: State<'_, AppState>,
+    base: KnowledgeBase,
+) -> AppResult<i64> {
     require_account(&state, &base.account_id).await?;
     state.database_executor.create_knowledge_base(base).await
 }
 
 #[tauri::command]
-pub(crate) async fn update_knowledge_base(state: State<'_, AppState>, base: KnowledgeBase) -> AppResult<()> {
+pub(crate) async fn update_knowledge_base(
+    state: State<'_, AppState>,
+    base: KnowledgeBase,
+) -> AppResult<()> {
     require_account(&state, &base.account_id).await?;
     state.database_executor.update_knowledge_base(base).await
 }

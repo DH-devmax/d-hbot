@@ -2,7 +2,7 @@
 
 ## 为什么要分层测试
 
-DH BOT 生产包由 Windows 开发机本地构建。构建脚本能证明指定源码可以通过 MSVC、扫描和打包，但仍需要真实旺商聊账号与桌面环境验证任务栏、托盘、窗口焦点和登录状态。正式验收分三层：
+DH BOT 生产包由 Windows 开发机本地构建。构建脚本能证明指定源码可以通过 MSVC、扫描和打包，但仍需要真实旺商聊账号与桌面环境验证任务栏、托盘、窗口焦点和登录状态。当前源码使用 schema v14、`commands/` 域命令、`runtime/` 模块和 QueueKernel 副作用队列。正式验收分三层：
 
 1. **本地构建层**：Rust、React、契约、生产隔离、NSIS 和 SHA-256。
 2. **Windows 自动探针层**：真实 EXE、WebView2、9222、旺商聊进程参数、普通最小化和退出残留。
@@ -31,16 +31,18 @@ Fixture 不参与这套测试。测试对象必须是 Windows 开发机生成并
 Set-ExecutionPolicy -Scope Process Bypass
 .\test-windows-real-machine.ps1 `
   -Artifact .\DH-BOT-3.0.0-beta.1-windows-x64-portable.zip `
-  -ExpectedSha256 EXE_SHA256 `
+  -ExpectedSha256 PORTABLE_EXE_SHA256 `
+  -SourceSha $(git rev-parse HEAD) `
+  -OutputDirectory "$env:USERPROFILE\Desktop\DH-BOT-Test-$(Get-Date -Format yyyyMMdd-HHmmss)" `
   -VerifyInteractiveExit
 ```
 
-`ExpectedSha256` 填同次本地构建的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值。当前个人发行的签名状态预期为 `NotSigned`，脚本将其记录为信息而不是失败。
+`ExpectedSha256` 填同次本地构建的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值；portable 内的 `DH-BOT-Portable.exe` 是它的同字节副本，脚本会在解压后校验该文件。`SourceSha` 固定本轮源码完整 SHA，避免报告引用旧基线。当前个人发行的签名状态预期为 `NotSigned`，脚本将其记录为信息而不是失败。
 
 脚本自动完成：
 
 - 解压到独立临时目录，并验证 portable 文件边界。
-- 校验 `DH-BOT.exe` 的 SHA-256，并记录 Authenticode 状态。
+- 校验 `DH-BOT-Portable.exe` 的 SHA-256，并记录 Authenticode 状态。
 - 检查 WebView2 Runtime。
 - 记录启动前是否已有 DH BOT 残留。
 - 启动真实 `DH-BOT.exe`，等待主窗口。
@@ -50,11 +52,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 - 等待操作员点击 X 并选择“退出 DH BOT”，检查主进程和 WebView2 子进程是否清理。
 - 确认 DH BOT 退出时没有顺带结束旺商聊。
 
-报告默认写到桌面的 `DH-BOT-Test-日期时间`：
+报告默认写到桌面的 `DH-BOT-Test-日期时间`（也可以用 `-OutputDirectory` 显式指定）：
 
 ```text
 DH-BOT-Windows-Real-Machine.json
 DH-BOT-Windows-Real-Machine.md
+TEST-REPORT.md
+TEST-RESULTS.json
+AUTOMATED-TESTS.log
+PROCESS-AND-PORTS.txt
+HASHES.txt
+FAILURE-CONTEXT.txt
+DH-BOT-Diagnostic-时间戳.zip
 ```
 
 把这两个文件交给本地或云电脑 Codex CLI 即可复盘，不必发送账号、Cookie、Token 或旺商聊数据库。

@@ -93,7 +93,10 @@ pub(crate) async fn search_rule_members(
 }
 
 #[tauri::command]
-pub(crate) async fn save_rule(state: State<'_, AppState>, mut rule: ModerationRule) -> AppResult<i64> {
+pub(crate) async fn save_rule(
+    state: State<'_, AppState>,
+    mut rule: ModerationRule,
+) -> AppResult<i64> {
     require_account(&state, &rule.account_id).await?;
     normalize_and_validate_rule(&mut rule)?;
     for group_id in &rule.group_ids {
@@ -116,7 +119,10 @@ pub(crate) async fn delete_rule(
 }
 
 #[tauri::command]
-pub(crate) async fn export_rules(state: State<'_, AppState>, account_id: String) -> AppResult<String> {
+pub(crate) async fn export_rules(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> AppResult<String> {
     let rules = state.database_executor.list_rules(account_id, None).await?;
     serde_json::to_string_pretty(&serde_json::json!({"version":2,"rules":rules}))
         .map_err(|error| AppError::new("rules_export", error.to_string()))

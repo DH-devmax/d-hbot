@@ -113,10 +113,7 @@ impl EffectMiddleware for ExpiryGuard {
         if let Some(expires_at) = ctx.item.expires_at {
             if expires_at <= self.clock.now() {
                 return DispatchDecision::Skip {
-                    reason: format!(
-                        "item {} expired at {}",
-                        ctx.item.id, expires_at
-                    ),
+                    reason: format!("item {} expired at {}", ctx.item.id, expires_at),
                 };
             }
         }
@@ -232,7 +229,6 @@ pub trait ClockSource: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-
 // ---------------------------------------------------------------------------
 // QueueKernel: top-level coordinator
 // ---------------------------------------------------------------------------
@@ -332,7 +328,12 @@ mod tests {
     use super::*;
     use crate::models::EffectOutboxItem;
 
-    fn make_item(id: i64, lane: &str, order_key: Option<&str>, expires_at: Option<DateTime<Utc>>) -> EffectOutboxItem {
+    fn make_item(
+        id: i64,
+        lane: &str,
+        order_key: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> EffectOutboxItem {
         EffectOutboxItem {
             id,
             account_id: "acc1".into(),

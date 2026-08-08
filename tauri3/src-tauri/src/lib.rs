@@ -4,11 +4,11 @@ mod activities;
 mod ai;
 mod bridge;
 mod build_channel;
-mod commands;
 mod business_apps;
 #[cfg(feature = "fixture")]
 mod calibration;
 mod cardnames;
+mod commands;
 mod contracts;
 mod database;
 mod defaults;
@@ -858,7 +858,10 @@ pub(crate) fn canonical_member(roster: &MemberRoster, user_id: i64) -> AppResult
     Ok(member)
 }
 
-pub(crate) fn canonical_member_ref(roster: &MemberRoster, requested: &MemberRef) -> AppResult<Member> {
+pub(crate) fn canonical_member_ref(
+    roster: &MemberRoster,
+    requested: &MemberRef,
+) -> AppResult<Member> {
     let requested_user_id = requested.user_id.filter(|value| *value > 0);
     let requested_nim_id = requested
         .nim_id
@@ -885,7 +888,10 @@ pub(crate) fn canonical_member_ref(roster: &MemberRoster, requested: &MemberRef)
     canonical_member(roster, matches[0].user_id)
 }
 
-pub(crate) async fn require_account(state: &State<'_, AppState>, account_id: &str) -> AppResult<i64> {
+pub(crate) async fn require_account(
+    state: &State<'_, AppState>,
+    account_id: &str,
+) -> AppResult<i64> {
     let (sender_id, current_account) = state.gateway.session_identity().await?;
     if current_account == account_id {
         Ok(sender_id)

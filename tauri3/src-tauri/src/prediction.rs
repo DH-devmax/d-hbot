@@ -438,8 +438,7 @@ impl PublicLotterySource {
                 format!("中国福彩网公开数据返回 HTTP {}", response.status()),
             ));
         }
-        let bytes =
-            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "中国福彩网公开数据").await?;
+        let bytes = read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "中国福彩网公开数据").await?;
         let snapshot = parse_cwl_snapshot(game, &bytes).ok_or_else(|| {
             AppError::new(
                 "prediction_public_contract",
@@ -474,8 +473,7 @@ impl PublicLotterySource {
                 format!("公开 Keno 回退源返回 HTTP {}", response.status()),
             ));
         }
-        let bytes =
-            read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "公开 Keno 回退源").await?;
+        let bytes = read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "公开 Keno 回退源").await?;
         let snapshot = parse_public_keno_snapshot(game, &bytes).ok_or_else(|| {
             AppError::new("prediction_public_contract", "公开 Keno 回退源格式无法识别")
         })?;
@@ -518,7 +516,8 @@ impl PublicLotterySource {
                 ));
                 continue;
             }
-            let bytes = match read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "开奖数据响应").await
+            let bytes = match read_capped_body(response, PUBLIC_RESPONSE_LIMIT, "开奖数据响应")
+                .await
             {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -1383,7 +1382,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let error = read_capped_body(response, 1024, "测试源").await.unwrap_err();
+        let error = read_capped_body(response, 1024, "测试源")
+            .await
+            .unwrap_err();
         assert_eq!(error.code, "prediction_public_response");
         assert_eq!(error.message, "测试源超过大小限制");
         worker.join().unwrap();

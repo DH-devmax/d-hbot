@@ -336,9 +336,7 @@ impl BackendRuntime {
             prediction_narration_pending: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             ai_rule_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             coordination: RuntimeCoordination::default(),
-            queue_kernel: Arc::new(crate::queue_kernel::QueueKernel::new(Arc::new(
-                SystemClock,
-            ))),
+            queue_kernel: Arc::new(crate::queue_kernel::QueueKernel::new(Arc::new(SystemClock))),
         }
     }
 
@@ -500,21 +498,36 @@ impl BackendRuntime {
                                 .run_chain(item.clone(), account_id.clone())
                                 .await;
                             let chain_micros = chain_start.elapsed().as_micros() as u64;
-                            self.coordination.dispatch_stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.coordination.dispatch_stats.chain_micros.fetch_add(chain_micros, std::sync::atomic::Ordering::Relaxed);
+                            self.coordination
+                                .dispatch_stats
+                                .dispatched
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.coordination
+                                .dispatch_stats
+                                .chain_micros
+                                .fetch_add(chain_micros, std::sync::atomic::Ordering::Relaxed);
                             match outcome {
                                 ChainOutcome::Skip { reason } => {
-                                    self.coordination.dispatch_stats.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.coordination
+                                        .dispatch_stats
+                                        .skipped
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.skip_effect_item(&item, &reason).await;
                                     dispatched += 1;
                                 }
                                 ChainOutcome::Fail { error } => {
-                                    self.coordination.dispatch_stats.rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.coordination
+                                        .dispatch_stats
+                                        .rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.reject_effect_item(&item, &error, false).await;
                                     dispatched += 1;
                                 }
                                 ChainOutcome::Retry { error } => {
-                                    self.coordination.dispatch_stats.rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.coordination
+                                        .dispatch_stats
+                                        .rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     self.reject_effect_item(&item, &error, true).await;
                                     dispatched += 1;
                                 }
@@ -522,7 +535,10 @@ impl BackendRuntime {
                                     order_guard,
                                     lane_permit,
                                 } => {
-                                    self.coordination.dispatch_stats.proceeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.coordination
+                                        .dispatch_stats
+                                        .proceeded
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     let work_id = runtime_lane_id(
                                         &item.effect_type,
                                         &item.account_id,
@@ -2056,7 +2072,8 @@ impl BackendRuntime {
                                     .clone()
                                     .unwrap_or_else(|| member_event_ids.join("|"));
                                 if reported_member_event_mismatches.len() < MAX_REPORTED_SET
-                                    && reported_member_event_mismatches.insert(mismatch_key) {
+                                    && reported_member_event_mismatches.insert(mismatch_key)
+                                {
                                     self.logger.write(
                                         "WARN",
                                         &format!(
@@ -4685,7 +4702,11 @@ mod tests {
     fn unlocked_members_never_accumulate_rename_violations() {
         // 没有锁定群名片的成员自行改名不属于违规，避免 rename_count 规则误伤。
         assert!(!is_external_member_card_update(
-            true, false, "原名", "自己改的名", false
+            true,
+            false,
+            "原名",
+            "自己改的名",
+            false
         ));
     }
 
@@ -5287,11 +5308,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let permit = runtime
-            .gateway
-            .automatic_write_permit()
-            .await
-            .unwrap();
+        let permit = runtime.gateway.automatic_write_permit().await.unwrap();
         let first = runtime
             .database
             .claim_effect_outbox(Some(FIXTURE_ACCOUNT.into()), 1)
