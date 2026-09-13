@@ -62,7 +62,17 @@ if ((Test-Path $Zip) -and $HashFiles.FullName -notcontains (Get-Item $Zip).FullN
   $HashFiles += Get-Item $Zip
 }
 $Hashes = $HashFiles | Sort-Object Name | ForEach-Object {
-  $Hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+  $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $Stream = [System.IO.File]::OpenRead($_.FullName)
+    try {
+      $Hash = ([System.BitConverter]::ToString($Sha256.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant()
+    } finally {
+      $Stream.Dispose()
+    }
+  } finally {
+    $Sha256.Dispose()
+  }
   "$Hash  $($_.Name)"
 }
 $Hashes | Set-Content (Join-Path $Dist 'SHA256SUMS.txt') -Encoding ascii

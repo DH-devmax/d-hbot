@@ -2,13 +2,13 @@
 
 ## 为什么要分层测试
 
-DH BOT 生产包由 Windows 开发机本地构建。构建脚本能证明指定源码可以通过 MSVC、扫描和打包，但仍需要真实旺商聊账号与桌面环境验证任务栏、托盘、窗口焦点和登录状态。当前源码使用 schema v14、`commands/` 域命令、`runtime/` 模块和 QueueKernel 副作用队列。正式验收分三层：
+DH BOT 生产包由 GitHub Actions 的 Windows runner 构建。构建脚本能证明指定源码可以通过 MSVC、扫描和打包，但仍需要真实旺商聊账号与桌面环境验证任务栏、托盘、窗口焦点和登录状态。当前源码使用 schema v14、`commands/` 域命令、`runtime/` 模块和 QueueKernel 副作用队列。正式验收分三层：
 
 1. **本地构建层**：Rust、React、契约、生产隔离、NSIS 和 SHA-256。
 2. **Windows 自动探针层**：真实 EXE、WebView2、9222、旺商聊进程参数、普通最小化和退出残留。
 3. **人工桌面层**：图标观感、任务栏点击、X 关闭提示、账号登录状态复用。
 
-Fixture 不参与这套测试。测试对象必须是 Windows 开发机生成并准备上传云盘的同一份未签名生产包，不使用历史 artifact 或开发 Fixture 包。
+Fixture 不参与这套测试。测试对象必须是 Actions 生成并准备发布的同一份未签名生产包，不使用历史 artifact 或开发 Fixture 包。
 
 ## 推荐环境
 
@@ -22,8 +22,8 @@ Fixture 不参与这套测试。测试对象必须是 Windows 开发机生成并
 
 把以下两个文件放在同一台 Windows 电脑：
 
-- Windows 本地构建的 `DH-BOT-*-windows-x64-portable.zip`
-- 私有源码中的 `tauri3/scripts/test-windows-real-machine.ps1`
+- GitHub Actions 生成的 `DH-BOT-*-windows-x64-portable.zip`
+- 源码仓库中的 `tauri3/scripts/test-windows-real-machine.ps1`
 
 在 PowerShell 中执行：
 
@@ -37,7 +37,7 @@ Set-ExecutionPolicy -Scope Process Bypass
   -VerifyInteractiveExit
 ```
 
-`ExpectedSha256` 填同次本地构建的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值；portable 内的 `DH-BOT-Portable.exe` 是它的同字节副本，脚本会在解压后校验该文件。`SourceSha` 固定本轮源码完整 SHA，避免报告引用旧基线。当前个人发行的签名状态预期为 `NotSigned`，脚本将其记录为信息而不是失败。
+`ExpectedSha256` 填同次 Actions 构建的 `SHA256SUMS.txt` 中 `DH-BOT.exe` 对应值；portable 内的 `DH-BOT-Portable.exe` 是它的同字节副本，脚本会在解压后校验该文件。`SourceSha` 固定本轮源码完整 SHA，避免报告引用旧基线。当前个人发行的签名状态预期为 `NotSigned`，脚本将其记录为信息而不是失败。
 
 脚本自动完成：
 

@@ -1,0 +1,273 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_real_machine:
+        description: '在已注册的 Windows 实机 runner 上执行真实桌面探针'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: tauri3/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install JavaScript dependencies
+        working-directory: tauri3
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browser
+        working-directory: tauri3
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Contract sanitizer tests
+        working-directory: tauri3
+        run: pnpm test:contract-sanitizer
+
+      - name: Production isolation tests
+        working-directory: tauri3
+        run: pnpm test:production-isolation
+
+      - name: Production Rust tests
+        working-directory: tauri3
+        run: pnpm test:production
+
+      - name: Fixture Rust tests
+        working-directory: tauri3
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --lib --bins --jobs 1
+
+      - name: Frontend tests
+        working-directory: tauri3
+        run: pnpm test:ui
+
+      - name: Fixture end-to-end tests
+        working-directory: tauri3
+        run: pnpm test:e2e:fixture
+
+      - name: Production Clippy
+        working-directory: tauri3
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
+
+      - name: Fixture Clippy
+        working-directory: tauri3
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --features fixture --all-targets -- -D warnings
+
+      - name: Production frontend build
+        working-directory: tauri3
+        run: pnpm build:production
+
+      - name: Production Rust build
+        working-directory: tauri3
+        run: pnpm build:rust:production
+
+      - name: Documentation and redaction gates
+        working-directory: tauri3
+        run: pnpm verify:docs
+
+  windows-production:
+    name: Windows production package
+    needs: quality
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: tauri3/pnpm-lock.yaml
+
+      - name: Setup Rust MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Ensure 7-Zip is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command 7z.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) {
+            choco install 7zip --no-progress -y
+          }
+
+      - name: Install JavaScript dependencies
+        working-directory: tauri3
+        run: pnpm install --frozen-lockfile
+
+      - name: Fixture CDP integration tests
+        working-directory: tauri3
+        env:
+          DH_FIXTURE_HEADLESS: '1'
+        shell: pwsh
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp -- --test-threads=1
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -lt $maxAttempts) {
+              Write-Host "Fixture CDP attempt $attempt failed; retrying after browser cleanup"
+              Start-Sleep -Seconds 3
+            }
+          }
+          exit 1
+
+      - name: Compile runtime headless CDP test
+        working-directory: tauri3
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test runtime_headless_cdp --no-run
+
+      - name: Verify production build boundary
+        working-directory: tauri3
+        run: pnpm verify:production:boundary
+
+      - name: Build Windows production application
+        working-directory: tauri3
+        run: pnpm tauri:build:production
+
+      - name: Package Windows production artifacts
+        working-directory: tauri3
+        run: pnpm package:windows:production
+
+      - name: Verify Windows production artifacts
+        working-directory: tauri3
+        run: pnpm verify:windows:production
+
+      - name: Upload Windows production artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-production-${{ github.sha }}
+          path: tauri3/dist/production
+          if-no-files-found: error
+          retention-days: 14
+
+  real-machine:
+    name: Windows real machine acceptance
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_real_machine == true }}
+    needs: windows-production
+    runs-on: [self-hosted, windows, dh-bot-real]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download production artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-production-${{ github.sha }}
+          path: tauri3/dist/production
+
+      - name: Run real machine probe
+        shell: pwsh
+        working-directory: tauri3
+        run: |
+          $portable = Get-ChildItem .\dist\production -Filter '*-portable.zip' | Select-Object -First 1
+          if (-not $portable) { throw '生产 artifact 中没有 portable ZIP' }
+          $exeHashLine = Get-Content .\dist\production\SHA256SUMS.txt |
+            Where-Object { $_ -match '^([0-9a-fA-F]{64})  DH-BOT\.exe$' } |
+            Select-Object -First 1
+          if (-not $exeHashLine) { throw 'SHA256SUMS.txt 中没有 DH-BOT.exe 哈希' }
+          $expectedHash = [regex]::Match($exeHashLine, '^([0-9a-fA-F]{64})').Groups[1].Value
+          $reportDirectory = Join-Path $env:GITHUB_WORKSPACE 'real-machine-report'
+          New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+          .\scripts\test-windows-real-machine.ps1 `
+            -Artifact $portable.FullName `
+            -ExpectedSha256 $expectedHash `
+            -SourceSha '${{ github.sha }}' `
+            -OutputDirectory $reportDirectory `
+            -VerifyInteractiveExit
+
+      - name: Upload real machine report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-real-machine-${{ github.sha }}
+          path: |
+            real-machine-report/**
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows production artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-production-${{ github.sha }}
+          path: release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*.exe
+            release-assets/*.zip
+            release-assets/*.txt
+            release-assets/*.pdf
+            release-assets/*.md

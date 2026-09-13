@@ -61,11 +61,11 @@ pnpm verify:docs
 
 `pnpm verify:docs` 依次运行 `tools/verify_docs.py`、`tools/verify_doc_references.py` 和 `tools/verify_repository_redaction.py`，分别核对版本与 Markdown 相对链接、纯文本文件名引用、以及凭据与真实身份残留。
 
-所有测试和开发构建在开发机执行，两个当前 GitHub 仓库 Actions 均停用。ZCG 基线协议更新需完成路由、参数和 envelope 测试；旺商聊专有写能力仍需采集、脱敏、回放 Contract v2，并通过首次手工回读。
+通用测试和生产构建由本仓库 GitHub Actions 执行，Windows 生产包在 Windows runner 上生成；真实旺商聊写能力仍需采集、脱敏、回放 Contract v2，并通过首次手工回读。ZCG 基线协议更新需完成路由、参数和 envelope 测试。
 
-生产发布只在受控 Windows 开发机执行：固定经过本地验收的源码 commit SHA，完成 MSVC/NSIS/portable 构建、生产包深度扫描和真实桌面验收。生产包使用 `--no-default-features`，Fixture 不参与构建或发行。
+生产发布在 GitHub Actions 的 Windows runner 执行：固定触发提交 SHA，完成 MSVC/NSIS/portable 构建和生产包深度扫描；真实桌面验收使用带 `dh-bot-real` 标签的自托管 Windows runner 手动触发。生产包使用 `--no-default-features`，Fixture 不参与构建或发行。
 
-Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针只存在于私有源码仓库，不复制到 NSIS、portable 或公开发行仓库。
+Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`，详细步骤见 [WINDOWS-REAL-MACHINE-TEST.md](WINDOWS-REAL-MACHINE-TEST.md)。该探针保留在源码仓库，不复制到 NSIS、portable 或发行附件。
 
 上传云盘前还必须确认：源码工作树干净、记录完整 commit SHA、应用版本与文件名一致、生产隔离扫描通过、Windows 实机报告通过、`SHA256SUMS.txt` 与待上传文件一致。已有文件使用新版本号，不覆盖旧包。
 
@@ -73,19 +73,19 @@ Windows 实机桌面验收使用 `tauri3/scripts/test-windows-real-machine.ps1`�
 
 ### Windows 发布追加门禁
 
-涉及 Windows 发布时，还必须在受控 Windows 机器执行 MSVC 生产构建、生产包扫描和 `scripts/test-windows-real-machine.ps1`。未通过真实旺商聊连接、登录复用、任务栏/托盘、退出残留和 DPI 检查前，不得标记为 RC 或正式版。
+涉及 Windows 发布时，GitHub Actions 必须完成 MSVC 生产构建和生产包扫描；再在带 `dh-bot-real` 标签的自托管 Windows runner 执行 `scripts/test-windows-real-machine.ps1`。未通过真实旺商聊连接、登录复用、任务栏/托盘、退出残留和 DPI 检查前，不得标记为 RC 或正式版。
 
 ## 协作范围
 
-- 协作者只加入私有源码仓库 `DH-devmax/d-hbot`。
+- 协作者只加入源码仓库 `DH-devmax/d-hbot`，通过 Pull Request 协作。
 - `DH-devmax/d-hbot-releases` 不授予源码写入权限，继续作为下载说明和历史索引。
 - 旧账号仓库不参与当前开发线路。
-- 协作者不得接触真实旺商聊账号、Cookie、Token、个人访问令牌、AI 密钥、云盘凭据或原始协议采集目录。
+- 协作者不得接触真实旺商聊账号、Cookie、Token、个人访问令牌、AI 密钥、云盘凭据或原始协议采集目录；这些内容不进入公开仓库和 Actions 日志。
 - Fixture、测试数据库和测试端口只用于本地开发，不进入生产包和云盘。
 
 ## 建议权限
 
-第二 GitHub 账号使用独立账号登录，通过 Pull Request 协作。默认授予私有源码仓库 `Write` 权限；需要管理仓库设置时再临时提升为 `Maintain`。不直接授予 `Admin`，不共享个人访问令牌。
+协作者使用独立账号登录，通过 Pull Request 协作。默认授予仓库必要的写权限；需要管理仓库设置时再临时提升为 `Maintain`。不直接授予 `Admin`，不共享个人访问令牌。
 
 协作者的分支命名使用 `codex/<topic>` 或 `<username>/<topic>`，禁止直接向 `main` 推送。合并前至少完成一次审阅，并确认改动没有混入 Fixture、测试数据、密钥或生产发布文件。
 
@@ -113,7 +113,7 @@ git config user.email
 
 ## 生产发布边界
 
-- 构建、扫描、打包和发布全部在本地完成，GitHub Actions 保持停用。
+- 构建、扫描、打包和 tag 发布由 `.github/workflows/ci.yml` 执行；真实旺商聊桌面验收通过手动 workflow 在带 `dh-bot-real` 标签的自托管 Windows runner 上执行。
 - 发行包只包含生产 EXE、portable ZIP、手册、默认规则和 `SHA256SUMS.txt`。
 - 不得发布 Fixture、开发 EXE、`9233/51300`、源码、PDB、Source Map、测试数据库、PFX、私钥、密码、Token、Cookie 或原始协议。
 - 云盘上传后必须重新下载并用 SHA-256 回读校验。

@@ -17,7 +17,7 @@ DH BOT 是使用 Rust、Tauri v2 和 React 构建的 Windows 旺商聊 AI 群管
 
 ## 本地构建与测试
 
-私有源码仓库不运行 GitHub Actions。生产、Fixture 和界面测试均在开发机完成；生产版固定连接 `127.0.0.1:9222`，编译时移除所有 Fixture 入口：
+仓库通过 GitHub Actions 执行生产、Fixture、界面和 Windows 打包门禁；生产版固定连接 `127.0.0.1:9222`，编译时移除所有 Fixture 入口：
 
 ```sh
 cd tauri3
@@ -40,7 +40,7 @@ pnpm tauri:build:developer
 
 提交前还需执行 `pnpm verify:docs`，核对版本、schema、文档链接、凭据和真实身份脱敏。
 
-Windows 开发机在提交生产发布前还需执行生产打包、深度扫描和实机探针。完整顺序见 [`docs/ENGINEERING-STANDARDS.md`](docs/ENGINEERING-STANDARDS.md)。
+Windows runner 在提交生产发布前执行生产打包和深度扫描；真实桌面探针通过手动 workflow 在自托管 runner 上执行。完整顺序见 [`docs/ENGINEERING-STANDARDS.md`](docs/ENGINEERING-STANDARDS.md)。
 
 ## 目录
 
@@ -78,7 +78,7 @@ Windows 开发机在提交生产发布前还需执行生产打包、深度扫描
 
 - 生产数据：`%APPDATA%\DH\3.0`
 - 开发 Fixture 数据：`%APPDATA%\DH\fixture`
-- 核心源码仓库保持私有，GitHub Actions 停用；生产构建与测试只在受控 Windows 开发机执行。
+- 核心源码仓库已开源；GitHub Actions 在 Linux 上执行通用门禁，在 Windows runner 上构建和扫描生产包，真实旺商聊桌面验收仍需手动触发的自托管 Windows runner。
 - 个人发行采用未签名便携 ZIP，随包提供 `SHA256SUMS.txt`，通过管理员公布的云盘链接分发。
 - [`DH-devmax/d-hbot-releases`](https://github.com/DH-devmax/d-hbot-releases) 仅作为可选下载说明或历史索引，不构建程序、不保存源码和 Fixture。
 - Windows 首次启动可能显示“未知发布者”或 SmartScreen 提示，这是当前未签名个人发行的预期状态。
