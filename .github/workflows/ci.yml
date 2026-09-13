@@ -158,7 +158,11 @@ jobs:
         working-directory: tauri3
         env:
           DH_FIXTURE_HEADLESS: '1'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp --test runtime_headless_cdp -- --test-threads=1
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp -- --test-threads=1
+
+      - name: Compile runtime headless CDP test
+        working-directory: tauri3
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test runtime_headless_cdp --no-run
 
       - name: Verify production build boundary
         working-directory: tauri3
