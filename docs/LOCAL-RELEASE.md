@@ -1,14 +1,14 @@
 # DH BOT Windows 本地发行步骤
 
-DH BOT 不使用 GitHub Actions 构建程序：
+DH BOT 使用 GitHub Actions 执行自动门禁和 Windows 生产打包：
 
 | 仓库 | 用途 | Actions |
 |---|---|---|
-| `DH-devmax/d-hbot` | 私有 Rust/Tauri 源码、Fixture、脱敏契约和本地工具 | 停用 |
-| `DH-devmax/d-hbot-releases` | 可选下载说明与历史发行索引 | 停用 |
+| `DH-devmax/d-hbot` | 开源 Rust/Tauri 源码、Fixture、脱敏契约和 CI | 已启用：Linux 门禁、Windows 生产包、tag Release |
+| `DH-devmax/d-hbot-releases` | 可选下载说明与历史发行索引 | 不使用 |
 | `sh492773746/*` | 旧账号归档 | 不参与当前线路 |
 
-测试、Windows MSVC 构建、NSIS/portable 打包、生产隔离扫描和真实桌面验收都在开发机本地完成。GitHub 不保存签名证书、源码读取 Token 或构建产物。
+通用测试、Windows MSVC 构建、NSIS/portable 打包和生产隔离扫描由 GitHub Actions 完成；真实桌面验收仍在带 `dh-bot-real` 标签的自托管 Windows runner 上手动触发。GitHub 不保存签名证书、源码读取 Token 或真实旺商聊数据。
 
 ## 1. 固定源码
 
@@ -47,7 +47,7 @@ pnpm verify:windows:production
 tauri3\dist\production\DH-BOT.exe
 tauri3\dist\production\DH-BOT-VERSION-windows-x64-setup.exe
 tauri3\dist\production\SHA256SUMS.txt
-tauri3\dist\DH-BOT-VERSION-windows-x64-portable.zip
+tauri3\dist\production\DH-BOT-VERSION-windows-x64-portable.zip
 ```
 
 打包脚本不会读取 PFX 或执行代码签名。`SHA256SUMS.txt` 同时记录主程序、安装包、文档、规则模板和 portable ZIP。当前个人发行不要求 Authenticode；未签名 portable ZIP 是预期发布形态。任何自签名测试证书、PFX、密码和密钥都不得进入包或云盘。
@@ -77,9 +77,9 @@ tauri3\dist\DH-BOT-VERSION-windows-x64-portable.zip
 
 自签名根证书、PFX 和密码不随包发布，也不要求用户安装根证书。
 
-## 6. 远端 Actions 只读核对
+## 6. 远端 Actions 核对
 
-以下命令用于确认远端没有活动 workflow：
+以下命令用于确认 CI workflow 和仓库 Actions 权限：
 
 ```text
 gh workflow list --repo DH-devmax/d-hbot
@@ -88,6 +88,6 @@ gh api repos/DH-devmax/d-hbot/actions/permissions
 gh api repos/DH-devmax/d-hbot-releases/actions/permissions
 ```
 
-两个权限接口都应返回 `enabled: false`，workflow 列表应为空。后续若采用公共信任代码签名或恢复 GitHub Release，需要先更新本规范和长期记忆，再建立新的独立发布方案。
+`DH-devmax/d-hbot` 应返回 `enabled: true`，并列出 `CI` workflow；发行仓库保持不参与构建。tag `v*` 会由 CI 创建 GitHub Release，普通 push/PR 只上传短期保留的 Actions artifact。
 
-最近只读核对：2026-08-01，两个权限接口均返回 `enabled: false`，两个 workflow 列表均为空。
+最近核对以 GitHub Actions 页面为准；源码仓库应显示 `CI` workflow 为 enabled，发行仓库不需要 workflow。

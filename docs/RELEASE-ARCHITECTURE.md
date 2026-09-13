@@ -2,21 +2,21 @@
 
 ## 归属
 
-- `DH-devmax/d-hbot`：私有源码仓库，Actions 停用。
-- `DH-devmax/d-hbot-releases`：可选下载说明或历史索引，Actions 停用。
-- Windows 开发机：唯一生产构建、扫描和实机验收环境。
+- `DH-devmax/d-hbot`：开源源码仓库，Actions 执行 Linux 门禁、Windows 生产打包和 tag Release。
+- `DH-devmax/d-hbot-releases`：可选下载说明或历史索引，不参与构建。
+- GitHub Actions Windows runner：生产构建、扫描和 artifact 生成环境；带 `dh-bot-real` 标签的自托管 runner 执行真实桌面验收。
 - 管理员云盘：个人用户下载 portable ZIP、手册和 SHA-256 清单的位置。
 
 ## 发布数据流
 
 ```text
 固定源码 commit
-  -> 本地自动测试
-  -> Windows --no-default-features 生产构建
+  -> GitHub Actions Linux 自动测试
+  -> GitHub Actions Windows --no-default-features 生产构建
   -> NSIS 与 portable 深度隔离扫描
-  -> Windows 真实桌面验收
+  -> 自托管 Windows runner 真实桌面验收（手动）
   -> 生成 SHA256SUMS.txt
-  -> 上传管理员云盘
+  -> tag 自动创建 GitHub Release / 可选上传管理员云盘
   -> 下载后复核 SHA-256
 ```
 

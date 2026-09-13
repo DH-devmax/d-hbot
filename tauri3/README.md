@@ -16,9 +16,10 @@ On first run it archives legacy `dh.db` and `secrets.dat` under
 `%APPDATA%\\DH\\legacy-backups\\<timestamp>` and does not migrate test data.
 AI starts with empty URLs and key, and model `deepseek-v4-pro`.旺商聊 keeps its
 own Electron login data; Windows startup uses the fixed `dh-primary` partition
-after a version-checked, backed-up script patch. A controlled Windows developer
-machine creates the NSIS installer with bundled WebView2 and the portable ZIP
-after Beta.2 device checks; GitHub Actions are not part of this release path.
+after a version-checked, backed-up script patch. GitHub Actions runs the
+reproducible checks and Windows production packaging on every main-branch change
+and version tag. Real WangShangLiao desktop acceptance remains a manual step on
+a registered Windows machine after the package is built.
 
 Development:
 
