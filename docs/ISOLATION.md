@@ -22,10 +22,10 @@
 
 ## 仓库与发布
 
-- 私有源码：`DH-devmax/d-hbot`，保存 Rust/Tauri、脱敏契约、Fixture 和本地测试工具；Actions 停用，不生成构建产物。
-- 生产构建：只在受控 Windows 开发机执行，使用 `--no-default-features`，构建后进行生产隔离扫描和实机验收。
+- 源码：`DH-devmax/d-hbot`，保存 Rust/Tauri、脱敏契约、Fixture 和 CI；Actions 生成短期保留的测试与生产构建 artifact。
+- 生产构建：由 GitHub Actions 的 Windows runner 执行，使用 `--no-default-features`，构建后进行生产隔离扫描；真实桌面验收在自托管 Windows runner 执行。
 - 个人发行：上传未签名 portable ZIP 与 `SHA256SUMS.txt` 到管理员控制的云盘。
-- 公开发行仓库：`DH-devmax/d-hbot-releases` 只保留下载说明或历史索引，Actions 停用，不保存源码、Fixture、证书或构建凭据。
+- 公开发行仓库：`DH-devmax/d-hbot-releases` 只保留下载说明或历史索引，不保存源码、Fixture、证书或构建凭据。
 - 旧仓库 `sh492773746/d-hbot` 与 `sh492773746/d-hbot-releases` 仅作为历史归档，当前 Actions 不再依赖。
 - 云盘目录只包含 portable ZIP、可选安装包、手册、规则模板和 `SHA256SUMS.txt`，不上传 PFX、密码、Token、源码、PDB 或 Source Map。
 
@@ -36,7 +36,7 @@
 - 旧账号仓库不接受新线路的提交或发布投递。
 - `.githooks/pre-commit` 与 `.githooks/pre-push` 会核对远端所有者、活动 `gh` 账号和 Git 作者；账号不一致时停止。
 
-两个当前仓库均停用 Actions。云盘文件、校验清单和实机报告不得包含私有源码、Token、证书、原始协议或真实群数据。
+源码仓库 Actions 只读取公开代码并上传构建结果；云盘文件、校验清单和实机报告不得包含 Token、证书、原始协议或真实群数据。
 
 提交前必须同时通过 `pnpm verify:docs`、Contract sanitizer 和生产隔离检查。仓库脱敏扫描会读取 Git 跟踪文件及归档 ZIP；真实测试群、长消息 ID、用户主目录、Bearer/JWT、私钥和常见 API/GitHub 密钥格式均视为失败。
 

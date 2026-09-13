@@ -45,7 +45,7 @@ Select-String -Path tauri3\src-tauri\src\diagnostics.rs -Pattern 'defaultRespons
 
 ## 2. 测试对象
 
-1. 在 Windows 开发机从一个干净、确定的完整源码 SHA 构建。
+1. 由 GitHub Actions 在 Windows runner 从一个干净、确定的完整源码 SHA 构建。
 2. 测试对象必须是准备上传云盘的同一份 production portable ZIP。
 3. 不使用旧 beta、历史下载包、Fixture 包或 macOS 产物。
 4. 首轮用 portable，第二轮用 NSIS 安装版；普通用户跑一次，管理员用户再跑一次。

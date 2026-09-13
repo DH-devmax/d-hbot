@@ -2,7 +2,7 @@
 
 你正在 Windows 真实桌面环境验收 DH BOT 3.0。先完整阅读同目录的：
 
-1. DH-BOT-WINDOWS-CONTEXT.md
+1. WINDOWS-ACCEPTANCE.md
 2. WINDOWS-REAL-MACHINE-TEST.md
 3. REAL-GROUP-TEST-20260731.md
 4. DIAGNOSTICS-AND-SUPPORT.md
@@ -19,7 +19,7 @@
 - 错误时保留日志和支持包，不只描述 UI 提示。
 - 不修改源码；发现问题时先给出最小复现、日志证据、推定模块和建议修复，不直接提交。
 
-完成后按 DH-BOT-WINDOWS-CONTEXT.md 的“结果回填格式”生成：
+完成后按 WINDOWS-ACCEPTANCE.md 的“结果回填格式”生成：
 
 - DH-BOT-Windows-Real-Machine.md
 - DH-BOT-Windows-Real-Machine.json

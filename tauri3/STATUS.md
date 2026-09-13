@@ -68,7 +68,7 @@
 - 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
 - 旧 beta.1 Windows 包曾通过本地隔离和 SHA-256 校验，但其文件哈希已过期，不作为当前发布证据。当前个人发行正式采用未签名 portable ZIP；每次 Windows 构建必须生成新的 `SHA256SUMS.txt` 并完成实机验收。
 - Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
-- 构建归属已调整为“两个 GitHub 仓库均停用 Actions，Windows 开发机本地生产构建，云盘个人分发”。发行仓库仅保留下载说明或历史索引。
+- 构建归属已调整为“源码仓库 GitHub Actions 执行通用门禁、Windows 生产打包和 tag Release；真实旺商聊桌面验收使用带 `dh-bot-real` 标签的自托管 Windows runner”。发行仓库仅保留下载说明或历史索引。
 - 本地日志改为 JSONL，带会话 ID 与递增序号，按日期/8 MiB 分段并执行 30 天/64 MiB 保留策略；统一脱敏 API Key、Token、Cookie、Authorization、密码和本机用户路径。
 - 调试页新增“生成诊断包”：使用原子 ZIP 写入和互不覆盖的文件名，包含脱敏连接/能力状态、数据库完整性摘要、匿名化审计、近期脱敏日志、`manifest.json` 与 `SHA256SUMS.txt`；不导出数据库、密钥、旺商聊登录数据或原始群消息。诊断包保留上限为 20 个、30 天和 128 MiB。
 
