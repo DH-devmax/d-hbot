@@ -72,6 +72,16 @@ jobs:
         working-directory: tauri3
         run: pnpm exec playwright install --with-deps chromium
 
+      - name: Select Playwright Chromium for Rust fixture tests
+        shell: bash
+        run: |
+          chromium_path="$(find "$HOME/.cache/ms-playwright" -type f -path '*/chrome-linux*/chrome' -print -quit)"
+          if [ -z "$chromium_path" ]; then
+            echo 'Playwright Chromium binary not found' >&2
+            exit 1
+          fi
+          echo "DH_FIXTURE_BROWSER=$chromium_path" >> "$GITHUB_ENV"
+
       - name: Contract sanitizer tests
         working-directory: tauri3
         run: pnpm test:contract-sanitizer
@@ -86,8 +96,6 @@ jobs:
 
       - name: Fixture Rust tests
         working-directory: tauri3
-        env:
-          DH_FIXTURE_BROWSER: /usr/bin/chromium
         run: pnpm test:fixture
 
       - name: Frontend tests
