@@ -80,7 +80,10 @@ jobs:
             echo 'Playwright Chromium binary not found' >&2
             exit 1
           fi
-          echo "DH_FIXTURE_BROWSER=$chromium_path" >> "$GITHUB_ENV"
+          wrapper="$RUNNER_TEMP/dh-fixture-chromium"
+          printf '#!/usr/bin/env bash\nexec %q --disable-dev-shm-usage --disable-gpu --no-zygote "$@"\n' "$chromium_path" > "$wrapper"
+          chmod +x "$wrapper"
+          echo "DH_FIXTURE_BROWSER=$wrapper" >> "$GITHUB_ENV"
 
       - name: Contract sanitizer tests
         working-directory: tauri3
@@ -96,7 +99,13 @@ jobs:
 
       - name: Fixture Rust tests
         working-directory: tauri3
-        run: pnpm test:fixture
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --lib --bins --jobs 1
+
+      - name: Fixture CDP integration tests
+        working-directory: tauri3
+        env:
+          DH_FIXTURE_HEADLESS: '1'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp --test runtime_headless_cdp -- --test-threads=1
 
       - name: Frontend tests
         working-directory: tauri3
