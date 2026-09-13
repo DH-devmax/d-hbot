@@ -86,6 +86,8 @@ jobs:
 
       - name: Fixture Rust tests
         working-directory: tauri3
+        env:
+          DH_FIXTURE_BROWSER: /usr/bin/chromium
         run: pnpm test:fixture
 
       - name: Frontend tests
