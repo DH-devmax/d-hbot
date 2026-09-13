@@ -158,7 +158,18 @@ jobs:
         working-directory: tauri3
         env:
           DH_FIXTURE_HEADLESS: '1'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp -- --test-threads=1
+        shell: pwsh
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            cargo test --manifest-path src-tauri/Cargo.toml --features fixture --test fixture_cdp -- --test-threads=1
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -lt $maxAttempts) {
+              Write-Host "Fixture CDP attempt $attempt failed; retrying after browser cleanup"
+              Start-Sleep -Seconds 3
+            }
+          }
+          exit 1
 
       - name: Compile runtime headless CDP test
         working-directory: tauri3
