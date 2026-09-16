@@ -1,0 +1,155 @@
+{
+  "checked_at": "2026-09-16T15:49:20.537419+00:00",
+  "instances": {
+    "A": {
+      "cases": {
+        "T01": {
+          "ledger": [
+            [
+              "in",
+              "text",
+              "queued",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": [
+            [
+              "processed",
+              1,
+              1
+            ]
+          ]
+        },
+        "T02": {
+          "ledger": [
+            [
+              "in",
+              "text",
+              "queued",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": [
+            [
+              "processed",
+              1,
+              1
+            ]
+          ]
+        },
+        "T03": {
+          "ledger": [
+            [
+              "out",
+              "text",
+              "ignored",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": []
+        },
+        "T04": {
+          "ledger": [
+            [
+              "in",
+              "text",
+              "queued",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": [
+            [
+              "processed",
+              1,
+              1
+            ]
+          ]
+        }
+      },
+      "send_states": [
+        [
+          "sent",
+          1
+        ]
+      ],
+      "ai_runs": 0
+    },
+    "B": {
+      "cases": {
+        "T01": {
+          "ledger": [
+            [
+              "out",
+              "text",
+              "ignored",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": []
+        },
+        "T02": {
+          "ledger": [
+            [
+              "out",
+              "text",
+              "ignored",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": []
+        },
+        "T03": {
+          "ledger": [
+            [
+              "in",
+              "text",
+              "queued",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": [
+            [
+              "processed",
+              1,
+              1
+            ]
+          ]
+        },
+        "T04": {
+          "ledger": [
+            [
+              "out",
+              "text",
+              "ignored",
+              "flushed",
+              1
+            ]
+          ],
+          "processing": []
+        }
+      },
+      "send_states": [
+        [
+          "rejected",
+          1
+        ],
+        [
+          "sent",
+          1
+        ],
+        [
+          "unknown",
+          2
+        ]
+      ],
+      "ai_runs": 0
+    }
+  }
+}

@@ -6,7 +6,8 @@ use chrono::{DateTime, Local, NaiveTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+#[cfg(not(feature = "headless"))]
+use tauri::AppHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -165,32 +166,10 @@ impl crate::queue_kernel::ClockSource for SystemClock {
     }
 }
 
-pub trait RuntimeEventSink: Send + Sync {
-    fn emit(&self, event: &str, payload: Value);
-}
-
-#[derive(Default)]
-pub struct NoopEventSink;
-
-impl RuntimeEventSink for NoopEventSink {
-    fn emit(&self, _event: &str, _payload: Value) {}
-}
-
-pub struct TauriEventSink {
-    app: AppHandle,
-}
-
-impl TauriEventSink {
-    fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-impl RuntimeEventSink for TauriEventSink {
-    fn emit(&self, event: &str, payload: Value) {
-        let _ = self.app.emit(event, payload);
-    }
-}
+use crate::runtime_events::RuntimeHost;
+#[cfg(not(feature = "headless"))]
+use crate::runtime_events::TauriEventSink;
+pub use crate::runtime_events::{NoopEventSink, RuntimeEventSink};
 
 pub trait AiProviderFactory: Send + Sync {
     fn create(&self, configs: Vec<AiConfig>) -> AppResult<Arc<dyn AiProvider>>;
@@ -258,6 +237,7 @@ fn capability_for_effect(
 
 #[derive(Clone)]
 pub struct BackendRuntime {
+    model_executor: Arc<crate::ai_pipeline::ModelExecutor>,
     database: DatabaseExecutor,
     gateway: Arc<dyn RuntimeGateway>,
     secrets: SecretStore,
@@ -318,6 +298,7 @@ impl BackendRuntime {
     ) -> Self {
         let (prediction_narration_tx, prediction_narration_rx) = mpsc::channel(64);
         Self {
+            model_executor: Arc::new(crate::ai_pipeline::ModelExecutor::default()),
             database,
             gateway,
             secrets,
@@ -345,50 +326,65 @@ impl BackendRuntime {
         self
     }
 
-    pub fn spawn(mut self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
-        self.events = Arc::new(TauriEventSink::new(app.clone()));
+    #[cfg(not(feature = "headless"))]
+    pub fn spawn(self, app: AppHandle) -> Vec<tauri::async_runtime::JoinHandle<()>> {
+        let handle = tauri::async_runtime::handle();
+        let _guard = handle.inner().enter();
+        self.spawn_with_events(Arc::new(TauriEventSink::new(app)))
+            .into_iter()
+            .map(tauri::async_runtime::JoinHandle::Tokio)
+            .collect()
+    }
+
+    /// Run all business workers with a transport-independent event destination.
+    pub fn spawn_with_events(
+        mut self,
+        events: Arc<dyn RuntimeEventSink>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        self.events = events.clone();
+        let app = RuntimeHost::new(events);
         self.coordination.tracker.attach(app.clone());
         let mut workers = Vec::with_capacity(9);
         let backlog = self.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             backlog.seed_runtime_work().await;
         }));
         let card_queue = self.clone();
         let card_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             card_queue.card_queue_loop(card_app).await;
         }));
         let scheduler = self.clone();
         let scheduler_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             scheduler.schedule_loop(scheduler_app).await;
         }));
         let connection = self.clone();
         let connection_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             connection.connection_loop(connection_app).await;
         }));
         let roster_sync = self.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             roster_sync.roster_sync_loop().await;
         }));
         let activities = self.clone();
         let activities_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             activities.activity_loop(activities_app).await;
         }));
         let summaries = self.clone();
         let summaries_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             summaries.summary_loop(summaries_app).await;
         }));
         let effects = self.clone();
         let effects_app = app.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             effects.effect_dispatcher_loop(effects_app).await;
         }));
         let prediction_narration = self.clone();
-        workers.push(tauri::async_runtime::spawn(async move {
+        workers.push(tokio::spawn(async move {
             prediction_narration.prediction_narration_loop().await;
         }));
         workers
@@ -480,7 +476,7 @@ impl BackendRuntime {
     ///   • Fail   → mark failed-terminal immediately
     ///   • Retry  → mark failed, let backoff reschedule
     ///   • Proceed → spawn a task holding the concurrency guards and dispatch
-    async fn effect_dispatcher_loop(&self, app: AppHandle) {
+    async fn effect_dispatcher_loop(&self, app: RuntimeHost) {
         loop {
             let mut dispatched: usize = 0;
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
@@ -555,7 +551,7 @@ impl BackendRuntime {
                                         Ok(permit) => {
                                             let rt = self.clone();
                                             let app_clone = app.clone();
-                                            tauri::async_runtime::spawn(async move {
+                                            tokio::spawn(async move {
                                                 rt.dispatch_effect_permitted(
                                                     Some(&app_clone),
                                                     item,
@@ -620,7 +616,7 @@ impl BackendRuntime {
 
     async fn dispatch_effect_permitted(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&RuntimeHost>,
         item: EffectOutboxItem,
         _permit: &AutomaticWritePermit,
     ) {
@@ -1099,7 +1095,7 @@ impl BackendRuntime {
         worker_tasks: &mut JoinSet<()>,
         group_id: i64,
         session_epoch: u64,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         sender_id: i64,
     ) -> mpsc::Sender<IncomingJob> {
@@ -1265,7 +1261,7 @@ impl BackendRuntime {
             .unwrap_or(false)
     }
 
-    async fn schedule_loop(&self, app: AppHandle) {
+    async fn schedule_loop(&self, app: RuntimeHost) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((sender_id, account_id)) = self.gateway.session_identity().await {
@@ -1397,7 +1393,7 @@ impl BackendRuntime {
         }
     }
 
-    async fn connection_loop(&self, app: AppHandle) {
+    async fn connection_loop(&self, app: RuntimeHost) {
         let mut workers: HashMap<(String, u64, i64), mpsc::Sender<IncomingJob>> = HashMap::new();
         let mut worker_tasks = JoinSet::new();
         let mut member_event_cache: HashMap<String, Vec<GatewayEvent>> = HashMap::new();
@@ -2282,7 +2278,7 @@ impl BackendRuntime {
 
     async fn handle_gateway_event(
         &self,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         durable_event_id: &str,
         event: GatewayEvent,
@@ -2484,7 +2480,7 @@ impl BackendRuntime {
 
     async fn process_member_update_rules(
         &self,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         durable_event_id: &str,
         group_id: i64,
@@ -2790,7 +2786,7 @@ impl BackendRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn process_job(
         &self,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         sender_id: i64,
         job: IncomingJob,
@@ -3073,7 +3069,7 @@ impl BackendRuntime {
 
     async fn process_deferred_ai(
         &self,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         sender_id: i64,
         message: Message,
@@ -3133,7 +3129,7 @@ impl BackendRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn process_ai_rules_background(
         &self,
-        app: AppHandle,
+        app: RuntimeHost,
         account_id: String,
         sender_id: i64,
         group: Group,
@@ -3260,7 +3256,7 @@ impl BackendRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn execute_rule_actions(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&RuntimeHost>,
         account_id: &str,
         sender_id: i64,
         message: &Message,
@@ -3660,7 +3656,7 @@ impl BackendRuntime {
 
     async fn process_ai(
         &self,
-        app: &AppHandle,
+        app: &RuntimeHost,
         account_id: &str,
         group: &Group,
         member: &Member,
@@ -3751,7 +3747,10 @@ impl BackendRuntime {
             let knowledge_ms = knowledge_started.elapsed().as_millis();
             let recent_messages = self
                 .database
-                .recent_messages(account_id.to_string(), group.group_id, 9)
+                .execute({
+                    let current = message.clone();
+                    move |database| database.messages_before(&current, 8)
+                })
                 .await?
                 .into_iter()
                 .filter(|candidate| candidate.id != message.id)
@@ -3794,7 +3793,10 @@ impl BackendRuntime {
                     (decision, true, true, 0)
                 } else {
                     let model_started = std::time::Instant::now();
-                    let decision = provider.decide(&request).await?;
+                    let decision = self.model_executor.decide(
+                        crate::conversations::ConversationKey { platform: "wangshangliao".into(), account_id: account_id.into(), kind: "group".into(), target: group.group_id.to_string() },
+                        provider.as_ref(), &request, &self.shutdown,
+                    ).await?;
                     let model_ms = model_started.elapsed().as_millis();
                     let cache_stored = self.ai_reply_cache
                         .insert_scoped(account_id, cache_key, decision.clone());
@@ -3802,7 +3804,10 @@ impl BackendRuntime {
                 }
             } else {
                 let model_started = std::time::Instant::now();
-                let decision = provider.decide(&request).await?;
+                let decision = self.model_executor.decide(
+                    crate::conversations::ConversationKey { platform: "wangshangliao".into(), account_id: account_id.into(), kind: "group".into(), target: group.group_id.to_string() },
+                    provider.as_ref(), &request, &self.shutdown,
+                ).await?;
                 (decision, false, false, model_started.elapsed().as_millis())
             };
             let decision_action_count = decision.actions.len();

@@ -45,7 +45,7 @@ Select-String -Path tauri3\src-tauri\src\diagnostics.rs -Pattern 'defaultRespons
 
 ## 2. 测试对象
 
-1. 在 Windows 开发机从一个干净、确定的完整源码 SHA 构建。
+1. 由 GitHub Actions 在 Windows runner 从一个干净、确定的完整源码 SHA 构建。
 2. 测试对象必须是准备上传云盘的同一份 production portable ZIP。
 3. 不使用旧 beta、历史下载包、Fixture 包或 macOS 产物。
 4. 首轮用 portable，第二轮用 NSIS 安装版；普通用户跑一次，管理员用户再跑一次。
@@ -65,7 +65,7 @@ Select-String -Path tauri3\src-tauri\src\diagnostics.rs -Pattern 'defaultRespons
 
 ### 已在 macOS 验证过的部分
 
-协议与业务链已在 macOS 真实旺商聊双实例（主账号 `9222`、普通成员测试账号 `9223`）验证通过，详见 [`REAL-GROUP-TEST-20260731.md`](REAL-GROUP-TEST-20260731.md)。Windows 这一轮不需要为了「再确认一遍」重复这些破坏性写操作：
+协议与业务链已有真实旺商聊基线。Windows 这一轮不需要为了“再确认一遍”重复全部破坏性写操作；只按本文件的 Windows 分层验收补足桌面、进程和发布包证据：
 
 - AI 明确提及回复通过；普通文本静默通过。
 - 临时知识库绑定、命中、解绑、删除通过；解绑后不复用旧答案。

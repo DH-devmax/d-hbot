@@ -50,6 +50,7 @@ export type DatabaseStatus = {
 }
 
 export type SupportBundleResult = {
+  downloadUrl?: string
   path: string
   sha256: string
   includedFiles: number

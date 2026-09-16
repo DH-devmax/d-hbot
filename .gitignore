@@ -2,9 +2,14 @@
 /dist/
 /output/
 /tmp/
+/.local-backups/
+/docs/architecture/rendered/
+/docs/architecture/dist/
 *.log
 tauri3/node_modules/
 tauri3/src-tauri/target/
+crates/*/target/
+tools/web-dispatch-generator/target/
 tauri3/dist/
 tauri3/test-results/
 tauri3/playwright-report/
@@ -20,3 +25,13 @@ __pycache__/
 *.db-wal
 *.dat
 .DS_Store
+
+tauri3/dist-web/
+
+# Local Web authentication material
+admin.db*
+admin-password.hash
+protocol.key
+deployment.sealed
+session.sealed
+login.sealed

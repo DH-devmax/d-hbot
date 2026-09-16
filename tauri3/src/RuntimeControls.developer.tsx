@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './api/transport'
 import { RefreshCw } from 'lucide-react'
 import type { RuntimeControlProps } from './runtimeTypes'
 

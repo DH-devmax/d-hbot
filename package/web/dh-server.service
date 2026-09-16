@@ -1,0 +1,25 @@
+[Unit]
+Description=DH BOT Rust Web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dhbot
+Group=dhbot
+WorkingDirectory=/opt/dh-bot
+ExecStart=/opt/dh-bot/dh-server serve-rust /var/lib/dh-bot-web /opt/dh-bot/web
+Restart=on-failure
+RestartSec=5
+Environment=TOKIO_WORKER_THREADS=2
+StateDirectory=dh-bot-web
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dh-bot-web
+
+[Install]
+WantedBy=multi-user.target

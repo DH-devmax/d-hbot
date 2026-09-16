@@ -2,10 +2,8 @@
 """检查文档里以纯文本形式出现的 .md 文件名是否真的存在。
 
 tools/verify_docs.py 只用正则匹配 markdown 链接 `[文字](目标)`，因此像
-「1. DH-BOT-WINDOWS-CONTEXT.md」这样直接写在正文里的裸文件名它完全看不见。
-docs/WINDOWS-CODEX-PROMPT.md 曾经这样引用一个只存在于 output/ 交接包里的
-文件（output/ 被 .gitignore 忽略），克隆仓库的人按清单找不到它，而 CI 一直是绿的。
-这个脚本补上那个缺口。
+文档中直接写出的裸文件名不会被 Markdown 链接检查发现。这个脚本补上该缺口，
+并允许脚本生成但不进仓库的报告文件。
 """
 
 import re

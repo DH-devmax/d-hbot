@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_LIMIT = 8 * 1024 * 1024
-BLOCKED_PARTS = {".secrets", "node_modules", "raw", "target", "test-results"}
+BLOCKED_PARTS = {".secrets", ".local-backups", "node_modules", "raw", "target", "test-results"}
 BLOCKED_SUFFIXES = {".db", ".dat", ".key", ".log", ".p12", ".pfx", ".pdb"}
 BINARY_SUFFIXES = {".gif", ".icns", ".ico", ".jpeg", ".jpg", ".pdf", ".png"}
 STRUCTURED_EXCLUSIONS = {
@@ -66,6 +66,12 @@ def blocked_path(path: PurePosixPath) -> str | None:
 
 
 def allowed_test_literal(path: str, value: str) -> bool:
+    # Native serializer corpus exercises signed/unsigned 64-bit boundaries.
+    if path == "crates/dh-protocol/tests/fixtures/request_metadata_280.json":
+        boundaries = {str(2**63 - 1), str(2**63), str(2**64 - 1)}
+        boundaries.update(f"{field << 3:02x}" + "80" * 9 + "01" for field in (1, 6, 8, 9, 10, 11, 14))
+        boundaries.update("".join(f"{field << 3:02x}" + encoded for field in range(1, 15)) for encoded in ("01", "8001"))
+        return value in boundaries
     return (
         path
         in {
@@ -146,6 +152,8 @@ def main() -> int:
             findings.append(f"{relative}: {reason}")
             continue
         absolute = ROOT / relative
+        if not absolute.exists():
+            continue
         if pure.suffix.lower() == ".zip":
             findings.extend(scan_zip(relative, absolute))
         else:

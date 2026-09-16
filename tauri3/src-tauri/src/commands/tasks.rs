@@ -1,10 +1,13 @@
 //! 任务、活动与群计划。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_tasks(
     state: State<'_, AppState>,
     account_id: String,
@@ -16,7 +19,7 @@ pub(crate) async fn list_tasks(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_task(state: State<'_, AppState>, task: TaskItem) -> AppResult<i64> {
     require_account(&state, &task.account_id).await?;
     require_manager(&state, task.group_id).await?;
@@ -25,7 +28,7 @@ pub(crate) async fn save_task(state: State<'_, AppState>, task: TaskItem) -> App
     Ok(id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_task(
     state: State<'_, AppState>,
     account_id: String,
@@ -38,7 +41,7 @@ pub(crate) async fn delete_task(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_activities(
     state: State<'_, AppState>,
     account_id: String,
@@ -77,7 +80,7 @@ fn normalize_activity(mut activity: Activity) -> AppResult<Activity> {
     Ok(activity)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_activity(
     state: State<'_, AppState>,
     activity: Activity,
@@ -92,7 +95,7 @@ pub(crate) async fn save_activity(
     Ok(id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_activity(
     state: State<'_, AppState>,
     account_id: String,
@@ -115,7 +118,7 @@ pub(crate) async fn delete_activity(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_activity_runs(
     state: State<'_, AppState>,
     account_id: String,
@@ -128,7 +131,7 @@ pub(crate) async fn list_activity_runs(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn preview_activity_text(
     state: State<'_, AppState>,
     activity: Activity,
@@ -202,7 +205,7 @@ pub(crate) async fn preview_activity_text(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn publish_activity_now(
     state: State<'_, AppState>,
     account_id: String,
@@ -227,7 +230,7 @@ pub(crate) async fn publish_activity_now(
     Ok(created)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_schedules(
     state: State<'_, AppState>,
     account_id: String,
@@ -235,7 +238,7 @@ pub(crate) async fn list_schedules(
     state.database_executor.list_schedules(account_id).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_schedule(
     state: State<'_, AppState>,
     mut schedule: GroupSchedule,
@@ -259,7 +262,7 @@ pub(crate) async fn save_schedule(
     Ok(id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_schedule(
     state: State<'_, AppState>,
     account_id: String,
@@ -272,7 +275,7 @@ pub(crate) async fn delete_schedule(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_schedule_runs(
     state: State<'_, AppState>,
     account_id: String,

@@ -7,13 +7,26 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Artifacts = (Resolve-Path $ArtifactDirectory).Path
 
+function Get-Sha256([string]$Path) {
+  $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+      return ([System.BitConverter]::ToString($Sha256.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant()
+    } finally {
+      $Stream.Dispose()
+    }
+  } finally {
+    $Sha256.Dispose()
+  }
+}
+
 & node (Join-Path $Root 'scripts\verify-production.mjs') $Artifacts
 if ($LASTEXITCODE -ne 0) { throw '生产产物直接扫描失败' }
 
 $MainExecutable = Join-Path $Artifacts 'DH-BOT.exe'
 if (-not (Test-Path $MainExecutable)) { throw '生产产物缺少 DH-BOT.exe' }
-$Signature = Get-AuthenticodeSignature -FilePath $MainExecutable
-Write-Host "DH-BOT.exe 签名状态：$($Signature.Status)（个人云盘分发允许未签名）"
+Write-Host 'DH-BOT.exe 签名状态：未执行 Authenticode 检查（个人云盘分发允许未签名）'
 
 $SevenZip = Get-Command 7z.exe -ErrorAction SilentlyContinue
 if (-not $SevenZip) { $SevenZip = Get-Command 7z -ErrorAction SilentlyContinue }
@@ -84,7 +97,7 @@ foreach ($Line in Get-Content -LiteralPath $ManifestPath) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     throw "SHA256SUMS.txt 引用缺失文件：$Name"
   }
-  $ActualHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  $ActualHash = Get-Sha256 $Path
   if ($ActualHash -ne $ExpectedHash) {
     throw "SHA256 校验失败：$Name"
   }

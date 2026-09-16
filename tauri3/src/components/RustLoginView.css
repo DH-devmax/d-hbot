@@ -1,0 +1,19 @@
+.rust-login label { display: grid; gap: 6px; font-size: 13px; color: #454545; }
+.rust-login input:not([type="checkbox"]) { height: 40px; padding: 8px 10px; border: 1px solid #c9cdd1; border-radius: 6px; background: #fff; color: #161616; }
+.rust-login label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 8px; cursor: pointer; min-height: 32px; }
+.rust-login input[type="checkbox"] { width: 16px; height: 16px; padding: 0; margin: 0; flex: 0 0 16px; accent-color: #237a62; }
+.rust-login input:focus-visible { outline: 2px solid #237a62; outline-offset: 1px; }
+.rust-login button { min-height: 40px; justify-content: center; gap: 8px; }
+.rust-login button:disabled { opacity: .6; cursor: wait; }
+.rust-login [role="alert"] { color: #a33232; line-height: 1.5; overflow-wrap: anywhere; }
+.wang-account-actions { position: relative; display: flex; align-items: center; gap: 6px; }
+.wang-account-label { margin-right: 4px; color: #777; font-size: 12px; white-space: nowrap; }
+.wang-account-actions .secondary { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border: 1px solid #e5e5e5; border-radius: 6px; background: #fff; color: #666; }
+.wang-account-actions .secondary:hover { background: #f5f5f5; color: #111; }
+.wang-account-actions .secondary:disabled { opacity: .5; cursor: wait; }
+.wang-account-error { position: absolute; right: 0; top: 100%; z-index: 10; width: 240px; max-width: 60vw; padding: 10px 12px; margin-top: 8px; border: 1px solid #edcccc; border-radius: 6px; background: #fff7f7; color: #a33232; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; box-shadow: 0 4px 16px #0000000d; }
+
+.rust-login button.secondary { display: inline-flex; align-items: center; padding: 8px 14px; border: 1px solid #ddd; border-radius: 8px; background: #fff; color: #555; font: inherit; cursor: pointer; transition: background .15s, border-color .15s; }
+.rust-login button.secondary:hover:not(:disabled) { background: #f5f5f5; border-color: #aaa; color: #171717; }
+.rust-login button:focus-visible { outline: 2px solid #237a62; outline-offset: 2px; }
+.rust-login button:disabled { cursor: not-allowed; }

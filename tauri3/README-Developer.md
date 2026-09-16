@@ -1,6 +1,6 @@
 # DH BOT Developer Build
 
-开发版有两个严格区分的运行环境：真实旺商聊用于 Contract v2 与专有写能力校准，Fixture 用于本地协议、成员、消息和自动化回归。ZCG 基线能力由运行时只读探测逐项开放；旺商聊专有写能力只有在真实状态恢复、脱敏和回放证据完整后才进入生产能力表。
+开发版只用于 Fixture 回归和真实旺商聊 Contract v2 校准；生产构建、用户使用和发布说明统一见仓库根目录 [`README.md`](../README.md) 与 [`docs/`](../docs/)。开发版有两个严格区分的运行环境：真实旺商聊用于 Contract v2 与专有写能力校准，Fixture 用于本地协议、成员、消息和自动化回归。ZCG 基线能力由运行时只读探测逐项开放；旺商聊专有写能力只有在真实状态恢复、脱敏和回放证据完整后才进入生产能力表。
 
 ## 启动
 
@@ -33,7 +33,7 @@ pnpm package:windows:developer
 
 开发构建产物为内部 ZIP，包含 `DH-BOT-Dev.exe`、`DH-Fixture.exe` 和校验文件；不上传到公开发布目录。
 
-生产构建只在 Windows 开发机使用 `pnpm tauri:build:production` 和 `pnpm package:windows:production`。当前个人发行产物未签名，随 portable ZIP 一起发布 `dist/production/SHA256SUMS.txt`；产物不携带开发测试模块、9233 端口或 Fixture 资源。
+生产构建由 GitHub Actions 的 Windows runner 使用 `pnpm tauri:build:production` 和 `pnpm package:windows:production`；Windows 开发机仍可按同样命令复现。当前个人发行产物未签名，随 portable ZIP 一起发布 `dist/production/SHA256SUMS.txt`；产物不携带开发测试模块、9233 端口或 Fixture 资源。
 生产构建会显式将 `--no-default-features` 传给 Cargo，并在编译前删除曾暂存的 `DH-Fixture` 资源和开发二进制。`pnpm test:production-isolation` 验证扫描器会拦截 Fixture 命令、9233/51300 端口、开发数据目录和环境变量；Windows 打包还会用 7-Zip 展开 NSIS 安装器，并复查解压后的 portable ZIP。
 
 开发版的运行模式文件位于 `%APPDATA%\DH\developer\runtime-mode`。Fixture 数据位于 `%APPDATA%\DH\fixture`；开发版真实模式和生产版使用 `%APPDATA%\DH\3.0` 与真实旺商聊 `9222`。

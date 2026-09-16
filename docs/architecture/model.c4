@@ -1,0 +1,34 @@
+specification {
+  element actor
+  element system
+  element container
+}
+model {
+  admin = actor "Administrator"
+  ui = container "React management UI" { technology "React / TypeScript" }
+  web = container "Rust Web host" { technology "dh-server / HTTP / WebSocket" }
+  desktop = container "Windows desktop" { technology "Tauri / CDP" }
+  core = container "Shared business core" { technology "dh-core / Tokio" }
+  protocol = container "Rust platform adapter" { technology "dh-protocol / Business HTTP / NIM" }
+  db = container "Local state and audit" { technology "SQLite / sealed credentials" }
+  platform = system "Wangshangliao"
+  ai = system "AI provider"
+  admin -> ui "Manages groups and settings"
+  ui -> web "Authenticated Web commands"
+  ui -> desktop "Desktop IPC commands"
+  web -> core "Shared commands and workers"
+  desktop -> core "Shared commands and workers"
+  web -> protocol "Session and protocol gateway"
+  desktop -> platform "Official client CDP"
+  core -> db "Queues, knowledge and audit"
+  core -> ai "Scoped prompts"
+  protocol -> platform "Login, messaging and management"
+  web -> db "Conversation ledger and sessions"
+}
+views {
+  view current {
+    title "DH BOT: current implementation"
+    include *
+    autoLayout TopBottom
+  }
+}

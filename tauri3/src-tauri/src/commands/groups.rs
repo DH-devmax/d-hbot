@@ -1,41 +1,51 @@
 //! 群列表、成员名单与群级开关。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
-pub(crate) async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
-    let (_, account_id) = state.gateway.session_identity().await?;
-    let now = Utc::now();
-    state
-        .database_executor
-        .upsert_account(models::Account {
-            id: account_id.clone(),
-            display_name: account_id.clone(),
-            role: "unknown".into(),
-            discovered_at: now,
-            updated_at: now,
-        })
-        .await?;
-    let _ = state
-        .database_executor
-        .ensure_account_defaults(account_id.clone())
-        .await;
-    for group in state.gateway.list_groups().await? {
-        state.database_executor.upsert_group(group).await?;
+pub(crate) fn validate_roster_context(
+    members: &[Member],
+    account: &str,
+    group: i64,
+    requested_epoch: u64,
+    current_epoch: u64,
+) -> AppResult<()> {
+    if requested_epoch != current_epoch
+        || members
+            .iter()
+            .any(|member| member.account_id != account || member.group_id != group)
+    {
+        return Err(AppError::new(
+            "stale_roster",
+            "账号或群状态已变化，请重新读取成员名单",
+        ));
     }
-    state.database_executor.list_groups(Some(account_id)).await
+    Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
+pub(crate) async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
+    crate::service::BusinessService {
+        database: state.database_executor.clone(),
+        gateway: state.gateway.clone(),
+    }
+    .list_groups()
+    .await
+}
+
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_cached_groups(state: State<'_, AppState>) -> AppResult<Vec<Group>> {
-    state.database_executor.list_groups(None).await
+    let Ok((_, account)) = state.gateway.session_identity().await else { return Ok(Vec::new()); };
+    state.database_executor.list_groups(Some(account)).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_members(
-    app: tauri::AppHandle,
+    app: crate::CommandEventHandle,
     state: State<'_, AppState>,
     group_id: i64,
     refresh: Option<bool>,
@@ -47,6 +57,13 @@ pub(crate) async fn list_members(
     }
     let mut roster = state.gateway.list_members(group_id).await?;
     let (self_id, account_id) = state.gateway.session_identity().await?;
+    validate_roster_context(
+        &roster.members,
+        &account_id,
+        group_id,
+        request_epoch,
+        state.gateway.session_epoch(),
+    )?;
     let existing = state
         .database_executor
         .list_members(account_id.clone(), group_id)
@@ -93,7 +110,11 @@ pub(crate) async fn list_members(
         .await?
         .as_deref()
         == Some("true");
-    if had_baseline && automatic && !newly_discovered.is_empty() {
+    if had_baseline
+        && automatic
+        && !newly_discovered.is_empty()
+        && request_epoch == state.gateway.session_epoch()
+    {
         let prefix = state
             .database_executor
             .get_setting(format!("card.prefix.{account_id}.{group_id}"))
@@ -145,7 +166,7 @@ pub(crate) async fn list_members(
     Ok(roster)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn local_members(
     state: State<'_, AppState>,
     account_id: String,
@@ -161,7 +182,7 @@ pub(crate) async fn local_members(
         .collect())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn set_group_features(
     state: State<'_, AppState>,
     account_id: String,

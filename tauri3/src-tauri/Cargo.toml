@@ -9,6 +9,7 @@ default-run = "dh-bot"
 default = []
 custom-protocol = ["tauri/custom-protocol"]
 fixture = []
+headless = []
 
 [lib]
 name = "dh_bot_lib"

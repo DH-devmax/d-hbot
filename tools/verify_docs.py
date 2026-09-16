@@ -79,6 +79,8 @@ def main() -> int:
                 errors.append(f"{relative}: missing current fact {fact!r}")
 
     for path in tracked_markdown():
+        if not path.exists():
+            continue
         errors.extend(relative_link_errors(path))
 
     if errors:

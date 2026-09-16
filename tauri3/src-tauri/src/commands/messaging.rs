@@ -1,5 +1,8 @@
 //! 发送消息、批量群发与消息查询。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
@@ -24,13 +27,13 @@ pub(crate) struct GroupBatchResult {
     error: String,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn send_text(
     state: State<'_, AppState>,
     group_id: i64,
     text: String,
 ) -> AppResult<String> {
-    require_manager(&state, group_id).await?;
+    require_group_member_for_send(&state, group_id).await?;
     let (sender_id, account_id) = state.gateway.session_identity().await?;
     let result = state.gateway.send_text(group_id, &text).await;
     let receipt = archive_manual_gateway_result(
@@ -56,7 +59,7 @@ pub(crate) async fn send_text(
     Ok(receipt.message_id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn send_text_batch(
     state: State<'_, AppState>,
     group_ids: Vec<i64>,
@@ -66,7 +69,7 @@ pub(crate) async fn send_text_batch(
         return Err(AppError::new("message_empty", "发送内容不能为空"));
     }
     for group_id in &group_ids {
-        require_manager(&state, *group_id).await?;
+        require_group_member_for_send(&state, *group_id).await?;
     }
     let (sender_id, account_id) = state.gateway.session_identity().await?;
     let mut results = Vec::with_capacity(group_ids.len());
@@ -158,7 +161,7 @@ async fn persist_outgoing_message(
         .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn execute_group_batch(
     state: State<'_, AppState>,
     input: GroupBatchInput,
@@ -224,7 +227,7 @@ pub(crate) async fn execute_group_batch(
     Ok(results)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn query_messages(
     state: State<'_, AppState>,
     mut query: MessageQuery,
@@ -241,7 +244,7 @@ pub(crate) async fn query_messages(
     Ok(Page { items, next_cursor })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn recent_messages(
     state: State<'_, AppState>,
     account_id: String,
