@@ -1,83 +1,21 @@
-# DH BOT 3.0 beta.1 状态
+# DH BOT 3.0 当前状态
 
-技术快照（2026-08-06）：应用版本 `3.0.0-beta.1`，SQLite schema v14，生产构建
-`--no-default-features`，生产端点 `127.0.0.1:9222`。本文件中的测试数量是该源码快照的
-本地结果；Windows 新产物必须重新生成 SHA-256，不能复用历史包哈希。
+应用版本 `3.0.0-beta.1`，SQLite schema v14。以下描述当前实现范围，不以历史测试数量或完成度百分比代替实际验收。
 
-## 2026-07-31 真实群 AI 与规则验收
+## 桌面与 Web
 
-- `gpt-5.6-luna`、Responses、`xhigh` 已完成模型目录、离群调用和真实群回复验证。
-- 脱敏测试群 A 的机器规则、AI 控制规则、知识绑定/解绑、缓存和 NIM 撤回已通过。
-- 真实撤回以 `nim.recallMsg` 的 `verified` 回执及 NIM 历史回读为空为验收依据。
-- 预测逻辑通过离群回归；加拿大28与 PC28/北京28已接入无需 Key 的公开或官方开奖源，应用仍由管理员明确启用。
-- 完整证据见 `docs/REAL-GROUP-TEST-20260731.md`。
+- 桌面版使用 Rust/Tauri 和官方客户端网关，Production 与 Fixture 构建隔离。
+- Web 使用 `dh-server`，复用 82 个业务命令的校验、权限与审计处理；具有独立管理员会话、页面事件和诊断下载。
+- `serve-rust` 已实现业务登录、设备验证码分支、续期、NIM 认证和心跳，以及群列表、成员分页和部分 HTTP 群管接口。
+- 纯 Rust 编解码、同步确认、收发、AI 回复、公告、成员禁言/解禁和在线撤回已有真实双账号验证。
+- 全群禁言、移除/拉黑、定时任务、离线撤回与长期运行仍待验收；群自动执行开关已恢复关闭。
+- 最新结果见 [阶段验收](../docs/acceptance/2026-09-17/RESULTS.md)。后续私用开发转向 [AstrBot](../docs/ASTRBOT-HANDOFF.md)，插件尚未实现。
 
-当前 Rust + Tauri 重构的代码闭环约 **99%**，考虑尚未完成的 Windows 本地生产构建、真实旺商聊契约证据和实机 RC 验收，有效完成度约 **97%**。Beta.1.1 核心收口、生产/Fixture 编译隔离、业务页面与自动化测试已落地。
+## 文档入口
 
-## 已完成
+- [Web 配置、登录和接口范围](../docs/RUST-WEB-LOGIN.md)
+- [协议契约与研究证据](../docs/PROTOCOL-CONTRACT.md)
+- [Windows 验收](../docs/WINDOWS-ACCEPTANCE.md)
+- [工程检查与发布要求](../docs/ENGINEERING-STANDARDS.md)
 
-- schema v12 幂等迁移：在既有消息、outbox、知识、任务和业务应用结构上增加账号级 `ai_provider_endpoints`、Responses 思考深度和短期群名片预期回调表，并增加机器/AI 规则类型、多群绑定、稳定成员白名单、独立群开关、规则评估记录和业务能力校验记录。
-- schema v13 幂等迁移：修正活动时间计算为数据库本地时区（`date(...,'localtime')` / `strftime('%H:%M',...,'localtime')`），版本门控启用存量 `legacy-task:*` 活动（需有活动组与活动时间、关联任务未发送提醒且状态为 pending/retry）；`activity_runs` 外键补 `ON DELETE CASCADE`。
-- schema v14 幂等迁移：`effect_outbox` 扩展 6 列（priority/lane/order_key/correlation_id/origin/expires_at，全部带默认值）；补 6 组索引（audit_events、effect_outbox×2、messages、gateway_inbox、rule_evaluations）支持高频查询；新建 `retention_policies` 表配置双上限保留策略（天数 + 行数）。
-- `DatabaseExecutor` 独占 `Database::open` 交付的唯一 SQLite 连接，使用 `dh-sqlite` 线程、256 有界队列、FIFO 排空和 `Shutdown` 回执。Tauri/runtime 生产路径不再持有可直接调用的同步数据库。
-- 连接、消息、名片、规则、提醒、摘要、计划和诊断桥 worker 统一监督；退出最多等待 5 秒，未确认副作归档为 `unknown`，再排空 SQLite。
-- 消息链路固定为“批量持久化 → 连续 ACK → 按群串行派发”；重复、乱序、重试、重启恢复、解码失败和未知回执可追踪。
-- ACK 失败重试会重新确认旺商聊源队列，源 ACK 与本地状态由单一 SQLite 事务收口；更低序号未确认时禁止越过处理后续事件。
-- 成员身份合并、完整/部分名单、入群/离群/资料变更、陌生发言发现、黑名单回群、注销/封禁状态和群名片重试已持久化。
-- 规则拆分为机器规则与 AI 控制规则：独立群开关、全局/多群范围、三级优先级、搜索式成员白名单、多规则贡献者、语义阈值、固定动作顺序和分来源审计已接通。v2 不再使用角色豁免和规则冷却。
-- 机器规则命中后直接进入 outbox，不调用模型；AI 控制规则一次请求统一判断全部语义类别。聊天模型返回的 `recall` 动作会被忽略。
-- 其他成员消息撤回使用 `nim.getHistoryMsgs` 精确定位和 `nim.recallMsg`，撤回通知作为成功依据；HTTP 业务码 `1001` 被标记为永久失败且不重试。
-- AI 仅由明确 `@DH` 或提及元数据触发；总开关、回复/任务/撤回/禁言/移出权限、最近上下文、知识分块和 `ai_runs` 已接通。
-- AI 使用持久连接池、2 秒连接/15 秒单连接生成/20 秒总预算、主备健康冷却、每群顺序回复队列、跨群最多 2 并发、8 条上下文、3 条知识、Chat Completions 512 tokens / Responses 1024 tokens、10 分钟纯 FAQ 缓存和 60 秒知识命中缓存；运行审计记录缓存与分段耗时但不记录提示词或密钥。
-- 预测已从消息硬编码分支迁入 `BusinessAppRegistry`；默认停用，严格要求 AI `reply` 权限，完成数据新鲜度检查、确定性统计、AI 纯文字润色、模板回退与运行去重。
-- 预测数据源已替换为 `PublicLotterySource`：加拿大28优先 BCLC 官方 Keno，官方端点失败时使用公开 Keno 原始数据镜像；中国福彩网官方快乐8支持 PC28/北京28。所有结果保留真实开奖时间并明确标注 DH 派生。缓存按开奖频率调整并使用 single-flight。BTC28 与腾讯分分彩28因缺少可核验算法或官方源继续显示不可用；ZCG Token 链路仅保留为显式兼容回退。群回复先返回即时统计模板，不等待 AI。
-- 任务提醒持久 claim、每日摘要、电脑时区、跨午夜/DST 开关群计划和计划历史已完成。
-- Contract v2 包含版本/主脚本哈希、请求、双层响应、回调和标准化状态；运行时能力采用 `Supported/ManualVerification/Unavailable/Unsupported`，并记录 ZCG、Electron、NIM 或人工回执来源。
-- 生产 `CdpGateway` 使用独立能力注册表；ZCG 基线能力由启动时路由、IPC 和 NIM 只读探测逐项决定，未知版本仅在结构不一致时降为 `Unavailable` 或 `ManualVerification`。旺商聊专有写能力继续按 Contract v2 与写后回读证据开放。Fixture 校准表不会编入生产包。
-- 生产版固定真实旺商聊 `127.0.0.1:9222`；Fixture 只在 `fixture` feature 与内部开发包出现，使用独立数据目录和端口。
-- Windows 进程身份含 PID、规范路径、创建时间、文件版本和 SHA-256；关闭前三重复核。固定分区补丁使用结构白名单、manifest、原子替换、验证和回滚，并支持同一 EXE 的 UAC 维护模式。
-- 旺商聊路径优先读取用户设置，其次检索注册表、常见安装目录和开始菜单；自动启动默认开启。已运行但没有 9222 时只对精确主进程弹出确认，Electron 子进程被排除；UAC 维护成功后自动续跑启动。
-- 自动启动 worker 每 10 秒监督 DevTools；旺商聊主进程退出后自动重启，主进程仍在但没有 DevTools 时只提示确认重启，不会自动结束现有进程。
-- 启动状态持久在 `AppState`，前端注册监听后主动领取最近状态并按事件 ID 去重，避免旺商聊快速启动时丢失确认或结果。启动失败使用中文原生错误框，不再直接 panic。
-- 9222 只接受带旺商聊标识的 DevTools 页面；其他程序占用端口时不结束任何进程。自动与人工启动共用互斥锁，确认重启遇到 UAC 时保留原进程，维护完成后自动续跑。
-- 托盘单击/双击恢复、动态暂停/恢复文案、关闭选择记忆和真正退出已接通；普通最小化保留在 Windows 任务栏，只有右上角关闭才进入托盘确认。`tray-icon 0.24.1` 的 Windows 实现原生处理 `TaskbarCreated`。
-- React 页面、事件刷新、离线缓存、批量部分失败、关闭对话框和开发 Fixture Playwright 工作流已覆盖。
-- 消息台的群、关键词、类型、处理状态和游标均由 SQLite 查询，页面按 30 条真实分页，不再一次读取 500/1000 条后在前端裁切。
-- 成员批量禁言、解禁、移出、加入/移出黑名单统一返回逐项结果；注销状态参与失效成员清理，单个成员失败不会中断后续成员。
-- 群组页已增加批量公告、批量全员禁言和批量解除全禁。选择范围固定为当前搜索结果，后端按群校验权限与能力，逐群归档回执和审计；失败群可重试，未知回执进入人工核对。
-- 开发 Fixture 默认提供两个隔离测试群，支持同一公告跨群写入与全群发言状态维护。浏览器事件采用有界可重放日志，在页面重载后由监听器去重；结束 Fixture 时按独立进程组和临时 profile 清理 Chromium，避免遗留开发端口。生产版仍不包含 Fixture 入口、端口或测试数据。
-- 规则编辑器已接通机器/AI 横向 TAB、全部 matcher、多群勾选、窗口、次数、语义阈值、三级优先级和搜索式成员白名单；知识库及文档启停、审计成员/事件筛选与过滤后导出已接通。
-- 运行时可注入时钟、事件、AI、语义分类和预测数据源；真实浏览器 headless 测试完整经过 CDP、NIM、Runtime、SQLite、outbox、动作及审计。
-- 当前 Tauri 界面已重新截图，并生成 12 页 A4 横向中文图解 PDF，新增“诊断与支持包”页。
-- Go 2.7 代码归档到 `go-2.7-final` 标签；当前 Rust 分支已移除 Go 构建入口和源码。
-
-## 当前验证
-
-- `cargo test --no-default-features`：核心库 225 项通过、1 项需要临时 AI 环境的 live test 默认忽略。覆盖 schema v14、多 Provider 与思考深度迁移、活动本地时区修正、成员改名回调、机器/AI 规则隔离、NIM 撤回、旧规则升级、连接复用、主备切换、提示词预算、预测旁白完整性、AI 文案事实双向校验、single-flight 与缓存校验、远端响应体限长读取（含恰好等于上限的边界与错误码映射）、诊断包 `memoryCaps` 七项上限与常量逐一对齐的漂移守卫。
-- `cargo test --features fixture`：核心库 231 项通过、1 项 live test 默认忽略；`fixture_cdp` 与 `runtime_headless_cdp` 真实浏览器集成各 1 项通过。覆盖其他成员消息撤回、双群公告、双群全员禁言/解除及状态读取、1000 条突发、101 条分批、页面重载事件回放、浏览器清理、业务应用注册与保守回退、完整 Runtime 副作用链和版本/脚本哈希校准。
-- 群公告发布语义已固定为 `add-notice → 按新 noticeId 回读 → NIM 广播`，每次明确发布都会新增历史；`notice-opt` 仅保留给明确选择旧公告后的编辑流程。
-- 两套 `cargo clippy --all-targets -- -D warnings` 通过。
-- `pnpm test`：20 个文件 77 项 RTL/Vitest 通过，包含业务应用、多 Provider 离群测试、批量群控、机器/AI 规则、知识、审计汉化、调试诊断包、消息游标分页和右键菜单（默认菜单屏蔽、通道分级、镜像行内按钮、密码框不给复制/剪切、剪贴板失败降级）回归测试。
-- `pnpm test:e2e:fixture`：开发 Fixture 核心流程通过，覆盖成员搜索、消息、规则、知识绑定、任务、计划、审计和调试页的实际 IPC 调用；另含右键菜单在真实 Chromium 下的默认菜单抑制、层级、真实剪贴板读写和边缘翻转。
-- macOS 本机登录旺商聊的只读探测通过：读到 8 个群、一个完整 3097 人名单，消息编码和 NIM 成员事件为 `Supported`，公告为 `ManualVerification`。没有执行任何群写操作。
-- macOS 真实双群计时验证通过：2026-07-28 15:00 对脱敏测试群 A/B 执行关群，15:01 执行开群；每次写入均通过 `nim.getTeam` 回读，两个群最终均确认为允许发言。
-- Contract v2 采集、组装、合并、严格验证与脱敏工具链 34 项测试及自检通过，可在多 DevTools 页面中唯一选择旺商聊；生产/开发构建边界、10 场景生产隔离扫描、前端生产扫描和无 Fixture 的 Rust release 构建通过。
-- `DH-Manual-ZH.pdf`：12 页，首页与“诊断与支持包”页已重新渲染为 PNG 并通过视觉检查。
-- 本机 macOS 未安装 `x86_64-pc-windows-msvc` 所需的 MSVC/C 头文件，也未安装 MinGW；最终生产包需由受控 Windows MSVC 开发机生成并完成实机烟测。
-- macOS Tauri 桌面包已连接真实旺商聊 2.6.3 的 `127.0.0.1:9222`；能识别登录路由和 `nim-not-ready`，本地 Rust 诊断桥正常返回。关闭窗口的“取消 / 挂到托盘 / 退出”确认框与后台进程存活已通过 Computer Use 实测。
-- 使用 `cargo-xwin`、Windows CRT/SDK 和 MSVC Rust target 完成生产及 Fixture 全目标静态编译检查与 release PE 链接；过程中修正了 `windows-sys 0.59` 的 DPAPI blob 与 `LocalFree` 绑定。生产主程序已确认为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`，发布扫描器会拦截会显示 CMD 的 CUI 构建。
-- 旧 beta.1 Windows 包曾通过本地隔离和 SHA-256 校验，但其文件哈希已过期，不作为当前发布证据。当前个人发行正式采用未签名 portable ZIP；每次 Windows 构建必须生成新的 `SHA256SUMS.txt` 并完成实机验收。
-- Go 2.7 旧架构已生成可重复校验的 `archive/go-2.7-final/DH-BOT-go-2.7-final-source.zip`；当前分支不存在 Go 源码或 Go 构建入口。
-- 构建归属已调整为“源码仓库 GitHub Actions 执行通用门禁、Windows 生产打包和 tag Release；真实旺商聊桌面验收使用带 `dh-bot-real` 标签的自托管 Windows runner”。发行仓库仅保留下载说明或历史索引。
-- 本地日志改为 JSONL，带会话 ID 与递增序号，按日期/8 MiB 分段并执行 30 天/64 MiB 保留策略；统一脱敏 API Key、Token、Cookie、Authorization、密码和本机用户路径。
-- 调试页新增“生成诊断包”：使用原子 ZIP 写入和互不覆盖的文件名，包含脱敏连接/能力状态、数据库完整性摘要、匿名化审计、近期脱敏日志、`manifest.json` 与 `SHA256SUMS.txt`；不导出数据库、密钥、旺商聊登录数据或原始群消息。诊断包保留上限为 20 个、30 天和 128 MiB。
-
-## Beta.2 / RC 必须由外部环境证明的门禁
-
-- Windows 开发机的 MSVC 生产编译、NSIS 和 portable ZIP 生成、WebView2 离线包、Windows 产物深度解包扫描。
-- Windows 10 22H2 与 Windows 11 23H2/24H2 的标准用户/管理员、安装/升级/卸载/portable、UAC、托盘、休眠恢复和 100%/125%/150% DPI。
-- 已内置 `ZcgLegacyProfileV1` 路由基线并接入运行时只读探测。未知脚本 SHA 在路由签名、Electron IPC、双层响应和 NIM 方法保持一致时会开放对应能力；公告继续执行首次手工写入与回读验证。
-- 16 人脱敏测试群 A 先做只读同步，再做测试消息撤回、短时禁言/立即解禁、临时改名/自动恢复；移出成员仍只在 Fixture 验证。
-- 云盘上传后下载文件的 SHA-256 回读校验与版本记录。
-
-生产新安装不创建测试群、成员、规则、知识库、计划或自动化开关；Fixture 仅存在于内部开发包。
+旧 Go 2.7 归档已从工作目录移除，可在 Git 历史中查阅。现有生产数据、数据库迁移和脱敏协议向量继续保留。

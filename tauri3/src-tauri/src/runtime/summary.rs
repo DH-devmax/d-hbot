@@ -6,7 +6,7 @@
 use super::*;
 
 impl BackendRuntime {
-    pub(super) async fn summary_loop(&self, app: AppHandle) {
+    pub(super) async fn summary_loop(&self, app: RuntimeHost) {
         loop {
             if self.gateway.diagnose().await.status == ConnectionStatus::Ready {
                 if let Ok((_, account_id)) = self.gateway.session_identity().await {

@@ -1,7 +1,11 @@
+import WangLoginView from './components/WangLoginView'
+import WebSession from './components/WebSession'
+import { isWebMode } from './api/transport'
 import React, { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from './api/transport'
+import { listen } from './api/transport'
+import type { UnlistenFn } from '@tauri-apps/api/event'
 import { Activity, BookOpen, Bug, CalendarClock, LayoutDashboard, LoaderCircle, MessagesSquare, Settings2, ShieldCheck, Users } from 'lucide-react'
 import './styles.css'
 import './window-titlebar.css'
@@ -57,6 +61,7 @@ const wangTransientStatuses = new Set(['discovering', 'validating', 'starting', 
 const emptyWorkSnapshot: RuntimeWorkSnapshot = { active: null, items: [], counts: { running: 0, queued: 0, retrying: 0, failed: 0 }, updatedAt: '' }
 
 function WangStatusBanner({ diagnostic, startup }: { diagnostic: Diagnostic | null; startup: WangStartupEvent | null }) {
+  if (isWebMode()) return null
   if (diagnostic?.status === 'ready') return null
   const status = diagnostic?.status === 'nim-not-ready' || diagnostic?.status === 'devtools-ready'
     ? diagnostic.status
@@ -111,6 +116,7 @@ async function finishConfirmedWangRestart(
 }
 
 function App() {
+  const [accountActionsTarget, setAccountActionsTarget] = useState<HTMLDivElement | null>(null)
   const [page, setPage] = useState<PageName>('总览')
   const [diagnostic, setDiagnostic] = useState<Diagnostic | null>(null)
   const [database, setDatabase] = useState<DatabaseStatus | null>(null)
@@ -217,14 +223,15 @@ function App() {
       setDiagnostic(diagnosticResult.value)
       updateWangLoginFocus(diagnosticResult.value)
     }
+    else if (isWebMode()) setError('Web 后端连接失败，请检查服务状态')
     else if (!isTauriRuntime()) setDiagnostic({ status: 'unavailable', devtoolsUrl: 'http://127.0.0.1:9222', pageTitle: '', pageUrl: '', nimAccount: '', detail: '浏览器预览模式：请使用桌面程序执行连接检查。' })
     if (databaseResult.status === 'fulfilled') setDatabase(databaseResult.value)
-    else if (!isTauriRuntime()) setDatabase({ path: '本地数据库', schemaVersion: 1, integrity: '等待桌面程序', accounts: 0, groups: 0, messages: 0 })
+    else if (!isTauriRuntime() && !isWebMode()) setDatabase({ path: '本地数据库', schemaVersion: 1, integrity: '等待桌面程序', accounts: 0, groups: 0, messages: 0 })
     if (settingsResult.status === 'fulfilled') setAiSettings(settingsResult.value)
 
     let nextGroups: Group[] = []
     try { nextGroups = diagnosticResult.status === 'fulfilled' && diagnosticResult.value.status === 'ready' ? await api.listGroups() : await api.listCachedGroups() }
-    catch (reason) { if (isTauriRuntime()) setError(readableError(reason)) }
+    catch (reason) { if (isTauriRuntime() || isWebMode()) setError(readableError(reason)) }
     if (refreshSequence !== refreshSequenceRef.current) return
     const nextAccount = diagnosticResult.status === 'fulfilled' ? diagnosticResult.value.nimAccount || nextGroups[0]?.accountId || '' : nextGroups[0]?.accountId || ''
     switchAccount(nextAccount)
@@ -235,7 +242,9 @@ function App() {
 
   useEffect(() => {
     void refresh()
-    if (!isTauriRuntime()) return
+    if (!isTauriRuntime() && !isWebMode()) return
+    const resync = () => { void refresh() }
+    window.addEventListener("dh-events-reconnected", resync)
     const listeners: Promise<UnlistenFn>[] = []
     const handleWangStartup = (payload: WangStartupEvent) => {
       if (payload.eventId && handledWangStartupRef.current.has(payload.eventId)) return
@@ -276,7 +285,7 @@ function App() {
     void invoke<RuntimeWorkSnapshot>('get_runtime_work_snapshot').then(setWorkSnapshot).catch(() => undefined)
     listeners.push(listen<string>('connection-error', event => setError(readableError(event.payload))))
     listeners.push(listen<WangStartupEvent>('wangshangliao-status', event => handleWangStartup(event.payload)))
-    void invoke<WangStartupEvent | null>('take_wang_startup_status').then(payload => {
+    if (!isWebMode()) void invoke<WangStartupEvent | null>('take_wang_startup_status').then(payload => {
       if (payload) handleWangStartup(payload)
     }).catch(() => undefined)
     const pollDiagnostic = async () => {
@@ -300,6 +309,7 @@ function App() {
     listeners.push(listen<{ paused?: boolean } | boolean>('automation-paused', event => setAutomationPaused(typeof event.payload === 'boolean' ? event.payload : Boolean(event.payload.paused))))
     listeners.push(listen('close-requested', showClosePrompt))
     return () => {
+      window.removeEventListener("dh-events-reconnected", resync)
       window.clearInterval(diagnosticTimer)
       if (wangLoginFocusTimerRef.current !== null) window.clearTimeout(wangLoginFocusTimerRef.current)
       void Promise.all(listeners).then(values => values.forEach(unlisten => unlisten()))
@@ -334,12 +344,13 @@ function App() {
   }
   const toggleWorkDrawer = () => workDrawerOpen ? closeWorkDrawer() : setWorkDrawerOpen(true)
 
-  return <div className="app-window"><WindowTitlebar /><main className="shell">
+  return <div className="app-window">{!isWebMode() && <WindowTitlebar />}<main className="shell">
     <aside className="sidebar"><RuntimeWorkIndicator snapshot={workSnapshot} open={workDrawerOpen} onToggle={toggleWorkDrawer} onClose={closeWorkDrawer} onNavigate={setPage} /><nav>{nav.map(([label, Icon]) => <button className={`nav-item ${page === label ? 'active' : ''}`} onClick={() => { setPage(label); if (workDrawerOpen) closeWorkDrawer() }} key={label}><Icon size={16} />{label}</button>)}</nav><button className="sidebar-foot" data-help="打开 DH BOT 版本、技术栈、作者和 Telegram 联系方式。" onClick={() => setShowAbout(true)}><span>DH BOT 3.0</span><small>查看版本与作者</small></button></aside>
     <section className="workspace">
-      <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></header>
+      <header className="topbar"><div><span className="eyebrow">工作区</span><h1>{page}</h1></div><div className="topbar-actions">{isWebMode() && <div ref={setAccountActionsTarget} className="account-actions-slot" />}<div className={`connection ${diagnostic?.status === 'ready' ? 'ok' : ''}`}><i />{connectionLabel}</div></div></header>
       {automationPaused && <div className="pause-banner"><ShieldCheck size={16} />全部自动化已暂停。读取、消息落库和审计仍会继续。</div>}
       <WangStatusBanner diagnostic={diagnostic} startup={wangStartup} />
+      {isWebMode() && <WangLoginView officialReady={diagnostic?.status === 'ready'} accountActionsTarget={accountActionsTarget} />}
       {wangStartupError && <ErrorBanner message={wangStartupError} onClose={() => setWangStartupError('')} />}
       {error && <ErrorBanner message={error} onClose={() => setError('')} />}
       {page === '总览' && <OverviewPage diagnostic={diagnostic} database={database} groups={groups} audits={overviewAudits} summaries={summaries} loading={loading} refresh={() => void refresh(true)} />}
@@ -360,7 +371,7 @@ async function bootstrap() {
     const { installStylePreviewFixture } = await import('./stylePreviewFixture')
     installStylePreviewFixture()
   }
-  createRoot(document.getElementById('root')!).render(<AppErrorBoundary><App /></AppErrorBoundary>)
+  createRoot(document.getElementById('root')!).render(<AppErrorBoundary><WebSession><App /></WebSession></AppErrorBoundary>)
 }
 
 void bootstrap()

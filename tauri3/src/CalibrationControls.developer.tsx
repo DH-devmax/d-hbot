@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './api/transport'
 import { FileCheck2, Radio, Square } from 'lucide-react'
 import { readableError } from './api/client'
 

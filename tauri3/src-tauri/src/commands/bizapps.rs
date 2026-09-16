@@ -1,5 +1,8 @@
 //! 业务应用注册、启停、健康与测试。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
@@ -24,7 +27,7 @@ pub(crate) struct BusinessAppTestResult {
     elapsed_ms: u128,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_business_apps(
     state: State<'_, AppState>,
     account_id: String,
@@ -36,7 +39,7 @@ pub(crate) async fn list_business_apps(
     state.database_executor.list_business_apps(account_id).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn set_business_app_enabled(
     state: State<'_, AppState>,
     account_id: String,
@@ -80,7 +83,7 @@ pub(crate) async fn set_business_app_enabled(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_business_app_health(
     state: State<'_, AppState>,
     account_id: String,
@@ -114,7 +117,7 @@ pub(crate) async fn get_business_app_health(
     Ok(health)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_business_app_runs(
     state: State<'_, AppState>,
     account_id: String,
@@ -127,7 +130,7 @@ pub(crate) async fn list_business_app_runs(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn test_business_app(
     state: State<'_, AppState>,
     input: BusinessAppTestInput,

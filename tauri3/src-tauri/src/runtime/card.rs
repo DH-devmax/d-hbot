@@ -6,7 +6,7 @@
 use super::*;
 
 impl BackendRuntime {
-    pub(super) async fn card_queue_loop(&self, app: AppHandle) {
+    pub(super) async fn card_queue_loop(&self, app: RuntimeHost) {
         loop {
             let globally_paused = self
                 .database

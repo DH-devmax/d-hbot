@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Bot, Plus, RefreshCw, Save, Send, Trash2 } from 'lucide-react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '../api/transport'
 import type { AiProviderEndpoint, AiSettings } from '../types'
 import { api, readableError } from '../api/client'
 

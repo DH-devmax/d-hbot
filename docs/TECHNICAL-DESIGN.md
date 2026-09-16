@@ -16,8 +16,7 @@ DevTools `http://127.0.0.1:9222`，Fixture 只能通过编译期 `fixture` featu
 | Developer | `--features fixture` | `%APPDATA%\\DH\\fixture` | `9233` | Fixture、开发校准、自动化测试 |
 
 生产版不会根据环境变量、旧运行模式文件或命令参数切换到 Fixture。前端的开发入口、
-Fixture 命令和 Fixture 资源也在生产构建时移除。旧 Go 2.7 代码仅在
-[`archive/go-2.7-final/`](../archive/go-2.7-final/) 作为只读参考。
+Fixture 命令和 Fixture 资源也在生产构建时移除。旧 Go 2.7 代码归档已从当前目录移除，仅在 Git 历史中保留，不参与构建。
 
 ## 2. 模块地图
 

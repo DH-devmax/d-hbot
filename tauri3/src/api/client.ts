@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './transport'
 import type { Activity, ActivityPreview, ActivityRun, AiProviderEndpoint, Audit, AuditFilters, BusinessAppHealth, BusinessAppRecord, BusinessAppRun, BusinessAppTestResult, DailySummary, Group, GroupBatchAction, GroupBatchResult, KnowledgeBase, KnowledgeDocument, Message, MessageFilters, PageResult, Rule, RuleMember, Schedule, ScheduleRun, SendResult, SummarySettings, SupportBundleResult, TaskItem } from '../types'
 
 export function readableError(reason: unknown) {

@@ -1,10 +1,13 @@
 //! 群名片批量改名相关命令。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn preview_card_names(
     state: State<'_, AppState>,
     account_id: String,
@@ -24,7 +27,7 @@ pub(crate) async fn preview_card_names(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn apply_card_names(
     state: State<'_, AppState>,
     group_id: i64,
@@ -59,7 +62,7 @@ pub(crate) async fn apply_card_names(
     Ok(queued)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_card_rename_jobs(
     state: State<'_, AppState>,
     account_id: String,
@@ -72,7 +75,7 @@ pub(crate) async fn list_card_rename_jobs(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn retry_card_rename_jobs(
     state: State<'_, AppState>,
     account_id: String,
@@ -105,7 +108,7 @@ pub(crate) async fn retry_card_rename_jobs(
     Ok(retried)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_card_settings(
     state: State<'_, AppState>,
     account_id: String,
@@ -121,7 +124,7 @@ pub(crate) async fn get_card_settings(
     }))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_card_settings(
     state: State<'_, AppState>,
     account_id: String,
@@ -162,7 +165,7 @@ pub(crate) async fn save_card_settings(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_group_welcome(
     state: State<'_, AppState>,
     account_id: String,

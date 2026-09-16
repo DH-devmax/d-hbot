@@ -1,10 +1,13 @@
 //! 审计事件查询与导出。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_audit(
     state: State<'_, AppState>,
     account_id: String,
@@ -16,7 +19,7 @@ pub(crate) async fn list_audit(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn query_audit(
     state: State<'_, AppState>,
     mut query: AuditQuery,
@@ -33,7 +36,7 @@ pub(crate) async fn query_audit(
     Ok(Page { items, next_cursor })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn export_audit(
     state: State<'_, AppState>,
     mut query: AuditQuery,

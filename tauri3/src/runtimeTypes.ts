@@ -4,6 +4,7 @@ export type Diagnostic = {
   pageTitle: string
   pageUrl: string
   nimAccount: string
+  accountName?: string | null
   detail: string
 }
 

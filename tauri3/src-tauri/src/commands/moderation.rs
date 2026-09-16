@@ -1,5 +1,8 @@
 //! 撤回、禁言、改名、移出与群公告。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
@@ -34,7 +37,7 @@ pub(crate) struct MemberBatchResult {
     error: String,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn recall_message(
     state: State<'_, AppState>,
     group_id: i64,
@@ -61,7 +64,7 @@ pub(crate) async fn recall_message(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn mute_member(
     state: State<'_, AppState>,
     group_id: i64,
@@ -89,7 +92,7 @@ pub(crate) async fn mute_member(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn unmute_member(
     state: State<'_, AppState>,
     group_id: i64,
@@ -113,7 +116,7 @@ pub(crate) async fn unmute_member(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn rename_member(
     state: State<'_, AppState>,
     group_id: i64,
@@ -168,7 +171,7 @@ pub(crate) async fn rename_member(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn remove_member(
     state: State<'_, AppState>,
     group_id: i64,
@@ -192,7 +195,7 @@ pub(crate) async fn remove_member(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn set_group_mute(
     state: State<'_, AppState>,
     group_id: i64,
@@ -219,7 +222,7 @@ pub(crate) async fn set_group_mute(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_group_mute_state(
     state: State<'_, AppState>,
     group_id: i64,
@@ -227,7 +230,7 @@ pub(crate) async fn get_group_mute_state(
     state.gateway.get_group_mute_state(group_id).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn set_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
@@ -274,7 +277,7 @@ pub(crate) async fn set_group_announcement(
     Ok(receipt)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
@@ -282,7 +285,7 @@ pub(crate) async fn get_group_announcement(
     state.gateway.get_group_announcement(group_id).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_group_announcements(
     state: State<'_, AppState>,
     group_id: i64,
@@ -290,7 +293,7 @@ pub(crate) async fn list_group_announcements(
     state.gateway.list_group_announcements(group_id).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn update_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
@@ -340,7 +343,7 @@ pub(crate) async fn update_group_announcement(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_group_announcement(
     state: State<'_, AppState>,
     group_id: i64,
@@ -381,7 +384,7 @@ pub(crate) async fn delete_group_announcement(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_group_management_context(
     state: State<'_, AppState>,
     group_id: i64,
@@ -427,7 +430,7 @@ pub(crate) async fn get_group_management_context(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn execute_member_batch(
     state: State<'_, AppState>,
     input: MemberBatchInput,

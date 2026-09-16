@@ -1,5 +1,8 @@
 //! AI 设置、Provider 端点与连通性测试。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
@@ -36,7 +39,7 @@ pub(crate) struct AiProviderEndpointInput {
     api_key: Option<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_ai_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
     let keys = [
         "ai.base_url",
@@ -71,7 +74,7 @@ pub(crate) async fn get_ai_settings(state: State<'_, AppState>) -> AppResult<ser
     Ok(serde_json::Value::Object(values))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_ai_automation_settings(
     state: State<'_, AppState>,
     account_id: String,
@@ -123,7 +126,7 @@ pub(crate) async fn get_ai_automation_settings(
     }))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_ai_automation_settings(
     state: State<'_, AppState>,
     settings: AiAutomationInput,
@@ -162,7 +165,7 @@ pub(crate) async fn save_ai_automation_settings(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_ai_settings(
     state: State<'_, AppState>,
     base_url: String,
@@ -233,7 +236,7 @@ fn validate_ai_endpoint_url(value: &str) -> AppResult<()> {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_ai_provider_endpoints(
     state: State<'_, AppState>,
     account_id: String,
@@ -255,7 +258,7 @@ pub(crate) async fn list_ai_provider_endpoints(
     Ok(endpoints)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_ai_provider_endpoint(
     state: State<'_, AppState>,
     input: AiProviderEndpointInput,
@@ -329,7 +332,7 @@ pub(crate) async fn save_ai_provider_endpoint(
     Ok(id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_ai_provider_endpoint(
     state: State<'_, AppState>,
     account_id: String,
@@ -358,7 +361,7 @@ pub(crate) async fn delete_ai_provider_endpoint(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn test_ai_provider_endpoint(
     state: State<'_, AppState>,
     account_id: String,
@@ -391,7 +394,7 @@ pub(crate) async fn test_ai_provider_endpoint(
     result
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn test_ai(
     state: State<'_, AppState>,
     account_id: Option<String>,

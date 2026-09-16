@@ -4,11 +4,14 @@ import { api, readableError } from '../api/client'
 import { EmptyState, PageFeedback, SectionHeading } from '../components/PageState'
 import SelectField from '../components/SelectField'
 import type { Group, LoadState, Message } from '../types'
+import { isWebMode } from '../api/transport'
+import ConversationsPage from './ConversationsPage'
 
 const kindLabels: Record<string, string> = { text: '文本', image: '图片', card: '名片', other: '其他' }
 const stateLabels: Record<string, string> = { processed: '已处理', pending: '待处理', processing: '处理中', failed: '失败', ignored: '历史归档' }
 
 export default function MessagesPage({ groups, accountId, onError }: { groups: Group[]; accountId: string; onError: (value: string) => void }) {
+  const [view, setView] = useState<'groups' | 'conversations'>('groups')
   const [selectedGroups, setSelectedGroups] = useState<number[]>([])
   const [keyword, setKeyword] = useState('')
   const [kind, setKind] = useState('all')
@@ -70,7 +73,8 @@ export default function MessagesPage({ groups, accountId, onError }: { groups: G
   }
 
   return <div className="page-stack">
-    <section className="section">
+    {isWebMode() && <div className="conversation-filters" role="tablist" aria-label="消息视图"><button role="tab" aria-selected={view === 'groups'} aria-pressed={view === 'groups'} onClick={() => setView('groups')}>群消息</button><button role="tab" aria-selected={view === 'conversations'} aria-pressed={view === 'conversations'} onClick={() => setView('conversations')}>群聊与私信</button></div>}
+    {view === 'conversations' ? <ConversationsPage key={accountId} /> : <section className="section">
       <SectionHeading eyebrow="实时流水线" title="消息台" meta={`${messages.length} 条`} actions={<button className="secondary" onClick={() => void reload()}><RefreshCw size={15} />刷新</button>} />
       <div className="filter-grid">
         <label className="search-field wide"><Search size={15} aria-hidden="true" /><input aria-label="搜索消息" value={keyword} onChange={event => setKeyword(event.target.value)} onKeyDown={event => event.key === 'Enter' && void reload()} placeholder="搜索成员、内容或消息 ID" /></label>
@@ -78,7 +82,7 @@ export default function MessagesPage({ groups, accountId, onError }: { groups: G
         <SelectField label="处理状态" value={processingState} options={[{ value: 'all', label: '全部状态' }, ...Object.entries(stateLabels).map(([value, label]) => ({ value, label }))]} onChange={value => { setProcessingState(value); void reload({ processingState: value }) }} />
       </div>
       <div className="group-filter"><span><Filter size={14} />选择群聊</span>{groups.length ? groups.map(group => <label className={`check-chip ${selectedGroups.includes(group.groupId) ? 'selected' : ''}`} key={group.groupId}><input type="checkbox" checked={selectedGroups.includes(group.groupId)} onChange={() => toggleGroup(group.groupId)} /><Check size={13} />{group.name}</label>) : <em>尚未同步群组</em>}</div>
-    </section>
+    </section>}
     <section className="section">
       <SectionHeading eyebrow="批量发送" title="向所选群发送文本" meta={selectedGroups.length ? `已选 ${selectedGroups.length} 个群` : '先选择群聊'} />
       <div className="compose-row"><textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder="发送内容只会发到当前勾选的群。" /><button className="primary" disabled={sending || !draft.trim() || !selectedGroups.length} onClick={() => void send()}><Send size={15} />{sending ? '发送中' : '发送文本'}</button></div>

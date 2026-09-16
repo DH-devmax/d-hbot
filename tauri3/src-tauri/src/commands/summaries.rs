@@ -1,5 +1,8 @@
 //! 群日报设置与生成。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
@@ -14,7 +17,7 @@ pub(crate) struct SummarySettings {
     timezone: String,
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_daily_summaries(
     state: State<'_, AppState>,
     account_id: String,
@@ -26,7 +29,7 @@ pub(crate) async fn list_daily_summaries(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn get_summary_settings(
     state: State<'_, AppState>,
     account_id: String,
@@ -57,7 +60,7 @@ pub(crate) async fn get_summary_settings(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_summary_settings(
     state: State<'_, AppState>,
     settings: SummarySettings,
@@ -95,7 +98,7 @@ pub(crate) async fn save_summary_settings(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn generate_daily_summary(
     state: State<'_, AppState>,
     account_id: String,

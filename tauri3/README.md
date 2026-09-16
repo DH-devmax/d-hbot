@@ -44,10 +44,15 @@ Fixture commands, ports and data paths before release.
 
 For user-reported failures, the desktop app provides **Debug -> Generate support bundle**. The ZIP stays local until the user shares it and contains redacted runtime health, capability information, anonymized audit records, recent redacted logs and checksums. It never includes SQLite data, secrets, WangShangLiao login data, raw messages, real group names or Fixture data. Repeated exports use unique names and local retention is bounded to 20 bundles, 30 days and 128 MiB. Run `python3 ../tools/verify_repository_redaction.py` before committing source or docs. See [`../docs/DIAGNOSTICS-AND-SUPPORT.md`](../docs/DIAGNOSTICS-AND-SUPPORT.md).
 
-Architecture and implementation references:
+详细资料统一放在仓库根目录 [`../docs/`](../docs/)；入口见根目录 [`../README.md`](../README.md)。
 
-- [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md): data-flow overview.
-- [`../docs/TECHNICAL-DESIGN.md`](../docs/TECHNICAL-DESIGN.md): module map, executor, workers and failure semantics.
-- [`../docs/API-REFERENCE.md`](../docs/API-REFERENCE.md): production Tauri commands, events and developer-only boundaries.
-- [`../docs/DATABASE-SCHEMA.md`](../docs/DATABASE-SCHEMA.md): schema v11 and persistence boundaries.
-- [`../docs/PROTOCOL-CONTRACT.md`](../docs/PROTOCOL-CONTRACT.md): ZCG baseline, WangShangLiao protocol and receipts.
+本目录结构：
+
+```text
+src/                 React 页面、组件、类型和前端测试
+src-tauri/src/       Rust/Tauri 命令、Runtime、协议和数据层
+src-tauri/tests/     CDP、协议和运行时集成测试
+contracts/           脱敏协议样本与能力基线
+scripts/             开发、构建、隔离扫描和 Windows 打包脚本
+e2e/                 Fixture 浏览器端到端测试
+```

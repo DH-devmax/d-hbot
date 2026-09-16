@@ -166,6 +166,14 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn messages_before(&self, current: &Message, limit: usize) -> AppResult<Vec<Message>> {
+        self.with_connection(|connection| {
+            let mut query = connection.prepare("SELECT id,account_id,group_id,server_message_id,sequence,user_id,sender_name,kind,text,sent_at,received_at,processed_at,acknowledged_at,processing_state,attempts,next_attempt_at,last_error,mentions_json,source_kind,flow FROM messages WHERE account_id=?1 AND group_id=?2 AND id<?3 AND julianday(sent_at)<=julianday(?4) ORDER BY julianday(sent_at) DESC,id DESC LIMIT ?5")?;
+            let rows = query.query_map(params![current.account_id,current.group_id,current.id,current.sent_at.to_rfc3339(),limit.min(200) as i64],message_from_row)?;
+            rows.collect::<Result<Vec<_>,_>>()
+        }).map_err(|_| AppError::new("context_read","读取会话上下文失败"))
+    }
+
     pub fn rule_cooldown_allows(
         &self,
         rule_id: i64,
@@ -1688,6 +1696,24 @@ mod tests {
             .unwrap();
         assert_eq!(previous.len(), 1);
         assert_eq!(previous[0].id, first_id);
+
+        let mut current = second.clone();
+        current.id = second_id;
+        // A later arrival must not enter an earlier request's context, even if
+        // its sender timestamp was backdated.
+        let mut later = first.clone();
+        later.server_message_id = "backdated-arrival".into();
+        later.sent_at = now - chrono::Duration::minutes(1);
+        database.insert_message(&later).unwrap();
+        assert_eq!(database.messages_before(&current, 8).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), vec![first_id]);
+        database.with_connection(|connection| connection.execute("UPDATE messages SET sent_at=? WHERE id=?",params![(now+chrono::Duration::minutes(1)).to_rfc3339(),first_id])).unwrap();
+        assert!(database.messages_before(&current, 8).unwrap().is_empty());
+        database.with_connection(|connection| connection.execute("UPDATE messages SET sent_at=? WHERE id=?",params![now.to_rfc3339(),first_id])).unwrap();
+        current.group_id = 2;
+        assert!(database.messages_before(&current, 8).unwrap().is_empty());
+        current.group_id = 1;
+        current.account_id = "other".into();
+        assert!(database.messages_before(&current, 8).unwrap().is_empty());
     }
 
     #[test]

@@ -1,5 +1,12 @@
 # DH BOT 3.0 架构
 
+![DH BOT 功能与架构全景](DH-BOT-Architecture.png)
+
+全景图展示当前双宿主结构，源模型见 [model.c4](architecture/model.c4)。
+`dh-server` 通过纯 Rust 网关运行共享业务，桌面端保留 CDP 网关。
+下方详细队列图以原桌面路径为例，不表示 Web 仍依赖 Tauri。
+最终验收范围见 [阶段记录](acceptance/2026-09-17/RESULTS.md)，后续方向见 [AstrBot 交接](ASTRBOT-HANDOFF.md)。
+
 本文先回答"数据如何流动"。开发时的模块边界、并发和失败语义见
 [`TECHNICAL-DESIGN.md`](TECHNICAL-DESIGN.md)；数据库表和唯一约束见
 [`DATABASE-SCHEMA.md`](DATABASE-SCHEMA.md)；协议、回执和能力状态见
@@ -282,3 +289,27 @@ flowchart LR
 - `connection.rateLimitHits` — 成员查询连续限速次数
 
 诊断包不含 `dh.db`、`secrets.dat`、AI Key、Cookie、原始消息正文或 Fixture 数据。
+
+
+## 纯 Rust Web 路径
+
+`dh-core` 以显式 path 引用桌面目录的同一份业务源码；RuntimeHost/RuntimeEventSink
+隔离 Tauri，后台工作循环使用 Tokio。Web 分发层复用共享命令，执行相同参数和权限校验。
+`dh-server` 的 RustGateway 连接 BusinessClient/NimTransport，不依赖官方客户端。
+
+Web 提供管理员激活、Argon2 密码、Cookie 会话、Origin 校验、限流、静态页面和事件流。
+账号会话与部署配置密封保存，登录世代防止迟到结果污染新账号。详情见 [Rust Web 登录](RUST-WEB-LOGIN.md)。
+服务与桌面必须使用独立数据目录；跨进程账号排他和目标部署长期运行仍需验证。
+
+Rust 消息账本按账号、群与消息去重，接收持久化后确认；撤回分别记录请求方的服务端确认和
+对端通知。离线/乱序撤回补偿仍是缺口，不能从在线撤回测试推断完成。
+真实验收与未完成项统一见 [阶段记录](acceptance/2026-09-17/RESULTS.md)。
+
+## 架构图维护
+
+```sh
+npx likec4 validate docs/architecture
+npx likec4 export png docs/architecture -o docs/architecture/rendered
+```
+
+`current` 视图展示当前双宿主与共享业务边界；AstrBot 是后续迁移目标，不混入当前实现图。

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke } from './api/transport'
+import { listen } from './api/transport'
 import { Ban, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, Hand, Megaphone, Pencil, Pin, PinOff, RefreshCw, Save, Search, Shield, Sparkles, Trash2, UserMinus, Users, Volume2, VolumeX, X } from 'lucide-react'
 import './members.css'
 

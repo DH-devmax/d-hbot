@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::runtime_events::RuntimeHost;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
 
 use crate::diagnostics::redact;
@@ -103,7 +103,7 @@ struct WorkState {
 
 struct TrackerInner {
     state: Mutex<WorkState>,
-    app: Mutex<Option<AppHandle>>,
+    app: Mutex<Option<RuntimeHost>>,
     emit_pending: AtomicBool,
 }
 
@@ -125,7 +125,7 @@ impl Default for RuntimeWorkTracker {
 }
 
 impl RuntimeWorkTracker {
-    pub fn attach(&self, app: AppHandle) {
+    pub fn attach(&self, app: RuntimeHost) {
         if let Ok(mut current) = self.inner.app.lock() {
             *current = Some(app);
         }
@@ -339,7 +339,7 @@ impl RuntimeWorkTracker {
         });
         if outcome == "succeeded" && self.has_app() {
             let tracker = self.clone();
-            tauri::async_runtime::spawn(async move {
+            spawn_work(async move {
                 tokio::time::sleep(SUCCESS_RETENTION).await;
                 tracker.changed();
             });
@@ -395,7 +395,7 @@ impl RuntimeWorkTracker {
             return;
         }
         let tracker = self.clone();
-        tauri::async_runtime::spawn(async move {
+        spawn_work(async move {
             tokio::time::sleep(EVENT_COALESCE).await;
             tracker.inner.emit_pending.store(false, Ordering::Release);
             let snapshot = tracker.snapshot();
@@ -593,6 +593,16 @@ fn snapshot_from_state(state: &WorkState) -> RuntimeWorkSnapshot {
         counts,
         updated_at: state.updated_at.unwrap_or_else(Utc::now),
     }
+}
+
+fn spawn_work<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(feature = "headless")]
+    tokio::spawn(future);
+    #[cfg(not(feature = "headless"))]
+    tauri::async_runtime::spawn(future);
 }
 
 #[cfg(test)]

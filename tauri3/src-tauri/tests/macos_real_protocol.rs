@@ -4,6 +4,36 @@ use dh_bot_lib::gateway::{CapabilityStatus, CdpClient, CdpGateway, GroupGateway,
 use serde_json::json;
 use tokio::time::{sleep, Duration};
 
+/// Reads only; never emits account, group, member, credential or response values.
+#[tokio::test]
+#[ignore = "requires authorized local logged-in client; reads one group roster"]
+async fn verifies_redacted_business_reads() {
+    let gateway = CdpGateway::new(CdpClient::new("http://127.0.0.1:9222").unwrap());
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
+        let groups = gateway
+            .list_groups()
+            .await
+            .map_err(|_| "group_list_failed")?;
+        let first = groups
+            .first()
+            .ok_or("no_group_available_for_roster_check")?;
+        let roster = gateway
+            .list_members(first.group_id)
+            .await
+            .map_err(|_| "roster_failed")?;
+        if roster.members.is_empty() {
+            return Err("empty_roster_requires_review");
+        }
+        Ok::<_, &str>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => eprintln!("group_list=passed roster=passed; no external writes"),
+        Ok(Err(stage)) => panic!("read-only verification failed at {stage}"),
+        Err(_) => panic!("read-only verification timed out"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "read-only listener diagnostics for a logged-in local WangShangLiao instance"]
 async fn reports_real_listener_hook_state_without_writes() {

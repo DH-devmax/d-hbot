@@ -65,7 +65,7 @@ Select-String -Path tauri3\src-tauri\src\diagnostics.rs -Pattern 'defaultRespons
 
 ### 已在 macOS 验证过的部分
 
-协议与业务链已在 macOS 真实旺商聊双实例（主账号 `9222`、普通成员测试账号 `9223`）验证通过，详见 [`REAL-GROUP-TEST-20260731.md`](REAL-GROUP-TEST-20260731.md)。Windows 这一轮不需要为了「再确认一遍」重复这些破坏性写操作：
+协议与业务链已有真实旺商聊基线。Windows 这一轮不需要为了“再确认一遍”重复全部破坏性写操作；只按本文件的 Windows 分层验收补足桌面、进程和发布包证据：
 
 - AI 明确提及回复通过；普通文本静默通过。
 - 临时知识库绑定、命中、解绑、删除通过；解绑后不复用旧答案。

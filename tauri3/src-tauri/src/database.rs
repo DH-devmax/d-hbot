@@ -2501,6 +2501,7 @@ impl Database {
             AppError::new("database_schema", format!("初始化 3.0 数据库失败：{error}"))
         })?;
         migrate_schema(&mut connection, old_version)?;
+        crate::conversations::initialize(&connection)?;
         let database = Self {
             path: paths.database.clone(),
             connection: Arc::new(Mutex::new(connection)),

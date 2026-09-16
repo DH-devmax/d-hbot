@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "build": "pnpm build:production",
+    "build:web": "vite build --mode web --outDir dist-web",
     "build:production": "vite build --mode production && node scripts/verify-production.mjs dist --allow-no-executable",
     "build:developer": "vite build --mode developer",
     "test": "vitest run --config vitest.config.ts --passWithNoTests",
@@ -25,7 +26,7 @@
     "clean:bundle": "node scripts/clean-bundle.mjs",
     "clean:production": "node scripts/prepare-production.mjs",
     "verify:production:boundary": "node scripts/verify-build-boundary.mjs",
-    "test:production-isolation": "node scripts/test-production-isolation.mjs",
+    "test:production-isolation": "node scripts/test-production-isolation.mjs && node --test scripts/gateway-preload.test.mjs",
     "verify:docs": "python3 ../tools/verify_docs.py && python3 ../tools/verify_doc_references.py && python3 ../tools/verify_repository_redaction.py",
     "tauri:build:production": "pnpm verify:production:boundary && pnpm clean:production && tauri build --features custom-protocol -- --no-default-features",
     "tauri:build:developer": "pnpm build:fixture-resource && pnpm clean:bundle && tauri build --features fixture,custom-protocol --config src-tauri/tauri.fixture.conf.json",

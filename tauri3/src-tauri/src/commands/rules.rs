@@ -1,10 +1,13 @@
 //! 机器规则与 AI 规则的增删改查、导入导出。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_rules(
     state: State<'_, AppState>,
     account_id: String,
@@ -16,7 +19,7 @@ pub(crate) async fn list_rules(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn set_group_rule_features(
     state: State<'_, AppState>,
     account_id: String,
@@ -32,7 +35,7 @@ pub(crate) async fn set_group_rule_features(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn search_rule_members(
     state: State<'_, AppState>,
     account_id: String,
@@ -92,7 +95,7 @@ pub(crate) async fn search_rule_members(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_rule(
     state: State<'_, AppState>,
     mut rule: ModerationRule,
@@ -105,7 +108,7 @@ pub(crate) async fn save_rule(
     state.database_executor.save_rule(rule).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_rule(
     state: State<'_, AppState>,
     account_id: String,
@@ -118,7 +121,7 @@ pub(crate) async fn delete_rule(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn export_rules(
     state: State<'_, AppState>,
     account_id: String,
@@ -128,7 +131,7 @@ pub(crate) async fn export_rules(
         .map_err(|error| AppError::new("rules_export", error.to_string()))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn import_rules(
     state: State<'_, AppState>,
     account_id: String,

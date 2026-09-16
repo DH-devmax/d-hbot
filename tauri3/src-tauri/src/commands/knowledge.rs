@@ -1,10 +1,13 @@
 //! 知识库、文档、分块与群绑定。
 
+#[cfg(feature = "headless")]
+use crate::headless::State;
+#[cfg(not(feature = "headless"))]
 use tauri::State;
 
 use crate::*;
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_knowledge_bases(
     state: State<'_, AppState>,
     account_id: String,
@@ -15,7 +18,7 @@ pub(crate) async fn list_knowledge_bases(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn create_knowledge_base(
     state: State<'_, AppState>,
     base: KnowledgeBase,
@@ -24,7 +27,7 @@ pub(crate) async fn create_knowledge_base(
     state.database_executor.create_knowledge_base(base).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn update_knowledge_base(
     state: State<'_, AppState>,
     base: KnowledgeBase,
@@ -33,7 +36,7 @@ pub(crate) async fn update_knowledge_base(
     state.database_executor.update_knowledge_base(base).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn clone_knowledge_base(
     state: State<'_, AppState>,
     account_id: String,
@@ -47,7 +50,7 @@ pub(crate) async fn clone_knowledge_base(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_knowledge_base(
     state: State<'_, AppState>,
     account_id: String,
@@ -60,7 +63,7 @@ pub(crate) async fn delete_knowledge_base(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_knowledge_documents(
     state: State<'_, AppState>,
     base_id: i64,
@@ -71,7 +74,7 @@ pub(crate) async fn list_knowledge_documents(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn save_knowledge_document(
     state: State<'_, AppState>,
     document: KnowledgeDocument,
@@ -106,7 +109,7 @@ pub(crate) async fn save_knowledge_document(
     Ok(document_id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn delete_knowledge_document(
     state: State<'_, AppState>,
     base_id: i64,
@@ -123,7 +126,7 @@ pub(crate) async fn delete_knowledge_document(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn bind_knowledge_base(
     state: State<'_, AppState>,
     base_id: i64,
@@ -140,7 +143,7 @@ pub(crate) async fn bind_knowledge_base(
         .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "headless"), tauri::command)]
 pub(crate) async fn list_knowledge_bindings(
     state: State<'_, AppState>,
     account_id: String,
