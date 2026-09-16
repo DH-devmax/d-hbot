@@ -33,7 +33,7 @@ impl Binding {
     }
     pub fn aad(&self) -> [u8; 16] {
         let mut input = [0; 32];
-        for (out, value) in input.chunks_exact_mut(8).zip([
+        for (out, value) in input.as_chunks_mut::<8>().0.iter_mut().zip([
             self.request_id,
             self.plaintext_hash,
             self.device_tag,

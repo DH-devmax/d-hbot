@@ -539,7 +539,12 @@ impl Client {
         fields[12] = 1;
         fields[8] = if let Some(key) = &self.config.account_mac {
             let mut input = [0; 24];
-            for (part, v) in input.chunks_exact_mut(8).zip([fields[0], id, fields[9]]) {
+            for (part, v) in input
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip([fields[0], id, fields[9]])
+            {
                 part.copy_from_slice(&v.to_le_bytes())
             }
             request_metadata::field9_mac(&input, key)
